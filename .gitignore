@@ -1,0 +1,4 @@
+cpu-bench
+src/*.o
+*.o
+.DS_Store
