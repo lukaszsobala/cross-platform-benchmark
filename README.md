@@ -25,8 +25,26 @@ make CFLAGS="-O3 -march=native -mtune=native"
 Or use the convenience make target or variables:
 
 ```
-make native                    # same as MARCH=native MTUNE=native
+make native                    # uses -march/-mtune best-effort for host
 make MARCH=x86-64-v3 MTUNE=generic
+```
+
+On some RISC-V toolchains, `-march=native` can emit an invalid ISA string. The `native` target auto-falls back to `-march=rv64gc -mtune=generic`. You can also set it explicitly:
+
+```
+make MARCH=rv64gc MTUNE=generic
+```
+
+RISC‑V notes:
+- The canonical ISA string for compilers excludes privilege letters (`S`, `U`). So `rv64imafdcvsu` is invalid for `-march` because `su` are privilege levels, not ISA extensions. Use only ISA subsets and standard extensions in `-march`, and pass CSR/fence split via named extensions instead.
+- For vector-capable toolchains: `make riscv-v` uses `-march=rv64gcv_zicsr_zifencei`.
+- For Sophgo SG2000 (rv64imafdcv + CSR+fence split), use the provided target:
+
+```
+make sg2000
+```
+
+This maps to `-march=rv64imafdcv_zicsr_zifencei -mtune=generic`. Adjust `MTUNE` if your toolchain provides a specific tuner.
 ```
 
 ## Run

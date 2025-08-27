@@ -18,17 +18,36 @@ ifdef MTUNE
 	CFLAGS += -mtune=$(MTUNE)
 endif
 
+# Host arch detection to make 'native' robust across platforms (esp. riscv64)
+HOST_ARCH := $(shell uname -m)
+NATIVE_MARCH ?= native
+NATIVE_MTUNE ?= native
+ifeq ($(HOST_ARCH),riscv64)
+	# On some RISC-V toolchains, -march=native produces an invalid ISA string.
+	# Fall back to a broadly compatible baseline (G = IMAFD).
+	NATIVE_MARCH := rv64gc
+	NATIVE_MTUNE := generic
+endif
+
 TARGET := cpu-bench
 SRCS := src/bench.c
 OBJS := $(SRCS:.c=.o)
 
-.PHONY: all clean native
+.PHONY: all clean native sg2000 riscv-v
 
 all: $(TARGET)
 
 # Convenience target for native tuning
 native:
-	$(MAKE) MARCH=native MTUNE=native all
+	$(MAKE) MARCH=$(NATIVE_MARCH) MTUNE=$(NATIVE_MTUNE) all
+
+# RISC-V vector baseline (if your toolchain supports V)
+riscv-v:
+	$(MAKE) MARCH=rv64gcv_zicsr_zifencei MTUNE=generic all
+
+# Sophgo SG2000: rv64imafdcv + privileged CSRs/fence split
+sg2000:
+	$(MAKE) MARCH=rv64imafdcv_zicsr_zifencei MTUNE=generic all
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
