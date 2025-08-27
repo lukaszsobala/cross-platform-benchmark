@@ -11,10 +11,10 @@ LIBS := -pthread
 # Optional tuning (set by user):
 #   make MARCH=native MTUNE=native
 #   make MARCH=x86-64-v3 MTUNE=generic
-ifdef MARCH
+ifneq ($(strip $(MARCH)),)
 	CFLAGS += -march=$(MARCH)
 endif
-ifdef MTUNE
+ifneq ($(strip $(MTUNE)),)
 	CFLAGS += -mtune=$(MTUNE)
 endif
 
@@ -26,7 +26,9 @@ ifeq ($(HOST_ARCH),riscv64)
 	# On some RISC-V toolchains, -march=native produces an invalid ISA string.
 	# Fall back to a broadly compatible baseline (G = IMAFD).
 	NATIVE_MARCH := rv64gc
-	NATIVE_MTUNE := generic
+	# Omit -mtune entirely unless the user provides one, as some toolchains
+	# don't accept 'generic'.
+	NATIVE_MTUNE :=
 endif
 
 TARGET := cpu-bench
@@ -43,11 +45,11 @@ native:
 
 # RISC-V vector baseline (if your toolchain supports V)
 riscv-v:
-	$(MAKE) MARCH=rv64gcv_zicsr_zifencei MTUNE=generic all
+	$(MAKE) MARCH=rv64gcv_zicsr_zifencei all
 
 # Sophgo SG2000: rv64imafdcv + privileged CSRs/fence split
 sg2000:
-	$(MAKE) MARCH=rv64imafdcv_zicsr_zifencei MTUNE=generic all
+	$(MAKE) MARCH=rv64imafdcv_zicsr_zifencei all
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
