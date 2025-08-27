@@ -79,11 +79,14 @@ static void *worker(void *arg) {
 
     // Integer arithmetic loop
     {
-        const double t_end = now_sec() + r->seconds;
+    const double t_start = now_sec();
+    const double t_end = t_start + r->seconds;
     uint64_t s = UINT64_C(0x9E3779B97F4A7C15) ^ (uint64_t)(unsigned)r->id;
         volatile uint64_t acc = 0;
         uint64_t iters = 0;
-        while (now_sec() < t_end) {
+    const int check_every = 1024;
+    const uint64_t check_mask = (uint64_t)check_every - 1u;
+        while (1) {
             // Unrolled integer ops, ~32 ops per iteration
             uint64_t a = xs64(&s);
             uint64_t b = xs64(&s);
@@ -95,18 +98,26 @@ static void *worker(void *arg) {
             // mix a bit more
             acc = (acc * UINT64_C(11400714819323198485)) ^ (acc >> 33);
             iters++;
+            if ((iters & check_mask) == 0) {
+                if (now_sec() >= t_end) break;
+            }
         }
         r->checksum ^= acc;
-        // Estimate ops: ~32 per iter (conservative)
-        r->int_mops = (double)(iters * 32) / 1e6 / r->seconds;
+    // Estimate ops: ~32 per iter (conservative)
+    double elapsed = now_sec() - t_start;
+    if (elapsed <= 0.0) elapsed = r->seconds;
+    r->int_mops = (double)(iters * 32) / 1e6 / elapsed;
     }
 
     // Floating point loop (double precision)
     {
-        const double t_end = now_sec() + r->seconds;
+    const double t_start = now_sec();
+    const double t_end = t_start + r->seconds;
         volatile double fa = 1.0, fb = 1.0000001, fc = 0.9999997, fd = 1.0000003;
         uint64_t iters = 0;
-        while (now_sec() < t_end) {
+    const int check_every = 1024;
+    const uint64_t check_mask = (uint64_t)check_every - 1u;
+    while (1) {
             // ~32 FLOPs per iteration (adds, muls, fmadd-ish patterns)
             fa = fa * fb + fc;
             fb = fb * fd + fa;
@@ -123,16 +134,22 @@ static void *worker(void *arg) {
             if (fd < -1e100) { fd *= 1e-100; }
 
             iters++;
+            if ((iters & check_mask) == 0) {
+                if (now_sec() >= t_end) break;
+            }
         }
         r->checksum ^= (uint64_t)(fa + fb + fc + fd);
-        // Estimate flops: each loop ~32 FLOPs
-        r->fp_mflops = (double)(iters * 32) / 1e6 / r->seconds;
+    // Estimate flops: each loop ~32 FLOPs
+    double elapsed = now_sec() - t_start;
+    if (elapsed <= 0.0) elapsed = r->seconds;
+    r->fp_mflops = (double)(iters * 32) / 1e6 / elapsed;
     }
 
     // Memory bandwidth (read + write). We walk the whole buffer per pass and
     // only check the clock after a pass to reduce timing overhead.
     if (buf && nbytes > 0) {
-        const double t_end = now_sec() + r->seconds;
+    const double t_start = now_sec();
+    const double t_end = t_start + r->seconds;
         volatile uint64_t acc = 0;
         size_t touched = 0;
 
@@ -151,8 +168,10 @@ static void *worker(void *arg) {
             }
             if (now_sec() >= t_end) break;
         }
-        r->checksum ^= acc;
-    r->mem_gbps = (double)touched / (double)(1ull << 30) / r->seconds;
+    r->checksum ^= acc;
+    double elapsed = now_sec() - t_start;
+    if (elapsed <= 0.0) elapsed = r->seconds;
+    r->mem_gbps = (double)touched / (double)(1ull << 30) / elapsed;
     } else {
         r->mem_gbps = 0.0;
     }
