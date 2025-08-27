@@ -1,4 +1,4 @@
-// Simple portable CPU benchmark (C11)
+// Simple portable CPU benchmark (C)
 // - Focus on integer, floating-point, and memory throughput
 // - Multi-threaded using pthreads (no external deps besides libc/pthreads)
 // - Targets 64-bit: amd64, arm64 (ARMv8-A), riscv64 (rv64imafdcvsu)
@@ -6,6 +6,7 @@
 // - Avoids arch-specific intrinsics for portability
 // - Deterministic workload seeded PRNG
 
+#define _GNU_SOURCE 1
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <math.h>
@@ -18,15 +19,39 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/utsname.h>
+#ifdef __linux__
+#include <sched.h>
+#include <sys/resource.h>
+#endif
 
 #ifndef ARRAY_LEN
 #define ARRAY_LEN(x) ((int)(sizeof(x) / sizeof((x)[0])))
 #endif
 
+static clockid_t g_clock_id = CLOCK_MONOTONIC;
+static void set_clock_mode(int use_raw) {
+#ifdef CLOCK_MONOTONIC_RAW
+    g_clock_id = use_raw ? CLOCK_MONOTONIC_RAW : CLOCK_MONOTONIC;
+#else
+    (void)use_raw;
+    g_clock_id = CLOCK_MONOTONIC;
+#endif
+}
 static inline double now_sec(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(g_clock_id, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void warmup_spin(double sec) {
+    if (sec <= 0.0) return;
+    volatile uint64_t x0=1,x1=2,x2=3,x3=4,x4=5,x5=6,x6=7,x7=8;
+    const double t_end = now_sec() + sec;
+    while (now_sec() < t_end) {
+        x0 += x1; x2 += x3; x4 += x5; x6 += x7;
+        x1 ^= x0; x3 ^= x2; x5 ^= x4; x7 ^= x6;
+    }
+    (void)x0;(void)x1;(void)x2;(void)x3;(void)x4;(void)x5;(void)x6;(void)x7;
 }
 
 // Xorshift64* PRNG for deterministic sequences
@@ -47,6 +72,9 @@ typedef struct {
     int cpu_work;        // millions of ops chunk size per loop (approx)
     size_t mem_bytes;    // memory bytes to touch per thread
     double seconds;      // runtime per phase
+    double warmup;       // warm-up seconds per phase
+    int pin;             // pin thread to CPU
+    pthread_barrier_t *bar; // barrier to align phase starts
     volatile uint64_t checksum;
 
     // results
@@ -77,14 +105,38 @@ static void *worker(void *arg) {
         memset(buf, 0, nbytes);
     }
 
+#ifdef __linux__
+    // Optionally pin thread to a CPU to reduce jitter
+    if (r->pin) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        long n = sysconf(_SC_NPROCESSORS_CONF);
+        if (n < 1) n = 1;
+    CPU_SET((unsigned int)(r->id % (int)n), &set);
+        (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    }
+#endif
+
+    // Prefault per-thread buf (memset already did, keeping cheap touch here)
+    if (buf && nbytes >= 4096) {
+        for (size_t i = 0; i < nbytes; i += 4096) {
+            buf[i] ^= (uint8_t)i;
+        }
+    }
+
+    // Align and warm up before each phase handled by global helper
+
     // Integer arithmetic loop
     {
+        if (r->bar) pthread_barrier_wait(r->bar);
+        warmup_spin(r->warmup);
+        if (r->bar) pthread_barrier_wait(r->bar);
     const double t_start = now_sec();
     const double t_end = t_start + r->seconds;
     uint64_t s = UINT64_C(0x9E3779B97F4A7C15) ^ (uint64_t)(unsigned)r->id;
         volatile uint64_t acc = 0;
         uint64_t iters = 0;
-    const int check_every = 1024;
+        const int check_every = 1024;
     const uint64_t check_mask = (uint64_t)check_every - 1u;
         while (1) {
             // Unrolled integer ops, ~32 ops per iteration
@@ -102,7 +154,7 @@ static void *worker(void *arg) {
                 if (now_sec() >= t_end) break;
             }
         }
-        r->checksum ^= acc;
+    r->checksum ^= acc;
     // Estimate ops: ~32 per iter (conservative)
     double elapsed = now_sec() - t_start;
     if (elapsed <= 0.0) elapsed = r->seconds;
@@ -111,11 +163,14 @@ static void *worker(void *arg) {
 
     // Floating point loop (double precision)
     {
+        if (r->bar) pthread_barrier_wait(r->bar);
+        warmup_spin(r->warmup);
+        if (r->bar) pthread_barrier_wait(r->bar);
     const double t_start = now_sec();
     const double t_end = t_start + r->seconds;
         volatile double fa = 1.0, fb = 1.0000001, fc = 0.9999997, fd = 1.0000003;
         uint64_t iters = 0;
-    const int check_every = 1024;
+        const int check_every = 1024;
     const uint64_t check_mask = (uint64_t)check_every - 1u;
     while (1) {
             // ~32 FLOPs per iteration (adds, muls, fmadd-ish patterns)
@@ -138,7 +193,7 @@ static void *worker(void *arg) {
                 if (now_sec() >= t_end) break;
             }
         }
-        r->checksum ^= (uint64_t)(fa + fb + fc + fd);
+    r->checksum ^= (uint64_t)(fa + fb + fc + fd);
     // Estimate flops: each loop ~32 FLOPs
     double elapsed = now_sec() - t_start;
     if (elapsed <= 0.0) elapsed = r->seconds;
@@ -148,6 +203,9 @@ static void *worker(void *arg) {
     // Memory bandwidth (read + write). We walk the whole buffer per pass and
     // only check the clock after a pass to reduce timing overhead.
     if (buf && nbytes > 0) {
+        if (r->bar) pthread_barrier_wait(r->bar);
+        warmup_spin(r->warmup);
+        if (r->bar) pthread_barrier_wait(r->bar);
     const double t_start = now_sec();
     const double t_end = t_start + r->seconds;
         volatile uint64_t acc = 0;
@@ -182,8 +240,10 @@ static void *worker(void *arg) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--threads N] [--time SECONDS] [--mem BYTES] [--no-mem]\n"
-            "Defaults: --threads <cores or 1>, --time 1.0, --mem 0 (memory phase disabled)\n",
+            "Usage: %s [--threads N] [--time SECONDS] [--mem BYTES] [--no-mem]\\n"
+            "           [--warmup SECONDS] [--no-pin] [--clock mono|raw]\\n"
+            "Defaults: --threads <cores or 1>, --time 1.0, --mem 0 (memory phase disabled)\\n"
+            "          --warmup 0.25, pinned threads, clock=raw (if available)\\n",
             prog);
 }
 
@@ -283,8 +343,11 @@ int main(int argc, char **argv) {
         .threads = get_cpu_count(),
         .duration = 1.0,
         .seed = 1u,
-    .mem_bytes = 0 // memory phase disabled by default
+        .mem_bytes = 0 // memory phase disabled by default
     };
+    double warmup = 0.25;
+    int pin = 1;
+    int use_clock_raw = 1;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
@@ -295,6 +358,14 @@ int main(int argc, char **argv) {
             cfg.mem_bytes = (size_t)strtoull(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--no-mem")) {
             cfg.mem_bytes = 0;
+        } else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) {
+            warmup = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--no-pin")) {
+            pin = 0;
+        } else if (!strcmp(argv[i], "--clock") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "mono")) use_clock_raw = 0;
+            else if (!strcmp(m, "raw")) use_clock_raw = 1;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             usage(argv[0]);
             return 0;
@@ -309,7 +380,9 @@ int main(int argc, char **argv) {
     if (cfg.duration < 0.1) cfg.duration = 0.1;
     if (cfg.mem_bytes > 0 && cfg.mem_bytes < (size_t)1024) cfg.mem_bytes = (size_t)1024;
 
+    set_clock_mode(use_clock_raw);
     print_build_runtime_info(cfg.threads);
+
     printf("cpu-bench: threads=%d time=%.3fs mem_total=%zu bytes\n", cfg.threads, cfg.duration, cfg.mem_bytes);
 
     pthread_t *ths = (pthread_t *)calloc((size_t)cfg.threads, sizeof(*ths));
@@ -318,11 +391,22 @@ int main(int argc, char **argv) {
 
     const size_t per_thread_mem = cfg.mem_bytes / (size_t)cfg.threads;
 
+    pthread_barrier_t bar;
+    if (cfg.threads > 1) {
+        if (pthread_barrier_init(&bar, NULL, (unsigned)cfg.threads) != 0) {
+            perror("pthread_barrier_init");
+            return 1;
+        }
+    }
+
     for (int t = 0; t < cfg.threads; ++t) {
         res[t].id = t;
         res[t].cpu_work = 1; // reserved, not used in this version
         res[t].mem_bytes = per_thread_mem;
-        res[t].seconds = cfg.duration;
+    res[t].seconds = cfg.duration;
+    res[t].warmup = warmup;
+    res[t].pin = pin;
+    res[t].bar = (cfg.threads > 1) ? &bar : NULL;
         res[t].checksum = 0;
         int rc = pthread_create(&ths[t], NULL, worker, &res[t]);
         if (rc != 0) { errno = rc; perror("pthread_create"); return 1; }
@@ -349,6 +433,9 @@ int main(int argc, char **argv) {
     }
     printf("CHK  : 0x%016llx\n", (unsigned long long)checksum);
 
+    if (cfg.threads > 1) {
+        (void)pthread_barrier_destroy(&bar);
+    }
     free(ths);
     free(res);
     return 0;

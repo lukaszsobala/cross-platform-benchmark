@@ -18,6 +18,18 @@ ifneq ($(strip $(MTUNE)),)
 	CFLAGS += -mtune=$(MTUNE)
 endif
 
+# Fairness toggles (defaults: scalar FP, no auto-vectorization or FMA contraction)
+VECTORIZE ?= 0
+FMA ?= 0
+ifeq ($(VECTORIZE),0)
+	CFLAGS += -fno-tree-vectorize -DNO_TREE_VECTORIZE=1
+endif
+ifeq ($(FMA),0)
+	CFLAGS += -ffp-contract=off -DFFP_CONTRACT_OFF=1
+else
+	CFLAGS += -ffp-contract=fast -DFFP_CONTRACT_FAST=1
+endif
+
 # Host arch detection to make 'native' robust across platforms (esp. riscv64)
 HOST_ARCH := $(shell uname -m)
 NATIVE_MARCH ?= native

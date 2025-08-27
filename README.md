@@ -47,12 +47,26 @@ make sg2000
 This maps to `-march=rv64imafdcv_zicsr_zifencei -mtune=generic`. Adjust `MTUNE` if your toolchain provides a specific tuner.
 ```
 
+Fairness defaults (for cross-arch comparisons):
+- Auto-vectorization disabled: `-fno-tree-vectorize`
+- FMA contraction disabled: `-ffp-contract=off`
+
+Enable for peak per-arch throughput:
+
+```
+make VECTORIZE=1                 # allow compiler vectorization
+make VECTORIZE=1 FMA=1           # allow vectorization and FMA contraction
+```
+
 ## Run
 
 ```
 ./cpu-bench --help
 ./cpu-bench --threads 4 --time 2.0                    # CPU-only (default)
 ./cpu-bench --threads 4 --time 2.0 --mem 268435456    # enable memory phase (256 MiB total)
+./cpu-bench --threads 4 --time 2.0 --warmup 0.25      # add warm-up before each phase
+./cpu-bench --no-pin                                  # disable thread pinning
+./cpu-bench --clock mono                              # use CLOCK_MONOTONIC instead of RAW
 ```
 
 Defaults:
@@ -78,3 +92,4 @@ Notes:
 - For apples-to-apples comparisons, pin clocks and disable turbo and frequency scaling.
 - Avoid using `-ffast-math` if you care about strict FP semantics; results will change.
 - To enable memory, pass `--mem <bytes>` (split across threads). The memory phase uses a cache-line stride and read+write pattern; adjust `stride` in `bench.c` if needed.
+- For apples-to-apples across ISAs, keep VECTORIZE/FMA consistent. Enabling RVV on RISC‑V while using baseline x86-64 will skew results.
