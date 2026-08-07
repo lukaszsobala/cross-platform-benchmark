@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/utsname.h>
+#include <dirent.h>
 #ifdef __linux__
 #include <sched.h>
 #endif
@@ -133,7 +134,6 @@ typedef struct {
 
 typedef struct {
     void   **cur[CHASE_WAYS];
-    int      ways;
 } chase_ctx_t;
 
 // Indirect dispatch through a table of tiny functions selected by random data.
@@ -354,6 +354,58 @@ static double cpu_max_mhz(int cpu) {
 }
 
 // ---------------------------------------------------------------------------
+// DRAM controller frequency (Linux devfreq)
+// ---------------------------------------------------------------------------
+//
+// Some SoCs scale the memory controller clock independently of the CPU, over a
+// range wide enough to dominate every memory measurement (4x on RK35xx). The
+// memory phases warm up with real traffic to force a ramp, but the governor may
+// still not reach its top step. Reporting the observed clock makes that visible
+// instead of leaving it as unexplained variance.
+static char g_dram_freq_path[288];
+static char g_dram_name[64];
+
+static void find_dram_devfreq(void) {
+    g_dram_freq_path[0] = '\0';
+    g_dram_name[0] = '\0';
+    DIR *d = opendir("/sys/class/devfreq");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char npath[288];
+        snprintf(npath, sizeof(npath), "/sys/class/devfreq/%s/name", e->d_name);
+        char name[64] = {0};
+        FILE *f = fopen(npath, "r");
+        if (f) {
+            if (!fgets(name, (int)sizeof(name), f)) name[0] = '\0';
+            fclose(f);
+        }
+        // Fall back to the directory name when there is no name attribute.
+        const char *id = name[0] ? name : e->d_name;
+        if (strstr(id, "dmc") || strstr(id, "ddr") || strstr(id, "mem")) {
+            snprintf(g_dram_freq_path, sizeof(g_dram_freq_path),
+                     "/sys/class/devfreq/%s/cur_freq", e->d_name);
+            size_t len = strlen(id);
+            while (len > 0 && (id[len - 1] == '\n' || id[len - 1] == '\r')) len--;
+            snprintf(g_dram_name, sizeof(g_dram_name), "%.*s", (int)len, id);
+            break;
+        }
+    }
+    closedir(d);
+}
+
+static double dram_mhz(void) {
+    if (!g_dram_freq_path[0]) return 0.0;
+    FILE *f = fopen(g_dram_freq_path, "r");
+    if (!f) return 0.0;
+    double hz = 0.0;
+    if (fscanf(f, "%lf", &hz) != 1) hz = 0.0;
+    fclose(f);
+    return hz > 0.0 ? hz / 1e6 : 0.0;
+}
+
+// ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
 
@@ -379,8 +431,8 @@ typedef struct {
     double mem_mlp_ns;     // CHASE_WAYS chains in flight, per access
     double disp_mops;      // unpredictable indirect calls per second
     double mhz_observed;   // sampled while the core was under load
+    double dram_mhz_observed; // DRAM controller clock during the memory phases
     int    cpu_observed;   // sched_getcpu() during the run
-    int    ok;
 } worker_t;
 
 static void wsync(worker_t *w) {
@@ -619,6 +671,8 @@ static void *worker(void *arg) {
         const uint64_t passes = run_timed(mem_kernel_bw, &m, w->seconds, 1, &elapsed);
         const double bytes = (double)passes * (double)nbytes * 2.0; // read + write
         keep_best_rate(&w->mem_gbps, bytes / 1e9 / elapsed);
+        const double dm = dram_mhz();
+        if (dm > w->dram_mhz_observed) w->dram_mhz_observed = dm;
         for (int i = 0; i < 4; ++i) w->checksum ^= m.acc[i];
     }
 
@@ -630,7 +684,6 @@ static void *worker(void *arg) {
         phase_begin_mem(w, rep, buf, nbytes, 1);
         if (!chase_ok) continue;
         chase_ctx_t ch;
-        ch.ways = 1;
         ch.cur[0] = (void **)heads[0];
         const uint64_t hops = run_timed(mem_kernel_lat, &ch, w->seconds, 4096, &elapsed);
         keep_best_lat(&w->mem_lat_ns, elapsed / (double)hops * 1e9);
@@ -646,7 +699,6 @@ static void *worker(void *arg) {
         phase_begin_mem(w, rep, buf, nbytes, 1);
         if (!chase_ok) continue;
         chase_ctx_t ch;
-        ch.ways = CHASE_WAYS;
         for (int i = 0; i < CHASE_WAYS; ++i) ch.cur[i] = (void **)heads[i];
         const uint64_t hops = run_timed(mem_kernel_mlp, &ch, w->seconds, 1024, &elapsed);
         keep_best_lat(&w->mem_mlp_ns,
@@ -657,7 +709,6 @@ static void *worker(void *arg) {
     }
 
     free(buf);
-    w->ok = 1;
     return NULL;
 }
 
@@ -862,6 +913,64 @@ static void usage(const char *prog) {
         prog);
 }
 
+// Largest cache size reported by sysfs, in bytes (0 if unknown).
+static size_t detect_llc_bytes(void) {
+    size_t best = 0;
+    for (int i = 0; i < 16; ++i) {
+        char path[160];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/size", i);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        char val[32] = {0};
+        if (fgets(val, (int)sizeof(val), f)) {
+            char *end = NULL;
+            const double n = strtod(val, &end);
+            size_t mult = 1;
+            if (end && (*end == 'K' || *end == 'k')) mult = 1024;
+            else if (end && (*end == 'M' || *end == 'm')) mult = 1024 * 1024;
+            const size_t bytes = (size_t)(n * (double)mult);
+            if (bytes > best) best = bytes;
+        }
+        fclose(f);
+    }
+    return best;
+}
+
+// The memory phases only mean anything if the working set clears last-level
+// cache. A buffer that fits in cache silently turns "MEM-lat" into a cache
+// latency measurement, which looks like a spectacular result rather than a
+// misconfiguration.
+static void warn_if_working_set_small(size_t per_thread, int threads, int per_core) {
+    if (per_thread == 0) return;
+    const size_t llc = detect_llc_bytes();
+    if (llc == 0) return;
+    const size_t total = per_core ? per_thread : per_thread * (size_t)threads;
+    if (total < llc * 2) {
+        printf("WARNING: %zu KiB working set vs %zu KiB last-level cache. The "
+               "memory phases\n"
+               "         will report cache behaviour, not DRAM. Raise "
+               "--mem-per-thread.\n",
+               total >> 10, llc >> 10);
+    }
+}
+
+// Report the DRAM controller clock seen while the memory phases were running.
+// If it moved during the run, or never reached the top step, the memory numbers
+// carry that variance and the reader needs to know.
+static void report_dram(double lo, double hi) {
+    if (hi <= 0.0) return;
+    if (hi - lo > 1.0) {
+        printf("DRAM (%s): %.0f-%.0f MHz during memory phases -- the controller "
+               "changed\n"
+               "      speed mid-run, so memory results carry that spread. Pin its "
+               "governor\n"
+               "      to 'performance' for stable numbers.\n", g_dram_name, lo, hi);
+    } else {
+        printf("DRAM (%s): %.0f MHz during memory phases\n", g_dram_name, hi);
+    }
+}
+
 static double geomean(const double *v, int n) {
     double s = 0.0;
     int m = 0;
@@ -953,11 +1062,8 @@ int main(int argc, char **argv) {
         for (int i = 0; i < want && i < ARRAY_LEN(cpu_list); ++i) cpu_list[i] = i;
         n_cpus = want < ARRAY_LEN(cpu_list) ? want : ARRAY_LEN(cpu_list);
     }
-    if (!per_core && threads > n_cpus) {
-        // More threads than listed CPUs: wrap around the list.
-    }
-
     set_clock_mode(use_clock_raw);
+    find_dram_devfreq();
     print_platform();
 
     if (mem_total > 0) {
@@ -979,6 +1085,7 @@ int main(int argc, char **argv) {
     };
 
     warn_if_loaded(threads);
+    warn_if_working_set_small(mem_per_thread, threads, per_core);
 
     // -----------------------------------------------------------------------
     // Per-core sweep
@@ -995,6 +1102,7 @@ int main(int argc, char **argv) {
                "GB/s", "ns", "x", "Mcall/s", "geomean");
 
         double best = 0.0, worst = 0.0;
+        double dram_lo = 0.0, dram_hi = 0.0;
         for (int i = 0; i < n_cpus; ++i) {
             worker_t w;
             memset(&w, 0, sizeof(w));
@@ -1008,6 +1116,12 @@ int main(int argc, char **argv) {
             const double score = core_score(&w);
             if (score > best) best = score;
             if (worst == 0.0 || score < worst) worst = score;
+            if (w.dram_mhz_observed > 0.0) {
+                if (w.dram_mhz_observed > dram_hi) dram_hi = w.dram_mhz_observed;
+                if (dram_lo == 0.0 || w.dram_mhz_observed < dram_lo) {
+                    dram_lo = w.dram_mhz_observed;
+                }
+            }
 
             printf("%4d %6.0f  %8.1f %8.1f %5.2f  %8.1f %8.1f  %7.2f %7.1f %5.2f  %8.1f   %8.1f\n",
                    cpu_list[i], mhz,
@@ -1020,6 +1134,7 @@ int main(int argc, char **argv) {
         if (worst > 0.0) {
             printf("\nfastest/slowest core ratio: %.2fx\n", best / worst);
         }
+        report_dram(dram_lo, dram_hi);
         printf("ILP = INT-thr/INT-lat, how much instruction parallelism the core extracts\n"
                "      from 8 independent chains. A 2-wide in-order core caps out near 2x.\n"
                "MLP = MEMlat / (latency with %d chases in flight): how much memory latency\n"
@@ -1078,7 +1193,18 @@ int main(int argc, char **argv) {
             printf("%-18s %12s %12.1f\n", "MEM-lat/8 ns", "-", mlp_ns_sum / mlp_n);
         }
     }
-    printf("\nILP (INT-thr / INT-lat): %.2fx\n", int_lat > 0.0 ? int_thr / int_lat : 0.0);
+    {
+        double dlo = 0.0, dhi = 0.0;
+        for (int i = 0; i < threads; ++i) {
+            const double d = w[i].dram_mhz_observed;
+            if (d <= 0.0) continue;
+            if (d > dhi) dhi = d;
+            if (dlo == 0.0 || d < dlo) dlo = d;
+        }
+        printf("\n");
+        report_dram(dlo, dhi);
+    }
+    printf("ILP (INT-thr / INT-lat): %.2fx\n", int_lat > 0.0 ? int_thr / int_lat : 0.0);
     if (lat_n > 0 && mlp_n > 0) {
         printf("MLP (latency overlapped): %.2fx\n",
                (lat_ns_sum / lat_n) / (mlp_ns_sum / mlp_n));

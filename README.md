@@ -24,7 +24,7 @@ Each compute kernel is run in two variants built from the *same* op sequence:
 `ILP`, `DISPATCH` and `MLP` exist because a register-resident ALU loop is the
 *best case* for a small in-order core and will badly underrate a big core. On a
 4x Cortex-A55 + 4x Cortex-A76 board, the A76 leads the A55 by only ~1.3x per
-clock on pure ALU throughput, but by ~5x on MLP. Real code depends on both.
+clock on pure ALU throughput, but by ~4x on MLP. Real code depends on both.
 
 ### Pitfalls this benchmark deliberately avoids
 
@@ -129,9 +129,15 @@ core types can be compared directly:
 ```
 
 For the most stable numbers, quiesce the machine first; `cpu-bench` prints a
-warning if the load average suggests otherwise. On platforms with a scaling DRAM
-controller, pinning its governor to `performance` removes the largest remaining
-source of `MEMlat` variance.
+warning if the load average suggests otherwise. It also warns if the working set
+does not clear last-level cache, and reports the DRAM controller clock observed
+during the memory phases (if it moved mid-run, the memory numbers carry that
+spread; pin the governor to `performance`).
+
+Compute phases repeat to within <1% across identical cores. `MEMlat` and the
+`MLP` derived from it still vary ~20%, which is physical page placement: without
+transparent huge pages a 16 MiB random chase spans 4096 pages and the DRAM
+bank/rank distribution differs per allocation.
 
 
 Notes:
