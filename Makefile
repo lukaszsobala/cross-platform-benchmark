@@ -6,7 +6,7 @@ CC ?= cc
 CFLAGS ?= -O3 -pipe -std=c2x -Wall -Wextra -Wshadow -Wconversion -Wdouble-promotion -Wformat=2 -fno-strict-aliasing
 # Avoid forcing -march=native by default for portability; allow user to add via CFLAGS
 LDFLAGS ?=
-LIBS := -pthread
+LIBS := -pthread -lm
 
 # Optional tuning (set by user):
 #   make MARCH=native MTUNE=native

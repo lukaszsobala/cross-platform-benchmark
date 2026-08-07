@@ -5,10 +5,51 @@ A tiny, portable CPU benchmark in C (C2x, GCC 13+) for common 64-bit architectur
 - AArch64 (ARMv8-A)
 - RISC-V 64 (rv64imafdcvsu)
 
-No external dependencies beyond libc and pthreads. It measures:
-- Integer ALU throughput (MOPS)
-- Double-precision FLOPs (MFLOPS)
-- Memory bandwidth (GB/s, read+write) — disabled by default
+No external dependencies beyond libc, libm and pthreads.
+
+## What it measures, and why
+
+Each compute kernel is run in two variants built from the *same* op sequence:
+
+| Metric | Meaning |
+|---|---|
+| `INT-lat` / `FP64-lat` | one dependency chain — per-op latency |
+| `INT-thr` / `FP64-thr` | 8 independent chains — how much ILP the core extracts |
+| `ILP` | `thr/lat`. A 2-wide in-order core caps near 2x; a wide OoO core goes higher |
+| `DISPATCH` | unpredictable indirect calls/s — indirect branch predictor + front end |
+| `MEM` | sequential read+write bandwidth, GB/s |
+| `MEMlat` | random-access latency, one dependent pointer chase |
+| `MLP` | `MEMlat / latency with 8 chases in flight` — how much memory latency the core overlaps |
+
+`ILP`, `DISPATCH` and `MLP` exist because a register-resident ALU loop is the
+*best case* for a small in-order core and will badly underrate a big core. On a
+4x Cortex-A55 + 4x Cortex-A76 board, the A76 leads the A55 by only ~1.3x per
+clock on pure ALU throughput, but by ~5x on MLP. Real code depends on both.
+
+### Pitfalls this benchmark deliberately avoids
+
+- **No `volatile` in a hot loop.** A volatile accumulator forces a store+reload
+  of every intermediate, turning any kernel into a store-to-load-forwarding
+  latency test. That is roughly constant across core widths, so a wide
+  out-of-order core scores barely above an in-order one. Dead-code elimination
+  is prevented with a checksum the caller reads instead.
+- **FP state stays in normal range forever.** The FP kernel is a 2D rotation,
+  which is norm-preserving up to rounding. A naive FP chain overflows to Inf
+  within ~10 iterations and then measures NaN-propagation speed for the
+  remaining billion — and NaN/denormal handling differs wildly between cores.
+- **Latency and MLP chases have identical footprints.** Both walk the whole
+  buffer (the 8-way chase is interleaved, not sliced), so the single-chain
+  number cannot accidentally fit in last-level cache and inflate the ratio.
+- **The memory phases warm up with memory traffic.** A pure-ALU warm-up does not
+  ramp a DRAM controller that scales its clock (devfreq/`dmc_ondemand` spans a
+  4x range on some SoCs), which otherwise causes ~2x swings between identical cores.
+- **Best-of-N, not mean.** Interference can only make a run slower, so the
+  fastest repetition is closest to the machine's true capability.
+
+Note that "ops" are counted at the C level, not as machine instructions. AArch64
+folds shifts into ALU operands, so one `INT_STEP` is 4 instructions there and
+more on x86-64. That is intentional: the benchmark measures how fast a machine
+performs a specified computation, and ISA efficiency is part of that.
 
 ## Build (GCC 13+)
 
@@ -62,29 +103,36 @@ make VECTORIZE=1 FMA=1           # allow vectorization and FMA contraction
 
 ```
 ./cpu-bench --help
-./cpu-bench --threads 4 --time 2.0                    # CPU-only (default)
-./cpu-bench --threads 4 --time 2.0 --mem 268435456    # enable memory phase (256 MiB total)
-./cpu-bench --threads 4 --time 2.0 --warmup 0.25      # add warm-up before each phase
-./cpu-bench --no-pin                                  # disable thread pinning
-./cpu-bench --clock mono                              # use CLOCK_MONOTONIC instead of RAW
+./cpu-bench                                  # all cores, all phases
+./cpu-bench --per-core                       # sweep each CPU single-threaded (see below)
+./cpu-bench --cpus 4-7 --threads 4           # only the big cluster
+./cpu-bench --time 2.0 --reps 5              # longer and more repetitions
+./cpu-bench --mem-per-thread 33554432        # 32 MiB working set per thread
+./cpu-bench --no-mem                         # skip the memory phases
+./cpu-bench --no-pin                         # disable thread pinning
 ```
 
-Defaults:
-- threads = online cores
-- time = 1.0 s per phase (int, fp)
-- mem = 0 (memory phase disabled)
+Defaults: threads = online cores, `--time 0.5` per phase, `--reps 3`,
+`--warmup 0.15`, 16 MiB per thread for the memory phases, pinned, `--clock raw`.
 
-Example output:
+### Per-core sweep
+
+On a heterogeneous machine (big.LITTLE, Intel P/E-cores) `--per-core` runs the
+whole suite single-threaded on each CPU in turn and tabulates the result, so
+core types can be compared directly:
 
 ```
-build: gcc 13.x, C2x, target=aarch64
-system: Linux 6.x #1 SMP, machine=aarch64, cores=8
-cpu: Neoverse-N2 (or model name)
-cpu-bench: threads=8 time=1.000s mem_total=0 bytes
-INT  :    42000.5 MOPS
-FP64 :    38000.2 MFLOPS
-CHK  : 0x3f9c4a7b2ee6c0d1
+ CPU    MHz   INT-lat  INT-thr   ILP    FP-lat   FP-thr      MEM  MEMlat   MLP  DISPATCH      score
+   0   1800    1321.4   3416.7  2.59    1090.3   2994.5    10.38   156.4  2.59     113.7     3723.7
+   ...
+   4   2400    2259.2   5962.7  2.64    2001.5   3709.8    20.24   148.7  9.17     121.5     6379.5
 ```
+
+For the most stable numbers, quiesce the machine first; `cpu-bench` prints a
+warning if the load average suggests otherwise. On platforms with a scaling DRAM
+controller, pinning its governor to `performance` removes the largest remaining
+source of `MEMlat` variance.
+
 
 Notes:
 - The numbers are synthetic and not directly comparable to industry benchmarks.
