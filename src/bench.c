@@ -100,12 +100,18 @@ static inline uint64_t xs64(uint64_t *s) {
 // add/xor/sub against a register are one instruction and one cycle on every
 // target ISA, so with the constants hoisted into registers this measures issue
 // width and nothing else. Multiply capability is measured separately below.
-#define INT_STEP(a, k1, k2, k3, k4)                   \
+//
+// Only two constants, reused, so the whole kernel needs 8 lane registers + 2
+// constants + a counter. x86-64 has 16 GPRs; four constants would put this at
+// the edge of spilling, and spill traffic would show up as a cross-ISA bias
+// against x86 that has nothing to do with issue width. The intervening xors
+// stop the compiler folding `+k1` and `-k1` together.
+#define INT_STEP(a, k1, k2)                           \
     do {                                              \
         (a) += (k1);                                  \
         (a) ^= (k2);                                  \
-        (a) -= (k3);                                  \
-        (a) ^= (k4);                                  \
+        (a) -= (k1);                                  \
+        (a) ^= (k2);                                  \
     } while (0)
 #define INT_OPS_PER_STEP 4u
 
@@ -131,7 +137,7 @@ static inline uint64_t xs64(uint64_t *s) {
 #define FP_STEP(x, c, b) do { (x) = (x) * (c) + (b); } while (0)
 #define FP_OPS_PER_STEP 2u
 
-typedef struct { uint64_t l[LANES]; uint64_t k[4]; } int_ctx_t;
+typedef struct { uint64_t l[LANES]; uint64_t k[2]; } int_ctx_t;
 typedef struct { uint64_t l[LANES]; uint64_t m; } mul_ctx_t;
 typedef struct { double x[LANES], b[LANES], c; } fp_ctx_t;
 
@@ -177,24 +183,24 @@ typedef void (*kernel_fn)(void *ctx, uint64_t n);
 // compiler cannot fold `+k1` and `-k3` together across the intervening xors.
 NOINLINE static void int_kernel_lat(void *vctx, uint64_t n) {
     int_ctx_t *c = (int_ctx_t *)vctx;
-    const uint64_t k1 = c->k[0], k2 = c->k[1], k3 = c->k[2], k4 = c->k[3];
+    const uint64_t k1 = c->k[0], k2 = c->k[1];
     uint64_t a0 = c->l[0];
     for (uint64_t i = 0; i < n; ++i) {
-        INT_STEP(a0, k1, k2, k3, k4);
+        INT_STEP(a0, k1, k2);
     }
     c->l[0] = a0;
 }
 
 NOINLINE static void int_kernel_thr(void *vctx, uint64_t n) {
     int_ctx_t *c = (int_ctx_t *)vctx;
-    const uint64_t k1 = c->k[0], k2 = c->k[1], k3 = c->k[2], k4 = c->k[3];
+    const uint64_t k1 = c->k[0], k2 = c->k[1];
     uint64_t a0 = c->l[0], a1 = c->l[1], a2 = c->l[2], a3 = c->l[3];
     uint64_t a4 = c->l[4], a5 = c->l[5], a6 = c->l[6], a7 = c->l[7];
     for (uint64_t i = 0; i < n; ++i) {
-        INT_STEP(a0, k1, k2, k3, k4); INT_STEP(a1, k1, k2, k3, k4);
-        INT_STEP(a2, k1, k2, k3, k4); INT_STEP(a3, k1, k2, k3, k4);
-        INT_STEP(a4, k1, k2, k3, k4); INT_STEP(a5, k1, k2, k3, k4);
-        INT_STEP(a6, k1, k2, k3, k4); INT_STEP(a7, k1, k2, k3, k4);
+        INT_STEP(a0, k1, k2); INT_STEP(a1, k1, k2);
+        INT_STEP(a2, k1, k2); INT_STEP(a3, k1, k2);
+        INT_STEP(a4, k1, k2); INT_STEP(a5, k1, k2);
+        INT_STEP(a6, k1, k2); INT_STEP(a7, k1, k2);
     }
     c->l[0] = a0; c->l[1] = a1; c->l[2] = a2; c->l[3] = a3;
     c->l[4] = a4; c->l[5] = a5; c->l[6] = a6; c->l[7] = a7;
@@ -361,7 +367,6 @@ static void warmup_spin(double sec) {
     int_ctx_t c;
     for (int i = 0; i < LANES; ++i) c.l[i] = (uint64_t)i + 1u;
     c.k[0] = UINT64_C(0x9E3779B97F4A7C15); c.k[1] = UINT64_C(0xBF58476D1CE4E5B9);
-    c.k[2] = UINT64_C(0x94D049BB133111EB); c.k[3] = UINT64_C(0x2545F4914F6CDD1D);
     const double t_end = now_sec() + sec;
     while (now_sec() < t_end) {
         int_kernel_thr(&c, 20000);
@@ -628,7 +633,7 @@ static void *worker(void *arg) {
     for (int rep = 0; rep < reps; ++rep) {
         int_ctx_t c;
         for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
-        for (int i = 0; i < 4; ++i) c.k[i] = xs64(&seed) | 1u;
+        for (int i = 0; i < 2; ++i) c.k[i] = xs64(&seed) | 1u;
         phase_begin(w, rep);
         const uint64_t it = run_timed(int_kernel_lat, &c, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->int_lat_mops,
@@ -640,7 +645,7 @@ static void *worker(void *arg) {
     for (int rep = 0; rep < reps; ++rep) {
         int_ctx_t c;
         for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
-        for (int i = 0; i < 4; ++i) c.k[i] = xs64(&seed) | 1u;
+        for (int i = 0; i < 2; ++i) c.k[i] = xs64(&seed) | 1u;
         phase_begin(w, rep);
         const uint64_t it = run_timed(int_kernel_thr, &c, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->int_thr_mops,
@@ -1011,6 +1016,58 @@ static void warn_if_working_set_small(size_t per_thread, int threads, int per_co
     }
 }
 
+static void print_legend_ratios(void);
+
+// Names every column of the results table. The table itself has to stay narrow
+// enough to read, so the headers are shorthand and the full name lives here.
+static void print_legend(void) {
+    printf("\nwhat each column means\n");
+    printf("  %-9s %-24s %s\n", "MHz", "core clock",
+           "observed under load; '~' = estimated from INT-lat");
+    printf("  %-9s %-24s %s\n", "INT-lat", "integer latency",
+           "one dependent chain of 1-cycle ALU ops, Mops/s");
+    printf("  %-9s %-24s %s\n", "INT-thr", "integer throughput",
+           "8 independent chains, Mops/s");
+    printf("  %-9s %-24s %s\n", "ILP", "instruction parallelism",
+           "INT-thr / INT-lat");
+    printf("  %-9s %-24s %s\n", "MUL-thr", "multiply throughput",
+           "64-bit integer multiplies, Mmul/s");
+    printf("  %-9s %-24s %s\n", "FP-lat", "FP latency",
+           "one dependent multiply-add chain, Mflop/s");
+    printf("  %-9s %-24s %s\n", "FP-thr", "FP throughput",
+           "8 independent chains, Mflop/s");
+    printf("  %-9s %-24s %s\n", "fILP", "FP ops in flight",
+           "FP-thr / FP-lat");
+    printf("  %-9s %-24s %s\n", "MEM", "memory bandwidth",
+           "sequential read+write sweep, GB/s");
+    printf("  %-9s %-24s %s\n", "MEMlat", "memory latency",
+           "random dependent pointer chase, ns");
+    printf("  %-9s %-24s %s\n", "MLP", "memory parallelism",
+           "MEMlat / latency with 8 chases in flight");
+    printf("  %-9s %-24s %s\n", "DISPATCH", "indirect dispatch",
+           "unpredictable indirect calls, Mcall/s");
+    printf("  %-9s %-24s %s\n", "score", "composite",
+           "geomean of INT-thr, MUL-thr, FP-thr, DISPATCH, MLP rate");
+
+    print_legend_ratios();
+    printf("  score is comparable across cores of one run, not across machines.\n");
+}
+
+// The ratio columns are the ones a reader is most likely to misread, so these
+// notes print in both the per-core sweep and the default multi-threaded run.
+static void print_legend_ratios(void) {
+    printf("\nreading the ratios\n");
+    printf("  ILP tracks issue width: the integer kernel holds no multiply, so\n"
+           "  INT-lat pins to 1 op/cycle and the ratio is what the core issues in\n"
+           "  parallel. Roughly 2x for a 2-wide in-order core, 3x for 3 ALUs.\n");
+    printf("  fILP is NOT a width measure and not \"bigger is better\". FP latency\n"
+           "  varies 3-6 cycles between cores, so a core with slow FP needs more ops\n"
+           "  in flight to fill its pipes and scores higher. Compare FP-thr instead.\n");
+    printf("  MLP shows how much memory latency the core hides. In-order cores stall\n"
+           "  on the first miss and sit near 1x. It can exceed %d when parallel page\n"
+           "  table walks overlap as well.\n", CHASE_WAYS);
+}
+
 // Report the DRAM controller clock seen while the memory phases were running.
 // If it moved during the run, or never reached the top step, the memory numbers
 // carry that variance and the reader needs to know.
@@ -1064,6 +1121,7 @@ int main(int argc, char **argv) {
     int reps = 3;
     size_t mem_per_thread = (size_t)16 << 20;
     size_t mem_total = 0;
+    int mem_explicit = 0;
     uint64_t seed = 1;
 
     for (int i = 1; i < argc; ++i) {
@@ -1083,11 +1141,14 @@ int main(int argc, char **argv) {
             warmup = atof(argv[++i]);
         } else if (!strcmp(a, "--mem-per-thread") && i + 1 < argc) {
             mem_per_thread = (size_t)strtoull(argv[++i], NULL, 0);
+            mem_explicit = 1;
         } else if (!strcmp(a, "--mem") && i + 1 < argc) {
             mem_total = (size_t)strtoull(argv[++i], NULL, 0);
+            mem_explicit = 1;
         } else if (!strcmp(a, "--no-mem")) {
             mem_per_thread = 0;
             mem_total = 0;
+            mem_explicit = 1;
         } else if (!strcmp(a, "--no-pin")) {
             pin = 0;
         } else if (!strcmp(a, "--clock") && i + 1 < argc) {
@@ -1123,6 +1184,18 @@ int main(int argc, char **argv) {
     find_dram_devfreq();
     print_platform();
 
+    // Size the default working set from the cache the machine actually has. A
+    // fixed 16 MiB default silently measures cache, not DRAM, on anything with a
+    // large last-level cache -- a 12 MiB LLC leaves a 16 MiB buffer only 1.3x
+    // oversubscribed, which is nowhere near enough.
+    if (!mem_explicit) {
+        const size_t llc = detect_llc_bytes();
+        if (llc > 0) {
+            const int eff = per_core ? 1 : (threads > 0 ? threads : 1);
+            const size_t want = (llc * 4) / (size_t)eff;
+            if (want > mem_per_thread) mem_per_thread = want;
+        }
+    }
     if (mem_total > 0) {
         const int div = per_core ? 1 : threads;
         mem_per_thread = mem_total / (size_t)(div > 0 ? div : 1);
@@ -1168,8 +1241,20 @@ int main(int argc, char **argv) {
             w.cpu = pin ? cpu_list[i] : -1;
             if (run_workers(&w, 1, &opts) != 0) return 1;
 
+            // INT-lat is one dependent 1-cycle op per cycle by construction --
+            // measured at 0.97-1.01 op/cycle on Cortex-A53/A55/A76, Skymont and
+            // Lion Cove -- so it doubles as a clock estimate where sysfs has no
+            // cpufreq node (marked with '~').
             double mhz = w.mhz_observed;
             if (mhz <= 0.0) mhz = cpu_max_mhz(cpu_list[i]);
+            char mhzbuf[16];
+            if (mhz > 0.0) {
+                snprintf(mhzbuf, sizeof(mhzbuf), "%.0f", mhz);
+            } else if (w.int_lat_mops > 0.0) {
+                snprintf(mhzbuf, sizeof(mhzbuf), "~%.0f", w.int_lat_mops);
+            } else {
+                snprintf(mhzbuf, sizeof(mhzbuf), "?");
+            }
             const double ilp = w.int_lat_mops > 0.0 ? w.int_thr_mops / w.int_lat_mops : 0.0;
             const double filp = w.fp_lat_mflops > 0.0 ? w.fp_thr_mflops / w.fp_lat_mflops : 0.0;
             const double mlp = w.mem_mlp_ns > 0.0 ? w.mem_lat_ns / w.mem_mlp_ns : 0.0;
@@ -1183,8 +1268,8 @@ int main(int argc, char **argv) {
                 }
             }
 
-            printf("%4d %6.0f  %8.1f %8.1f %5.2f %8.1f  %8.1f %8.1f %5.2f  %7.2f %7.1f %5.2f  %8.1f  %8.1f\n",
-                   cpu_list[i], mhz,
+            printf("%4d %6s  %8.1f %8.1f %5.2f %8.1f  %8.1f %8.1f %5.2f  %7.2f %7.1f %5.2f  %8.1f  %8.1f\n",
+                   cpu_list[i], mhzbuf,
                    w.int_lat_mops, w.int_thr_mops, ilp, w.mul_thr_mops,
                    w.fp_lat_mflops, w.fp_thr_mflops, filp,
                    w.mem_gbps, w.mem_lat_ns, mlp,
@@ -1195,22 +1280,7 @@ int main(int argc, char **argv) {
             printf("\nfastest/slowest core ratio: %.2fx\n", best / worst);
         }
         report_dram(dram_lo, dram_hi);
-        printf("ILP  = INT-thr/INT-lat. The integer kernel is 4 dependent 1-cycle ALU\n"
-               "      ops and contains no multiply, so INT-lat pins to 1 op/cycle and ILP\n"
-               "      reads out issue width directly: ~2x for a 2-wide in-order core, ~3x\n"
-               "      for 3 integer ALUs. MUL-thr reports multiplier throughput separately,\n"
-               "      because a multiply in this kernel would bottleneck both halves of the\n"
-               "      ratio and flatten it.\n"
-               "fILP = FP-thr/FP-lat. NOT a width measure and not \"bigger is better\":\n"
-               "      FP latency varies 3-6 cycles between cores, so a core with slow FP\n"
-               "      needs more ops in flight to fill its pipes and scores higher here.\n"
-               "      Compare FP-thr for capability; fILP only says how many are in flight.\n"
-               "MLP = MEMlat / (latency with %d chases in flight): how much memory latency\n"
-               "      the core overlaps. In-order cores stall on the first miss and sit\n"
-               "      near 1x. Can exceed %d when parallel TLB walks overlap too.\n"
-               "score = geomean of INT-thr, FP-thr, dispatch rate and parallel random-access\n"
-               "        rate. Comparable across cores of one run, not across machines.\n",
-               CHASE_WAYS, CHASE_WAYS);
+        print_legend();
         return 0;
     }
 
@@ -1248,22 +1318,42 @@ int main(int argc, char **argv) {
     }
     const double n = (double)threads;
 
-    printf("%-18s %12s %12s\n", "metric", "total", "per-thread");
-    printf("%-18s %12.1f %12.1f\n", "INT-lat  Mops/s", int_lat, int_lat / n);
-    printf("%-18s %12.1f %12.1f\n", "INT-thr  Mops/s", int_thr, int_thr / n);
-    printf("%-18s %12.1f %12.1f\n", "MUL-thr  Mmul/s", mul_thr, mul_thr / n);
-    printf("%-18s %12.1f %12.1f\n", "FP64-lat Mflop/s", fp_lat, fp_lat / n);
-    printf("%-18s %12.1f %12.1f\n", "FP64-thr Mflop/s", fp_thr, fp_thr / n);
-    printf("%-18s %12.1f %12.1f\n", "DISPATCH Mcall/s", disp, disp / n);
+    printf("%-9s %-23s %8s %11s %11s\n",
+           "metric", "what it measures", "unit", "total", "per-thread");
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "INT-lat", "integer latency", "Mops/s", int_lat, int_lat / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "INT-thr", "integer throughput", "Mops/s", int_thr, int_thr / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "MUL-thr", "multiply throughput", "Mmul/s", mul_thr, mul_thr / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "FP-lat", "FP latency", "Mflop/s", fp_lat, fp_lat / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "FP-thr", "FP throughput", "Mflop/s", fp_thr, fp_thr / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "DISPATCH", "indirect dispatch", "Mcall/s", disp, disp / n);
     if (mem_per_thread > 0) {
-        printf("%-18s %12.2f %12.2f\n", "MEM-bw   GB/s", gbps, gbps / n);
+        printf("%-9s %-23s %8s %11.2f %11.2f\n",
+               "MEM", "memory bandwidth", "GB/s", gbps, gbps / n);
         if (lat_n > 0) {
-            printf("%-18s %12s %12.1f\n", "MEM-lat  ns", "-", lat_ns_sum / lat_n);
+            printf("%-9s %-23s %8s %11s %11.1f\n",
+                   "MEMlat", "memory latency", "ns", "-", lat_ns_sum / lat_n);
         }
         if (mlp_n > 0) {
-            printf("%-18s %12s %12.1f\n", "MEM-lat/8 ns", "-", mlp_ns_sum / mlp_n);
+            printf("%-9s %-23s %8s %11s %11.1f\n",
+                   "MEMlat/8", "latency, 8 chases", "ns", "-", mlp_ns_sum / mlp_n);
         }
     }
+    // Derived ratios: per-thread only, so the "total" column stays blank.
+    printf("%-9s %-23s %8s %11s %11.2f\n", "ILP", "instruction parallelism",
+           "x", "-", int_lat > 0.0 ? int_thr / int_lat : 0.0);
+    printf("%-9s %-23s %8s %11s %11.2f\n", "fILP", "FP ops in flight",
+           "x", "-", fp_lat > 0.0 ? fp_thr / fp_lat : 0.0);
+    if (lat_n > 0 && mlp_n > 0) {
+        printf("%-9s %-23s %8s %11s %11.2f\n", "MLP", "memory parallelism",
+               "x", "-", (lat_ns_sum / lat_n) / (mlp_ns_sum / mlp_n));
+    }
+
     {
         double dlo = 0.0, dhi = 0.0;
         for (int i = 0; i < threads; ++i) {
@@ -1275,13 +1365,8 @@ int main(int argc, char **argv) {
         printf("\n");
         report_dram(dlo, dhi);
     }
-    printf("ILP  (INT-thr / INT-lat): %.2fx\n", int_lat > 0.0 ? int_thr / int_lat : 0.0);
-    printf("fILP (FP-thr  / FP-lat) : %.2fx\n", fp_lat > 0.0 ? fp_thr / fp_lat : 0.0);
-    if (lat_n > 0 && mlp_n > 0) {
-        printf("MLP (latency overlapped): %.2fx\n",
-               (lat_ns_sum / lat_n) / (mlp_ns_sum / mlp_n));
-    }
-    printf("CHK : 0x%016llx\n", (unsigned long long)checksum);
+    print_legend_ratios();
+    printf("\nchecksum: 0x%016llx\n", (unsigned long long)checksum);
 
     free(w);
     return 0;

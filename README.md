@@ -141,19 +141,29 @@ make VECTORIZE=1 FMA=1           # allow vectorization and FMA contraction
 ```
 
 Defaults: threads = online cores, `--time 0.5` per phase, `--reps 3`,
-`--warmup 0.15`, 16 MiB per thread for the memory phases, pinned, `--clock raw`.
+`--warmup 0.15`, pinned, `--clock raw`. The memory working set defaults to
+`max(16 MiB, 4 x LLC / threads)` per thread, read from sysfs — a fixed 16 MiB
+measures cache rather than DRAM on a machine with a 12 MiB last-level cache.
+
+Where sysfs exposes no cpufreq node (some SoCs), the `MHz` column falls back to
+an estimate derived from `INT-lat` and is marked with `~`. That works because
+`INT-lat` is one dependent 1-cycle op per cycle by construction; it measured
+0.97–1.01 op/cycle across Cortex-A53, A55, A76, Skymont and Lion Cove.
 
 ### Per-core sweep
 
 On a heterogeneous machine (big.LITTLE, Intel P/E-cores) `--per-core` runs the
 whole suite single-threaded on each CPU in turn and tabulates the result, so
-core types can be compared directly:
+core types can be compared directly. Both this table and the default
+multi-threaded one name every metric in full underneath, so the shorthand
+column headers do not have to be memorised:
 
 ```
- CPU    MHz   INT-lat  INT-thr   ILP    FP-lat   FP-thr      MEM  MEMlat   MLP  DISPATCH      score
-   0   1800    1321.4   3416.7  2.59    1090.3   2994.5    10.38   156.4  2.59     113.7     3723.7
+ CPU    MHz   INT-lat  INT-thr   ILP  MUL-thr    FP-lat   FP-thr  fILP      MEM  MEMlat   MLP  DISPATCH     score
+               Mops/s   Mops/s     x   Mmul/s   Mflop/s  Mflop/s     x     GB/s      ns     x   Mcall/s   geomean
+   0   1800    1817.8   3230.7  1.78    582.2     454.5   2907.3  6.40    10.34   153.8  2.53     113.9    3331.2
    ...
-   4   2400    2259.2   5962.7  2.64    2001.5   3709.8    20.24   148.7  9.17     121.5     6379.5
+   4   2400    2331.3   6581.3  2.82    777.4     932.9   4145.1  4.44    22.04   201.2 12.91     121.7    5810.7
 ```
 
 For the most stable numbers, quiesce the machine first; `cpu-bench` prints a
