@@ -14,8 +14,10 @@ Each compute kernel is run in two variants built from the *same* op sequence:
 | Metric | Meaning |
 |---|---|
 | `INT-lat` / `FP64-lat` | one dependency chain — per-op latency |
-| `INT-thr` / `FP64-thr` | 8 independent chains — how much ILP the core extracts |
-| `ILP` | `thr/lat`. A 2-wide in-order core caps near 2x; a wide OoO core goes higher |
+| `INT-thr` / `FP64-thr` | 8 independent chains — sustained throughput |
+| `ILP` | `INT-thr/INT-lat` — reads out integer issue width (see below) |
+| `MUL-thr` | 64-bit integer multiplies/s, measured on its own |
+| `fILP` | `FP-thr/FP-lat` — FP ops in flight. *Not* a width measure, see below |
 | `DISPATCH` | unpredictable indirect calls/s — indirect branch predictor + front end |
 | `MEM` | sequential read+write bandwidth, GB/s |
 | `MEMlat` | random-access latency, one dependent pointer chase |
@@ -25,6 +27,32 @@ Each compute kernel is run in two variants built from the *same* op sequence:
 *best case* for a small in-order core and will badly underrate a big core. On a
 4x Cortex-A55 + 4x Cortex-A76 board, the A76 leads the A55 by only ~1.3x per
 clock on pure ALU throughput, but by ~4x on MLP. Real code depends on both.
+
+### Keep the multiply out of the ILP kernel
+
+A 64-bit multiply is the scarcest integer resource on most cores — one pipe,
+often unpipelined. A kernel containing one is multiplier-bound in *both* the
+latency and the throughput variant, so the ratio cancels and reports the same
+number no matter how wide the core is. An earlier version of this benchmark did
+exactly that and reported ILP 2.59 for a 2-wide in-order A55 and 2.64 for a
+4-wide out-of-order A76 — no separation at all. Measured cause: both cores were
+pinned to ~0.32 multiplies/cycle, which is *identical* between them.
+
+The integer kernel is now four dependent add/xor/sub ops against registers —
+one instruction and one cycle on every target ISA. `INT-lat` consequently pins
+to 1.00 op/cycle, and `INT-thr` lands at ~90% of each core's ALU count, so `ILP`
+reads out issue width: **1.78x on the A55 (2-wide), 2.82x on the A76 (3 ALUs)**.
+Multiply capability is still measured, as its own `MUL-thr` number.
+
+The FP kernel had the same defect in a worse form: a 2D rotation is 4 multiplies
+to 2 adds, so it saturated the A76's single FP multiply pipe at 1.03 mul/cycle
+and let the *little* A55 win per clock on `FP-thr`. It is now a balanced
+`x = x*c + b` (one multiply, one add), which is also exactly one FMA when built
+with `FMA=1`.
+
+`fILP` is reported but must not be read as "bigger is better": FP latency varies
+3–6 cycles between cores, so a core with slow FP needs more ops in flight to
+fill its pipes and scores *higher*. Compare `FP-thr` for capability.
 
 ### Pitfalls this benchmark deliberately avoids
 

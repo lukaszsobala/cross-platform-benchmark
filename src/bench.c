@@ -86,32 +86,54 @@ static inline uint64_t xs64(uint64_t *s) {
 // Kernels
 // ---------------------------------------------------------------------------
 //
-// One integer step: multiply, add, two shift+xor, one shift+add.
-// Counted honestly as 8 dependent integer ALU ops.
-#define INT_STEP(a)                                   \
+// One integer step: four dependent single-cycle ALU ops.
+//
+// Deliberately contains NO multiply. A 64-bit multiply is the scarcest integer
+// resource on most cores (one pipe, 3-4 cycle throughput on small cores), so a
+// kernel containing one is multiplier-bound in *both* the latency and the
+// throughput variant -- and their ratio then cancels to the same number no
+// matter how wide the core is. Measured directly: Cortex-A55 sustained 0.24
+// muls/cycle and Cortex-A76 0.31, i.e. exactly their 1/4 and 1/3 multiplier
+// throughputs, and both reported ILP ~2.6 despite being 2-wide in-order and
+// 4-wide out-of-order respectively.
+//
+// add/xor/sub against a register are one instruction and one cycle on every
+// target ISA, so with the constants hoisted into registers this measures issue
+// width and nothing else. Multiply capability is measured separately below.
+#define INT_STEP(a, k1, k2, k3, k4)                   \
     do {                                              \
-        (a) = (a) * UINT64_C(6364136223846793005)     \
-              + UINT64_C(1442695040888963407);        \
-        (a) ^= (a) >> 29;                             \
-        (a) += (a) << 13;                             \
-        (a) ^= (a) >> 17;                             \
+        (a) += (k1);                                  \
+        (a) ^= (k2);                                  \
+        (a) -= (k3);                                  \
+        (a) ^= (k4);                                  \
     } while (0)
-#define INT_OPS_PER_STEP 8u
+#define INT_OPS_PER_STEP 4u
 
-// One FP step: 2D rotation by a fixed angle. 4 multiplies + 2 adds = 6 FLOPs.
-// |(x,y)| is preserved to within rounding, so the state can never overflow to
-// Inf, collapse to a denormal, or become NaN, at any iteration count.
-#define FP_STEP(x, y, c, s)                           \
-    do {                                              \
-        double nx_ = (x) * (c) - (y) * (s);           \
-        double ny_ = (x) * (s) + (y) * (c);           \
-        (x) = nx_;                                    \
-        (y) = ny_;                                    \
-    } while (0)
-#define FP_OPS_PER_STEP 6u
+// One multiply step, kept apart from the ALU kernel so that integer multiplier
+// throughput is reported as its own number instead of silently gating ILP.
+// Odd * odd stays odd, so a lane can never collapse to zero.
+#define MUL_STEP(a, m) do { (a) *= (m); } while (0)
+#define MUL_OPS_PER_STEP 1u
 
-typedef struct { uint64_t l[LANES]; } int_ctx_t;
-typedef struct { double x[LANES], y[LANES], c, s; } fp_ctx_t;
+// One FP step: a multiply and an add, in balance.
+//
+// The previous kernel was a 2D rotation, which is 4 multiplies to 2 adds and so
+// bottlenecks on the FP multiply pipe rather than on FP throughput. On this
+// board the A76 sat at exactly 1.03 FP-multiplies/cycle -- its single FP mul
+// pipe saturated -- which let the *little* A55 beat it per clock on FP-thr.
+//
+// x = x*c + b with |c| < 1 converges to the fixed point b/(1-c) and stays
+// there, so the state is bounded for any iteration count: it can never reach
+// Inf, NaN or a denormal, all of which carry data-dependent timing penalties
+// that differ between cores. With -ffp-contract=off this is fmul+fadd; with
+// FMA enabled it folds to one FMA, which is the standard way to measure peak
+// FLOPs. Either way it is 2 FLOPs.
+#define FP_STEP(x, c, b) do { (x) = (x) * (c) + (b); } while (0)
+#define FP_OPS_PER_STEP 2u
+
+typedef struct { uint64_t l[LANES]; uint64_t k[4]; } int_ctx_t;
+typedef struct { uint64_t l[LANES]; uint64_t m; } mul_ctx_t;
+typedef struct { double x[LANES], b[LANES], c; } fp_ctx_t;
 
 typedef struct {
     uint64_t *buf;
@@ -151,22 +173,42 @@ typedef struct {
 // A kernel runs `n` units of work and returns; the driver times batches of them.
 typedef void (*kernel_fn)(void *ctx, uint64_t n);
 
+// The k-constants come from the context rather than being literals, so the
+// compiler cannot fold `+k1` and `-k3` together across the intervening xors.
 NOINLINE static void int_kernel_lat(void *vctx, uint64_t n) {
     int_ctx_t *c = (int_ctx_t *)vctx;
+    const uint64_t k1 = c->k[0], k2 = c->k[1], k3 = c->k[2], k4 = c->k[3];
     uint64_t a0 = c->l[0];
     for (uint64_t i = 0; i < n; ++i) {
-        INT_STEP(a0);
+        INT_STEP(a0, k1, k2, k3, k4);
     }
     c->l[0] = a0;
 }
 
 NOINLINE static void int_kernel_thr(void *vctx, uint64_t n) {
     int_ctx_t *c = (int_ctx_t *)vctx;
+    const uint64_t k1 = c->k[0], k2 = c->k[1], k3 = c->k[2], k4 = c->k[3];
     uint64_t a0 = c->l[0], a1 = c->l[1], a2 = c->l[2], a3 = c->l[3];
     uint64_t a4 = c->l[4], a5 = c->l[5], a6 = c->l[6], a7 = c->l[7];
     for (uint64_t i = 0; i < n; ++i) {
-        INT_STEP(a0); INT_STEP(a1); INT_STEP(a2); INT_STEP(a3);
-        INT_STEP(a4); INT_STEP(a5); INT_STEP(a6); INT_STEP(a7);
+        INT_STEP(a0, k1, k2, k3, k4); INT_STEP(a1, k1, k2, k3, k4);
+        INT_STEP(a2, k1, k2, k3, k4); INT_STEP(a3, k1, k2, k3, k4);
+        INT_STEP(a4, k1, k2, k3, k4); INT_STEP(a5, k1, k2, k3, k4);
+        INT_STEP(a6, k1, k2, k3, k4); INT_STEP(a7, k1, k2, k3, k4);
+    }
+    c->l[0] = a0; c->l[1] = a1; c->l[2] = a2; c->l[3] = a3;
+    c->l[4] = a4; c->l[5] = a5; c->l[6] = a6; c->l[7] = a7;
+}
+
+// Integer multiply throughput: LANES independent multiply chains.
+NOINLINE static void mul_kernel_thr(void *vctx, uint64_t n) {
+    mul_ctx_t *c = (mul_ctx_t *)vctx;
+    const uint64_t m = c->m;
+    uint64_t a0 = c->l[0], a1 = c->l[1], a2 = c->l[2], a3 = c->l[3];
+    uint64_t a4 = c->l[4], a5 = c->l[5], a6 = c->l[6], a7 = c->l[7];
+    for (uint64_t i = 0; i < n; ++i) {
+        MUL_STEP(a0, m); MUL_STEP(a1, m); MUL_STEP(a2, m); MUL_STEP(a3, m);
+        MUL_STEP(a4, m); MUL_STEP(a5, m); MUL_STEP(a6, m); MUL_STEP(a7, m);
     }
     c->l[0] = a0; c->l[1] = a1; c->l[2] = a2; c->l[3] = a3;
     c->l[4] = a4; c->l[5] = a5; c->l[6] = a6; c->l[7] = a7;
@@ -174,31 +216,30 @@ NOINLINE static void int_kernel_thr(void *vctx, uint64_t n) {
 
 NOINLINE static void fp_kernel_lat(void *vctx, uint64_t n) {
     fp_ctx_t *f = (fp_ctx_t *)vctx;
-    const double co = f->c, si = f->s;
-    double x0 = f->x[0], y0 = f->y[0];
+    const double co = f->c;
+    const double b0 = f->b[0];
+    double x0 = f->x[0];
     for (uint64_t i = 0; i < n; ++i) {
-        FP_STEP(x0, y0, co, si);
+        FP_STEP(x0, co, b0);
     }
-    f->x[0] = x0; f->y[0] = y0;
+    f->x[0] = x0;
 }
 
 NOINLINE static void fp_kernel_thr(void *vctx, uint64_t n) {
     fp_ctx_t *f = (fp_ctx_t *)vctx;
-    const double co = f->c, si = f->s;
+    const double co = f->c;
+    const double b0 = f->b[0], b1 = f->b[1], b2 = f->b[2], b3 = f->b[3];
+    const double b4 = f->b[4], b5 = f->b[5], b6 = f->b[6], b7 = f->b[7];
     double x0 = f->x[0], x1 = f->x[1], x2 = f->x[2], x3 = f->x[3];
     double x4 = f->x[4], x5 = f->x[5], x6 = f->x[6], x7 = f->x[7];
-    double y0 = f->y[0], y1 = f->y[1], y2 = f->y[2], y3 = f->y[3];
-    double y4 = f->y[4], y5 = f->y[5], y6 = f->y[6], y7 = f->y[7];
     for (uint64_t i = 0; i < n; ++i) {
-        FP_STEP(x0, y0, co, si); FP_STEP(x1, y1, co, si);
-        FP_STEP(x2, y2, co, si); FP_STEP(x3, y3, co, si);
-        FP_STEP(x4, y4, co, si); FP_STEP(x5, y5, co, si);
-        FP_STEP(x6, y6, co, si); FP_STEP(x7, y7, co, si);
+        FP_STEP(x0, co, b0); FP_STEP(x1, co, b1);
+        FP_STEP(x2, co, b2); FP_STEP(x3, co, b3);
+        FP_STEP(x4, co, b4); FP_STEP(x5, co, b5);
+        FP_STEP(x6, co, b6); FP_STEP(x7, co, b7);
     }
     f->x[0] = x0; f->x[1] = x1; f->x[2] = x2; f->x[3] = x3;
     f->x[4] = x4; f->x[5] = x5; f->x[6] = x6; f->x[7] = x7;
-    f->y[0] = y0; f->y[1] = y1; f->y[2] = y2; f->y[3] = y3;
-    f->y[4] = y4; f->y[5] = y5; f->y[6] = y6; f->y[7] = y7;
 }
 
 // One unit = one full read+write sweep of the buffer.
@@ -319,6 +360,8 @@ static void warmup_spin(double sec) {
     if (sec <= 0.0) return;
     int_ctx_t c;
     for (int i = 0; i < LANES; ++i) c.l[i] = (uint64_t)i + 1u;
+    c.k[0] = UINT64_C(0x9E3779B97F4A7C15); c.k[1] = UINT64_C(0xBF58476D1CE4E5B9);
+    c.k[2] = UINT64_C(0x94D049BB133111EB); c.k[3] = UINT64_C(0x2545F4914F6CDD1D);
     const double t_end = now_sec() + sec;
     while (now_sec() < t_end) {
         int_kernel_thr(&c, 20000);
@@ -424,6 +467,7 @@ typedef struct {
     // results
     double int_lat_mops;
     double int_thr_mops;
+    double mul_thr_mops;   // integer 64-bit multiplies per second
     double fp_lat_mflops;
     double fp_thr_mflops;
     double mem_gbps;
@@ -584,6 +628,7 @@ static void *worker(void *arg) {
     for (int rep = 0; rep < reps; ++rep) {
         int_ctx_t c;
         for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
+        for (int i = 0; i < 4; ++i) c.k[i] = xs64(&seed) | 1u;
         phase_begin(w, rep);
         const uint64_t it = run_timed(int_kernel_lat, &c, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->int_lat_mops,
@@ -595,6 +640,7 @@ static void *worker(void *arg) {
     for (int rep = 0; rep < reps; ++rep) {
         int_ctx_t c;
         for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
+        for (int i = 0; i < 4; ++i) c.k[i] = xs64(&seed) | 1u;
         phase_begin(w, rep);
         const uint64_t it = run_timed(int_kernel_thr, &c, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->int_thr_mops,
@@ -607,34 +653,44 @@ static void *worker(void *arg) {
         }
     }
 
-    // A rotation by 1 radian: |(x,y)| is invariant, so the state stays in
-    // normal double range for any number of iterations.
-    const double angle = 1.0;
-    const double co = cos(angle), si = sin(angle);
+    // ---- integer multiply throughput: LANES independent multiply chains ----
+    for (int rep = 0; rep < reps; ++rep) {
+        mul_ctx_t c;
+        for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
+        c.m = xs64(&seed) | 1u;
+        phase_begin(w, rep);
+        const uint64_t it = run_timed(mul_kernel_thr, &c, w->seconds, 1024, &elapsed);
+        keep_best_rate(&w->mul_thr_mops,
+                       (double)it * (double)(MUL_OPS_PER_STEP * LANES) / 1e6 / elapsed);
+        for (int i = 0; i < LANES; ++i) w->checksum ^= c.l[i];
+    }
+
+    // Converges to the fixed point b/(1-c) and stays there: bounded forever.
+    const double co = 0.5;
 
     // ---- FP latency ----
     for (int rep = 0; rep < reps; ++rep) {
         fp_ctx_t f;
-        f.c = co; f.s = si;
-        for (int i = 0; i < LANES; ++i) { f.x[i] = 1.0 + (double)i; f.y[i] = 0.5; }
+        f.c = co;
+        for (int i = 0; i < LANES; ++i) { f.x[i] = 1.0 + (double)i; f.b[i] = 1.0 + 0.25 * (double)i; }
         phase_begin(w, rep);
         const uint64_t it = run_timed(fp_kernel_lat, &f, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->fp_lat_mflops,
                        (double)it * (double)FP_OPS_PER_STEP / 1e6 / elapsed);
-        w->checksum ^= (uint64_t)(int64_t)(f.x[0] * 1e6 + f.y[0] * 1e3);
+        w->checksum ^= (uint64_t)(int64_t)(f.x[0] * 1e6);
     }
 
     // ---- FP throughput ----
     for (int rep = 0; rep < reps; ++rep) {
         fp_ctx_t f;
-        f.c = co; f.s = si;
-        for (int i = 0; i < LANES; ++i) { f.x[i] = 1.0 + (double)i; f.y[i] = 0.5; }
+        f.c = co;
+        for (int i = 0; i < LANES; ++i) { f.x[i] = 1.0 + (double)i; f.b[i] = 1.0 + 0.25 * (double)i; }
         phase_begin(w, rep);
         const uint64_t it = run_timed(fp_kernel_thr, &f, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->fp_thr_mflops,
                        (double)it * (double)(FP_OPS_PER_STEP * LANES) / 1e6 / elapsed);
         for (int i = 0; i < LANES; ++i) {
-            w->checksum ^= (uint64_t)(int64_t)(f.x[i] * 1e6 + f.y[i] * 1e3);
+            w->checksum ^= (uint64_t)(int64_t)(f.x[i] * 1e6);
         }
     }
 
@@ -986,9 +1042,10 @@ static double geomean(const double *v, int n) {
 // shift the absolute magnitude -- a constant factor on a geomean -- so ratios
 // between cores are unaffected by them.
 static double core_score(const worker_t *w) {
-    double v[4];
+    double v[5];
     v[0] = w->int_thr_mops;
     v[1] = w->fp_thr_mflops;
+    v[4] = w->mul_thr_mops * 4.0;
     v[2] = w->disp_mops * 100.0;
     // Random-access rate with all chases in flight, in millions/s.
     v[3] = w->mem_mlp_ns > 0.0 ? (1000.0 / w->mem_mlp_ns) * 100.0 : 0.0;
@@ -1094,12 +1151,14 @@ int main(int argc, char **argv) {
         printf("mode: per-core sweep over %d CPUs, %.2fs/phase x %d reps (best kept),\n"
                "      warmup %.2fs, mem %zu MiB/thread\n\n",
                n_cpus, duration, reps, warmup, mem_per_thread >> 20);
-        printf("%4s %6s  %8s %8s %5s  %8s %8s  %7s %7s %5s  %8s   %8s\n",
-               "CPU", "MHz", "INT-lat", "INT-thr", "ILP", "FP-lat", "FP-thr",
-               "MEM", "MEMlat", "MLP", "DISPATCH", "score");
-        printf("%4s %6s  %8s %8s %5s  %8s %8s  %7s %7s %5s  %8s   %8s\n",
-               "", "", "Mops/s", "Mops/s", "x", "Mflop/s", "Mflop/s",
-               "GB/s", "ns", "x", "Mcall/s", "geomean");
+        printf("%4s %6s  %8s %8s %5s %8s  %8s %8s %5s  %7s %7s %5s  %8s  %8s\n",
+               "CPU", "MHz", "INT-lat", "INT-thr", "ILP", "MUL-thr",
+               "FP-lat", "FP-thr", "fILP", "MEM", "MEMlat", "MLP",
+               "DISPATCH", "score");
+        printf("%4s %6s  %8s %8s %5s %8s  %8s %8s %5s  %7s %7s %5s  %8s  %8s\n",
+               "", "", "Mops/s", "Mops/s", "x", "Mmul/s",
+               "Mflop/s", "Mflop/s", "x", "GB/s", "ns", "x",
+               "Mcall/s", "geomean");
 
         double best = 0.0, worst = 0.0;
         double dram_lo = 0.0, dram_hi = 0.0;
@@ -1112,6 +1171,7 @@ int main(int argc, char **argv) {
             double mhz = w.mhz_observed;
             if (mhz <= 0.0) mhz = cpu_max_mhz(cpu_list[i]);
             const double ilp = w.int_lat_mops > 0.0 ? w.int_thr_mops / w.int_lat_mops : 0.0;
+            const double filp = w.fp_lat_mflops > 0.0 ? w.fp_thr_mflops / w.fp_lat_mflops : 0.0;
             const double mlp = w.mem_mlp_ns > 0.0 ? w.mem_lat_ns / w.mem_mlp_ns : 0.0;
             const double score = core_score(&w);
             if (score > best) best = score;
@@ -1123,10 +1183,10 @@ int main(int argc, char **argv) {
                 }
             }
 
-            printf("%4d %6.0f  %8.1f %8.1f %5.2f  %8.1f %8.1f  %7.2f %7.1f %5.2f  %8.1f   %8.1f\n",
+            printf("%4d %6.0f  %8.1f %8.1f %5.2f %8.1f  %8.1f %8.1f %5.2f  %7.2f %7.1f %5.2f  %8.1f  %8.1f\n",
                    cpu_list[i], mhz,
-                   w.int_lat_mops, w.int_thr_mops, ilp,
-                   w.fp_lat_mflops, w.fp_thr_mflops,
+                   w.int_lat_mops, w.int_thr_mops, ilp, w.mul_thr_mops,
+                   w.fp_lat_mflops, w.fp_thr_mflops, filp,
                    w.mem_gbps, w.mem_lat_ns, mlp,
                    w.disp_mops, score);
             fflush(stdout);
@@ -1135,8 +1195,16 @@ int main(int argc, char **argv) {
             printf("\nfastest/slowest core ratio: %.2fx\n", best / worst);
         }
         report_dram(dram_lo, dram_hi);
-        printf("ILP = INT-thr/INT-lat, how much instruction parallelism the core extracts\n"
-               "      from 8 independent chains. A 2-wide in-order core caps out near 2x.\n"
+        printf("ILP  = INT-thr/INT-lat. The integer kernel is 4 dependent 1-cycle ALU\n"
+               "      ops and contains no multiply, so INT-lat pins to 1 op/cycle and ILP\n"
+               "      reads out issue width directly: ~2x for a 2-wide in-order core, ~3x\n"
+               "      for 3 integer ALUs. MUL-thr reports multiplier throughput separately,\n"
+               "      because a multiply in this kernel would bottleneck both halves of the\n"
+               "      ratio and flatten it.\n"
+               "fILP = FP-thr/FP-lat. NOT a width measure and not \"bigger is better\":\n"
+               "      FP latency varies 3-6 cycles between cores, so a core with slow FP\n"
+               "      needs more ops in flight to fill its pipes and scores higher here.\n"
+               "      Compare FP-thr for capability; fILP only says how many are in flight.\n"
                "MLP = MEMlat / (latency with %d chases in flight): how much memory latency\n"
                "      the core overlaps. In-order cores stall on the first miss and sit\n"
                "      near 1x. Can exceed %d when parallel TLB walks overlap too.\n"
@@ -1162,12 +1230,14 @@ int main(int argc, char **argv) {
     if (run_workers(w, threads, &opts) != 0) return 1;
 
     double int_lat = 0, int_thr = 0, fp_lat = 0, fp_thr = 0, gbps = 0, disp = 0;
+    double mul_thr = 0;
     double lat_ns_sum = 0, mlp_ns_sum = 0;
     int lat_n = 0, mlp_n = 0;
     uint64_t checksum = 0;
     for (int i = 0; i < threads; ++i) {
         int_lat += w[i].int_lat_mops;
         int_thr += w[i].int_thr_mops;
+        mul_thr += w[i].mul_thr_mops;
         fp_lat  += w[i].fp_lat_mflops;
         fp_thr  += w[i].fp_thr_mflops;
         gbps    += w[i].mem_gbps;
@@ -1181,6 +1251,7 @@ int main(int argc, char **argv) {
     printf("%-18s %12s %12s\n", "metric", "total", "per-thread");
     printf("%-18s %12.1f %12.1f\n", "INT-lat  Mops/s", int_lat, int_lat / n);
     printf("%-18s %12.1f %12.1f\n", "INT-thr  Mops/s", int_thr, int_thr / n);
+    printf("%-18s %12.1f %12.1f\n", "MUL-thr  Mmul/s", mul_thr, mul_thr / n);
     printf("%-18s %12.1f %12.1f\n", "FP64-lat Mflop/s", fp_lat, fp_lat / n);
     printf("%-18s %12.1f %12.1f\n", "FP64-thr Mflop/s", fp_thr, fp_thr / n);
     printf("%-18s %12.1f %12.1f\n", "DISPATCH Mcall/s", disp, disp / n);
@@ -1204,7 +1275,8 @@ int main(int argc, char **argv) {
         printf("\n");
         report_dram(dlo, dhi);
     }
-    printf("ILP (INT-thr / INT-lat): %.2fx\n", int_lat > 0.0 ? int_thr / int_lat : 0.0);
+    printf("ILP  (INT-thr / INT-lat): %.2fx\n", int_lat > 0.0 ? int_thr / int_lat : 0.0);
+    printf("fILP (FP-thr  / FP-lat) : %.2fx\n", fp_lat > 0.0 ? fp_thr / fp_lat : 0.0);
     if (lat_n > 0 && mlp_n > 0) {
         printf("MLP (latency overlapped): %.2fx\n",
                (lat_ns_sum / lat_n) / (mlp_ns_sum / mlp_n));
