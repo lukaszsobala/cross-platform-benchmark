@@ -106,6 +106,11 @@ static inline uint64_t xs64(uint64_t *s) {
 // the edge of spilling, and spill traffic would show up as a cross-ISA bias
 // against x86 that has nothing to do with issue width. The intervening xors
 // stop the compiler folding `+k1` and `-k1` together.
+//
+// Verified spill-free on both ISAs, not assumed: with gcc 15.2 -O3 the x86-64
+// loop body of int_kernel_thr is exactly 32 add/xor/sub plus the counter and
+// branch, with no memory operand anywhere between the loop label and the
+// backedge (objdump -d src/bench.o --disassemble=int_kernel_thr).
 #define INT_STEP(a, k1, k2)                           \
     do {                                              \
         (a) += (k1);                                  \
@@ -175,6 +180,63 @@ typedef struct {
     size_t         pos;
     uint64_t       acc;
 } disp_ctx_t;
+
+// Selector-sequence periods swept by --disp-sweep, in calls.
+//
+// A uniformly random target sequence is unpredictable for every predictor ever
+// built, so a "random" dispatch loop measures the *cost of a mispredict*, which
+// is pipeline-depth-dominated: it ranks cores by how shallow they are, and a
+// little in-order core wins. What separates a big core from a little one is
+// predictor capacity -- the length of deterministic pattern it can still learn.
+// So the selector stream is a fixed random pattern of period L, repeated, and L
+// is swept. Small L: everyone learns it. Huge L: nobody does. The knee in
+// between is a direct read-out of the predictor.
+//
+// The last entry is the old behaviour and serves as the unpredictable floor.
+static const size_t g_disp_periods[] = {
+    4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 65536
+};
+#define DISP_SWEEP_N   ARRAY_LEN(g_disp_periods)
+// Backing array is sized for the largest period; smaller periods use a prefix.
+#define DISP_IDX_BYTES ((size_t)65536)
+
+// The ladder the suite itself walks, a x2 geometric span of the same curve.
+// It stops at 8192 for two reasons: measured on Lion Cove and Skymont, 8192 is
+// already within 2% of the fully-random floor (see --disp-sweep), and 8192
+// selector bytes still fit in every L1 we target. A 64 KiB array does not, so
+// the old "random" point was partly measuring L2, not prediction.
+static const size_t g_disp_ladder[] = {
+    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192
+};
+#define DISP_LADDER_N     ARRAY_LEN(g_disp_ladder)
+#define DISP_LADDER_BYTES ((size_t)8192)
+// Periods averaged to establish the "everyone predicts this" plateau. x2 spaced
+// and flat to ~1% on every core measured, so the mean is a stable reference.
+#define DISP_PLATEAU_PTS  3
+// The capacity read-out integrates the whole curve rather than crossing a
+// threshold. At each ladder point the rate is normalised to
+//   q = (rate - floor) / (plateau - floor)
+// i.e. "how much of the available prediction win is this core still getting",
+// clipped to [0,1]. Summing q over the ladder gives the width of the predicted
+// region in log2(period) units, so
+//   capacity = first_period * 2^(sum(q) - 1)
+// which returns exactly L for an ideal core that predicts everything up to L
+// and nothing beyond. Normalising by the floor is what removes the old bias:
+// the floor *is* the mispredict penalty, and dividing it out stops a shallow
+// pipeline from scoring as a good predictor.
+//
+// A threshold crossing was tried first and rejected on measured grounds. The
+// Skymont knee sits at 94% of its plateau at period 256, so a 90% threshold
+// straddles it: repeated runs on one core returned 206-322 calls (1.46x
+// run-to-run) as noise moved the crossing between two ladder intervals.
+// Thresholds of 0.85/0.80/0.75 spread 1.27x/1.38x/1.37x. The integral form
+// spreads 1.21x worst-case and reproduces to ~1% on the P-cores, because no
+// single point can move it by more than its own 1/11th of the span.
+// Discrimination is lower but still decisive: 1.7x rather than 2.1x.
+// Below this plateau/floor ratio, prediction is not buying the core anything
+// and the "knee" would be an artefact of a flat curve, so no capacity is
+// reported. Both cores here sit near 5x, so this is a long way from the data.
+#define DISP_MIN_GAIN     1.30
 
 // A kernel runs `n` units of work and returns; the driver times batches of them.
 typedef void (*kernel_fn)(void *ctx, uint64_t n);
@@ -303,7 +365,14 @@ NOINLINE static uint64_t op_rot(uint64_t v) { return (v << 13) | (v >> 51); }
 // call back into a direct one.
 op_fn g_op_table[4] = { op_add, op_xor, op_mul, op_rot };
 
-// One unit = one unpredictable indirect call.
+// One unit = one indirect call whose target is chosen by the selector stream.
+// The selector array is walked cyclically with `mask` = period-1, so the target
+// sequence repeats with period `mask + 1`. That period is the whole experiment:
+// see the DISP_PERIOD comment below.
+//
+// The result feeds the next call's argument. The *target* does not depend on
+// `acc`, so this chain does not stop the predictor from running ahead; see
+// disp_kernel_free for the variant that removes it entirely.
 NOINLINE static void disp_kernel(void *vctx, uint64_t n) {
     disp_ctx_t *d = (disp_ctx_t *)vctx;
     const uint8_t *idx = d->idx;
@@ -316,6 +385,25 @@ NOINLINE static void disp_kernel(void *vctx, uint64_t n) {
     }
     d->pos = pos;
     d->acc = acc;
+}
+
+// Same single call site and same selector stream, but the callee's result is
+// folded into a side accumulator instead of being fed back as its argument, so
+// consecutive calls are data-independent. Used to prove that the serial `acc`
+// chain in disp_kernel is not what the metric is bottlenecked on.
+NOINLINE static void disp_kernel_free(void *vctx, uint64_t n) {
+    disp_ctx_t *d = (disp_ctx_t *)vctx;
+    const uint8_t *idx = d->idx;
+    const size_t mask = d->mask;
+    size_t pos = d->pos;
+    const uint64_t arg = d->acc | 1u;
+    uint64_t sum = 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        sum ^= g_op_table[idx[pos] & 3u](arg);
+        pos = (pos + 1) & mask;
+    }
+    d->pos = pos;
+    d->acc = sum;
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +566,10 @@ typedef struct {
     double mem_gbps;
     double mem_lat_ns;     // one dependent chain
     double mem_mlp_ns;     // CHASE_WAYS chains in flight, per access
-    double disp_mops;      // unpredictable indirect calls per second
+    double disp_ladder[DISP_LADDER_N];  // Mcall/s at each selector period
+    int    disp_sweep;     // run only the selector-period sweep, not the suite
+    double sweep_serial[DISP_SWEEP_N];  // Mcall/s per period, dependent chain
+    double sweep_free[DISP_SWEEP_N];    // Mcall/s per period, independent calls
     double mhz_observed;   // sampled while the core was under load
     double dram_mhz_observed; // DRAM controller clock during the memory phases
     int    cpu_observed;   // sched_getcpu() during the run
@@ -629,6 +720,56 @@ static void *worker(void *arg) {
 
     const int reps = w->reps > 0 ? w->reps : 1;
 
+    // ---- selector-period sweep (diagnostic mode, --disp-sweep) ----
+    // Runs the dispatch kernel at every period in g_disp_periods and nothing
+    // else. This is the data the reported DISPATCH number is derived from; it
+    // is kept in the tool so the curve can be re-measured on any target.
+    if (w->disp_sweep) {
+        // INT-lat is one dependent 1-cycle op per cycle, so it doubles as a
+        // clock reading on targets with no cpufreq node.
+        for (int rep = 0; rep < reps; ++rep) {
+            int_ctx_t c;
+            for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
+            for (int i = 0; i < 2; ++i) c.k[i] = xs64(&seed) | 1u;
+            phase_begin(w, rep);
+            const uint64_t it = run_timed(int_kernel_lat, &c, w->seconds, 1024, &elapsed);
+            keep_best_rate(&w->int_lat_mops,
+                           (double)it * (double)INT_OPS_PER_STEP / 1e6 / elapsed);
+            for (int i = 0; i < LANES; ++i) w->checksum ^= c.l[i];
+            if (w->cpu_observed >= 0) {
+                const double mhz = cpu_cur_mhz(w->cpu_observed);
+                if (mhz > w->mhz_observed) w->mhz_observed = mhz;
+            }
+        }
+
+        uint8_t *idx = (uint8_t *)malloc(DISP_IDX_BYTES);
+        if (idx) for (size_t i = 0; i < DISP_IDX_BYTES; ++i) idx[i] = (uint8_t)xs64(&seed);
+        // The barrier count must not depend on the allocation succeeding.
+        for (int k = 0; k < DISP_SWEEP_N; ++k) {
+            for (int rep = 0; rep < reps; ++rep) {
+                phase_begin(w, rep);
+                if (!idx) continue;
+                disp_ctx_t d = { .idx = idx, .mask = g_disp_periods[k] - 1,
+                                 .pos = 0, .acc = 1 };
+                const uint64_t calls = run_timed(disp_kernel, &d, w->seconds, 1024, &elapsed);
+                keep_best_rate(&w->sweep_serial[k], (double)calls / 1e6 / elapsed);
+                w->checksum ^= d.acc;
+            }
+            for (int rep = 0; rep < reps; ++rep) {
+                phase_begin(w, rep);
+                if (!idx) continue;
+                disp_ctx_t d = { .idx = idx, .mask = g_disp_periods[k] - 1,
+                                 .pos = 0, .acc = 1 };
+                const uint64_t calls = run_timed(disp_kernel_free, &d, w->seconds, 1024, &elapsed);
+                keep_best_rate(&w->sweep_free[k], (double)calls / 1e6 / elapsed);
+                w->checksum ^= d.acc;
+            }
+        }
+        free(idx);
+        free(buf);
+        return NULL;
+    }
+
     // ---- integer latency: one dependency chain ----
     for (int rep = 0; rep < reps; ++rep) {
         int_ctx_t c;
@@ -699,25 +840,34 @@ static void *worker(void *arg) {
         }
     }
 
-    // ---- unpredictable indirect dispatch ----
+    // ---- indirect dispatch: one point per selector period ----
+    // The whole ladder replaces what used to be a single random-selector phase.
+    // Each point gets half a phase's time: the points on the steep part of the
+    // curve are where measurement noise turns into capacity error, and halving
+    // the time again (measured) widens run-to-run spread on the little cores
+    // from 8% to 20%, while doubling it buys little.
     {
-        const size_t nidx = 1u << 16;   // 64 KiB of random selectors
-        uint8_t *idx = (uint8_t *)malloc(nidx);
+        uint8_t *idx = (uint8_t *)malloc(DISP_LADDER_BYTES);
         if (idx) {
-            for (size_t i = 0; i < nidx; ++i) idx[i] = (uint8_t)xs64(&seed);
+            for (size_t i = 0; i < DISP_LADDER_BYTES; ++i) idx[i] = (uint8_t)xs64(&seed);
+        }
+        const double t_pt = w->seconds / 2.0;
+        for (int k = 0; k < DISP_LADDER_N; ++k) {
             for (int rep = 0; rep < reps; ++rep) {
-                disp_ctx_t d = { .idx = idx, .mask = nidx - 1, .pos = 0, .acc = 1 };
-                phase_begin(w, rep);
-                const uint64_t calls = run_timed(disp_kernel, &d, w->seconds, 1024, &elapsed);
-                keep_best_rate(&w->disp_mops, (double)calls / 1e6 / elapsed);
+                // Only the very first point pays for a warm-up; the core is at
+                // its steady-state clock for the rest of the ladder. The
+                // barrier is still entered once per point per rep by every
+                // thread, whether or not the allocation succeeded.
+                phase_begin(w, k == 0 ? rep : 1);
+                if (!idx) continue;
+                disp_ctx_t d = { .idx = idx, .mask = g_disp_ladder[k] - 1,
+                                 .pos = 0, .acc = 1 };
+                const uint64_t calls = run_timed(disp_kernel, &d, t_pt, 1024, &elapsed);
+                keep_best_rate(&w->disp_ladder[k], (double)calls / 1e6 / elapsed);
                 w->checksum ^= d.acc;
             }
-            free(idx);
-        } else {
-            // Still hit the barrier the same number of times as every other
-            // thread, or they would all hang here.
-            for (int rep = 0; rep < reps; ++rep) phase_begin(w, rep);
         }
+        free(idx);
     }
 
     const int mem_ok = (buf != NULL && nbytes >= (size_t)CHASE_WAYS * 65536);
@@ -962,6 +1112,8 @@ static void usage(const char *prog) {
         "  --threads N        threads to run (default: online CPUs)\n"
         "  --cpus LIST        pin to these CPUs, e.g. 0-3,6 (default: 0..threads-1)\n"
         "  --per-core         run the suite single-threaded on each CPU in turn\n"
+        "  --disp-sweep       diagnostic: sweep the indirect-dispatch selector\n"
+        "                     period on each CPU and print calls/cycle vs period\n"
         "  --time SEC         measured seconds per phase (default 0.5)\n"
         "  --reps N           repetitions per phase, best is kept (default 3)\n"
         "  --warmup SEC       warm-up seconds before each phase (default 0.15)\n"
@@ -1044,10 +1196,12 @@ static void print_legend(void) {
            "random dependent pointer chase, ns");
     printf("  %-9s %-24s %s\n", "MLP", "memory parallelism",
            "MEMlat / latency with 8 chases in flight");
-    printf("  %-9s %-24s %s\n", "DISPATCH", "indirect dispatch",
-           "unpredictable indirect calls, Mcall/s");
+    printf("  %-9s %-24s %s\n", "DISP-thr", "indirect dispatch rate",
+           "calls/s once the target pattern is learned, Mcall/s");
+    printf("  %-9s %-24s %s\n", "DISPcap", "indirect predictor size",
+           "longest repeating call pattern still predicted, in calls");
     printf("  %-9s %-24s %s\n", "score", "composite",
-           "geomean of INT-thr, MUL-thr, FP-thr, DISPATCH, MLP rate");
+           "geomean of INT-thr, MUL-thr, FP-thr, DISP-thr, DISPcap, MLP rate");
 
     print_legend_ratios();
     printf("  score is comparable across cores of one run, not across machines.\n");
@@ -1066,6 +1220,17 @@ static void print_legend_ratios(void) {
     printf("  MLP shows how much memory latency the core hides. In-order cores stall\n"
            "  on the first miss and sit near 1x. It can exceed %d when parallel page\n"
            "  table walks overlap as well.\n", CHASE_WAYS);
+    printf("  DISPcap is a length, not a rate, so it is already independent of clock.\n"
+           "  A fixed random call sequence of period L is repeated, L is swept %zu..%zu,\n"
+           "  and the resulting curve -- normalised between the rate at tiny L and the\n"
+           "  rate at the longest L -- is integrated over log2(L). A core that predicts\n"
+           "  everything up to L and nothing beyond reads out exactly L. '-' means the\n"
+           "  curve never fell, so the ladder says nothing: run --disp-sweep.\n"
+           "  A purely random target stream is unpredictable for every core ever built,\n"
+           "  so it measures mispredict *penalty*, which favours short pipelines. That\n"
+           "  is what this column used to report, and why a Cortex-A55 beat a Lion Cove\n"
+           "  on it per clock.\n",
+           g_disp_ladder[0], g_disp_ladder[DISP_LADDER_N - 1]);
 }
 
 // Report the DRAM controller clock seen while the memory phases were running.
@@ -1093,17 +1258,68 @@ static double geomean(const double *v, int n) {
     return m > 0 ? exp(s / (double)m) : 0.0;
 }
 
+// Reduce the dispatch ladder to the numbers the tables report.
+//
+//   *thr  calls/s once the pattern has been learned -- the plateau. A front-end
+//         call/return throughput, and unambiguously bigger-is-better.
+//   *cap  the longest repeating call sequence the core still predicts, in
+//         calls: the floor-normalised curve integrated over log2(period), as
+//         derived above the DISP_MIN_GAIN definition. Being a length and not a
+//         rate, it needs no clock normalisation.
+//   *gain plateau / unpredictable floor, i.e. what prediction is worth on this
+//         core at all. Used to reject a flat curve, and worth printing because
+//         it is the mispredict penalty the old metric was accidentally
+//         reporting -- kept visible, but no longer mistaken for core quality.
+//
+// Returns 0 if the ladder was never measured.
+static int disp_summary(const worker_t *w, double *thr, double *cap, double *gain) {
+    *thr = 0.0; *cap = 0.0; *gain = 0.0;
+    double plateau = 0.0;
+    for (int i = 0; i < DISP_PLATEAU_PTS; ++i) {
+        if (w->disp_ladder[i] <= 0.0) return 0;
+        plateau += w->disp_ladder[i];
+    }
+    plateau /= (double)DISP_PLATEAU_PTS;
+    const double floor_rate = w->disp_ladder[DISP_LADDER_N - 1];
+    if (plateau <= 0.0 || floor_rate <= 0.0) return 0;
+
+    *thr = plateau;
+    *gain = plateau / floor_rate;
+    // A curve that never falls is not a core with an infinite predictor -- it
+    // is a ladder that does not reach far enough, or a core that predicts none
+    // of it. Either way there is no capacity to report; --disp-sweep tells the
+    // two apart.
+    if (*gain < DISP_MIN_GAIN) return 1;
+
+    double span = 0.0;
+    for (int i = 0; i < DISP_LADDER_N; ++i) {
+        double q = (w->disp_ladder[i] - floor_rate) / (plateau - floor_rate);
+        if (q > 1.0) q = 1.0;
+        if (q < 0.0) q = 0.0;
+        span += q;
+    }
+    *cap = (double)g_disp_ladder[0] * pow(2.0, span - 1.0);
+    return 1;
+}
+
 // Synthetic single-core score. Deliberately spans compute *and* the two things
 // that actually separate a big core from a little one: unpredictable indirect
 // dispatch and overlapped cache misses. The per-component scale factors only
 // shift the absolute magnitude -- a constant factor on a geomean -- so ratios
 // between cores are unaffected by them.
 static double core_score(const worker_t *w) {
-    double v[5];
+    double v[6];
+    double disp_thr, disp_cap, disp_gain;
+    disp_summary(w, &disp_thr, &disp_cap, &disp_gain);
     v[0] = w->int_thr_mops;
     v[1] = w->fp_thr_mflops;
     v[4] = w->mul_thr_mops * 4.0;
-    v[2] = w->disp_mops * 100.0;
+    v[2] = disp_thr * 20.0;
+    // Predictor capacity in calls. Not a rate, but the geomean only cares
+    // about ratios between cores, and this is the term that carries "the front
+    // end can learn what this code does" -- the reason the dispatch phase is in
+    // the score at all. Zero when the curve was flat, and geomean() drops it.
+    v[5] = disp_cap * 20.0;
     // Random-access rate with all chases in flight, in millions/s.
     v[3] = w->mem_mlp_ns > 0.0 ? (1000.0 / w->mem_mlp_ns) * 100.0 : 0.0;
     return geomean(v, ARRAY_LEN(v));
@@ -1114,6 +1330,7 @@ int main(int argc, char **argv) {
     int cpu_list[1024];
     int n_cpus = 0;
     int per_core = 0;
+    int disp_sweep = 0;
     int pin = 1;
     int use_clock_raw = 1;
     double duration = 0.5;
@@ -1133,6 +1350,8 @@ int main(int argc, char **argv) {
             if (n_cpus <= 0) { fprintf(stderr, "bad --cpus list\n"); return 2; }
         } else if (!strcmp(a, "--per-core")) {
             per_core = 1;
+        } else if (!strcmp(a, "--disp-sweep")) {
+            disp_sweep = 1;
         } else if (!strcmp(a, "--time") && i + 1 < argc) {
             duration = atof(argv[++i]);
         } else if (!strcmp(a, "--reps") && i + 1 < argc) {
@@ -1176,7 +1395,7 @@ int main(int argc, char **argv) {
     // Default CPU list: 0..threads-1, or every online CPU in --per-core mode.
     if (n_cpus == 0) {
         const int online = get_cpu_count();
-        const int want = per_core ? online : threads;
+        const int want = (per_core || disp_sweep) ? online : threads;
         for (int i = 0; i < want && i < ARRAY_LEN(cpu_list); ++i) cpu_list[i] = i;
         n_cpus = want < ARRAY_LEN(cpu_list) ? want : ARRAY_LEN(cpu_list);
     }
@@ -1218,20 +1437,77 @@ int main(int argc, char **argv) {
     warn_if_working_set_small(mem_per_thread, threads, per_core);
 
     // -----------------------------------------------------------------------
+    // Selector-period sweep (diagnostic)
+    // -----------------------------------------------------------------------
+    if (disp_sweep) {
+        opts.mem_per_thread = 0;
+        worker_t *sw = (worker_t *)calloc((size_t)n_cpus, sizeof(*sw));
+        if (!sw) { perror("calloc"); return 1; }
+        printf("mode: indirect-dispatch selector-period sweep over %d CPUs,\n"
+               "      %.2fs/phase x %d reps (best kept), warmup %.2fs\n\n",
+               n_cpus, duration, reps, warmup);
+        for (int i = 0; i < n_cpus; ++i) {
+            sw[i].cpu = pin ? cpu_list[i] : -1;
+            sw[i].disp_sweep = 1;
+            if (run_workers(&sw[i], 1, &opts) != 0) { free(sw); return 1; }
+            fprintf(stderr, "cpu %d done\n", cpu_list[i]);
+        }
+
+        double mhz[1024];
+        for (int i = 0; i < n_cpus; ++i) {
+            double m = sw[i].mhz_observed;
+            if (m <= 0.0) m = cpu_max_mhz(cpu_list[i]);
+            if (m <= 0.0) m = sw[i].int_lat_mops;   // 1 op/cycle by construction
+            mhz[i] = m;
+        }
+
+        printf("clock used for calls/kcycle (MHz):");
+        for (int i = 0; i < n_cpus; ++i) printf(" cpu%d=%.0f", cpu_list[i], mhz[i]);
+        printf("\n");
+
+        // Two tables: the dependent-accumulator kernel that the suite uses, and
+        // the independent-call variant, to show whether the serial chain caps
+        // the measurement.
+        for (int variant = 0; variant < 2; ++variant) {
+            printf("\n%s: calls per 1000 cycles (Mcall/s in parentheses)\n",
+                   variant == 0 ? "serial acc (disp_kernel)"
+                                : "independent calls (disp_kernel_free)");
+            printf("%8s", "period");
+            for (int i = 0; i < n_cpus; ++i) printf("  %14s%d", "cpu", cpu_list[i]);
+            printf("\n");
+            for (int k = 0; k < DISP_SWEEP_N; ++k) {
+                printf("%8zu", g_disp_periods[k]);
+                for (int i = 0; i < n_cpus; ++i) {
+                    const double r = variant == 0 ? sw[i].sweep_serial[k]
+                                                  : sw[i].sweep_free[k];
+                    const double kc = mhz[i] > 0.0 ? r * 1000.0 / mhz[i] : 0.0;
+                    printf("  %7.2f (%6.1f)", kc, r);
+                }
+                printf("\n");
+            }
+        }
+        printf("\nperiod = length of the repeating selector sequence, in calls.\n"
+               "The largest period a core still predicts well is its indirect\n"
+               "predictor's usable capacity; the last row is the unpredictable floor.\n");
+        free(sw);
+        return 0;
+    }
+
+    // -----------------------------------------------------------------------
     // Per-core sweep
     // -----------------------------------------------------------------------
     if (per_core) {
         printf("mode: per-core sweep over %d CPUs, %.2fs/phase x %d reps (best kept),\n"
                "      warmup %.2fs, mem %zu MiB/thread\n\n",
                n_cpus, duration, reps, warmup, mem_per_thread >> 20);
-        printf("%4s %6s  %8s %8s %5s %8s  %8s %8s %5s  %7s %7s %5s  %8s  %8s\n",
+        printf("%4s %6s  %8s %8s %5s %8s  %8s %8s %5s  %7s %7s %5s  %8s %7s  %8s\n",
                "CPU", "MHz", "INT-lat", "INT-thr", "ILP", "MUL-thr",
                "FP-lat", "FP-thr", "fILP", "MEM", "MEMlat", "MLP",
-               "DISPATCH", "score");
-        printf("%4s %6s  %8s %8s %5s %8s  %8s %8s %5s  %7s %7s %5s  %8s  %8s\n",
+               "DISP-thr", "DISPcap", "score");
+        printf("%4s %6s  %8s %8s %5s %8s  %8s %8s %5s  %7s %7s %5s  %8s %7s  %8s\n",
                "", "", "Mops/s", "Mops/s", "x", "Mmul/s",
                "Mflop/s", "Mflop/s", "x", "GB/s", "ns", "x",
-               "Mcall/s", "geomean");
+               "Mcall/s", "calls", "geomean");
 
         double best = 0.0, worst = 0.0;
         double dram_lo = 0.0, dram_hi = 0.0;
@@ -1268,12 +1544,24 @@ int main(int argc, char **argv) {
                 }
             }
 
-            printf("%4d %6s  %8.1f %8.1f %5.2f %8.1f  %8.1f %8.1f %5.2f  %7.2f %7.1f %5.2f  %8.1f  %8.1f\n",
+            double disp_thr, disp_cap, disp_gain;
+            disp_summary(&w, &disp_thr, &disp_cap, &disp_gain);
+            char capbuf[16];
+            if (disp_cap >= (double)g_disp_ladder[DISP_LADDER_N - 1]) {
+                snprintf(capbuf, sizeof(capbuf), ">=%zu",
+                         g_disp_ladder[DISP_LADDER_N - 1]);
+            } else if (disp_cap > 0.0) {
+                snprintf(capbuf, sizeof(capbuf), "%.0f", disp_cap);
+            } else {
+                snprintf(capbuf, sizeof(capbuf), "-");
+            }
+
+            printf("%4d %6s  %8.1f %8.1f %5.2f %8.1f  %8.1f %8.1f %5.2f  %7.2f %7.1f %5.2f  %8.1f %7s  %8.1f\n",
                    cpu_list[i], mhzbuf,
                    w.int_lat_mops, w.int_thr_mops, ilp, w.mul_thr_mops,
                    w.fp_lat_mflops, w.fp_thr_mflops, filp,
                    w.mem_gbps, w.mem_lat_ns, mlp,
-                   w.disp_mops, score);
+                   disp_thr, capbuf, score);
             fflush(stdout);
         }
         if (worst > 0.0) {
@@ -1302,7 +1590,8 @@ int main(int argc, char **argv) {
     double int_lat = 0, int_thr = 0, fp_lat = 0, fp_thr = 0, gbps = 0, disp = 0;
     double mul_thr = 0;
     double lat_ns_sum = 0, mlp_ns_sum = 0;
-    int lat_n = 0, mlp_n = 0;
+    double cap_sum = 0;
+    int lat_n = 0, mlp_n = 0, cap_n = 0;
     uint64_t checksum = 0;
     for (int i = 0; i < threads; ++i) {
         int_lat += w[i].int_lat_mops;
@@ -1311,7 +1600,12 @@ int main(int argc, char **argv) {
         fp_lat  += w[i].fp_lat_mflops;
         fp_thr  += w[i].fp_thr_mflops;
         gbps    += w[i].mem_gbps;
-        disp    += w[i].disp_mops;
+        {
+            double dthr, dcap, dgain;
+            disp_summary(&w[i], &dthr, &dcap, &dgain);
+            disp += dthr;
+            if (dcap > 0.0) { cap_sum += dcap; cap_n++; }
+        }
         if (w[i].mem_lat_ns > 0.0) { lat_ns_sum += w[i].mem_lat_ns; lat_n++; }
         if (w[i].mem_mlp_ns > 0.0) { mlp_ns_sum += w[i].mem_mlp_ns; mlp_n++; }
         checksum ^= w[i].checksum;
@@ -1331,7 +1625,12 @@ int main(int argc, char **argv) {
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
            "FP-thr", "FP throughput", "Mflop/s", fp_thr, fp_thr / n);
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
-           "DISPATCH", "indirect dispatch", "Mcall/s", disp, disp / n);
+           "DISP-thr", "indirect dispatch rate", "Mcall/s", disp, disp / n);
+    if (cap_n > 0) {
+        printf("%-9s %-23s %8s %11s %11.0f\n",
+               "DISPcap", "indirect predictor size", "calls", "-",
+               cap_sum / cap_n);
+    }
     if (mem_per_thread > 0) {
         printf("%-9s %-23s %8s %11.2f %11.2f\n",
                "MEM", "memory bandwidth", "GB/s", gbps, gbps / n);
