@@ -47,28 +47,55 @@ TARGET := cpu-bench
 SRCS := src/bench.c
 OBJS := $(SRCS:.c=.o)
 
-.PHONY: all clean native sg2000 riscv-v
+.PHONY: all clean native sg2000 sg2000-xthead riscv-v FORCE
 
 all: $(TARGET)
+
+# Objects depend on the flags they were built with, not just on the source.
+# Without this, `make` followed by `make sg2000` finds src/bench.o up to date
+# and silently keeps the object built for the *previous* -march -- so an ISA
+# switch appears to succeed while changing nothing, and a build that is
+# supposed to have been re-targeted still runs (or crashes) as the old one.
+FLAGSTAMP := .build-flags
+BUILDID   := $(CC) $(CFLAGS) $(LDFLAGS) $(LIBS)
+
+$(FLAGSTAMP): FORCE
+	@[ -f $@ ] && [ "$$(cat $@)" = "$(BUILDID)" ] || printf '%s' "$(BUILDID)" > $@
+
+FORCE:
 
 # Convenience target for native tuning
 native:
 	$(MAKE) MARCH=$(NATIVE_MARCH) MTUNE=$(NATIVE_MTUNE) all
 
-# RISC-V vector baseline (if your toolchain supports V)
+# RISC-V *ratified* vector (RVV 1.0). Only for hardware that implements 1.0 --
+# see the sg2000 note below before assuming a 'V' in a datasheet means this.
 riscv-v:
 	$(MAKE) MARCH=rv64gcv_zicsr_zifencei all
 
-# Sophgo SG2000: rv64imafdcv + privileged CSRs/fence split
+# Sophgo SG2000 (T-Head C906): rv64imafdc + privileged CSRs/fence split.
+#
+# Deliberately NO 'v'. The C906 implements the *draft* 0.7.1 vector extension,
+# which is not RVV 1.0 and is not binary compatible with it. GCC's 'v' means
+# RVV 1.0, so -march=rv64imafdcv builds a binary that dies with SIGILL
+# ("Illegal instruction") on this chip -- and it does so even with
+# -fno-tree-vectorize, because the compiler also uses vector registers to
+# inline memset/memcpy and struct copies. It buys nothing here anyway: the
+# default build is deliberately scalar (VECTORIZE=0) for cross-ISA fairness.
 sg2000:
-	$(MAKE) MARCH=rv64imafdcv_zicsr_zifencei all
+	$(MAKE) MARCH=rv64imafdc_zicsr_zifencei all
+
+# The 0.7.1 vector extension as T-Head hardware actually implements it. Needs
+# GCC 14+ (or a T-Head toolchain) and is only worth building with VECTORIZE=1.
+sg2000-xthead:
+	$(MAKE) MARCH=rv64imafdc_zicsr_zifencei_xtheadvector all
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
 
-src/%.o: src/%.c
+src/%.o: src/%.c $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(OBJS) $(FLAGSTAMP)

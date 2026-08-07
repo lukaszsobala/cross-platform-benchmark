@@ -1,4 +1,5 @@
 cpu-bench
+.build-flags
 src/*.o
 *.o
 .DS_Store

@@ -169,15 +169,24 @@ make MARCH=rv64gc MTUNE=generic
 
 RISC‑V notes:
 - The canonical ISA string for compilers excludes privilege letters (`S`, `U`). So `rv64imafdcvsu` is invalid for `-march` because `su` are privilege levels, not ISA extensions. Use only ISA subsets and standard extensions in `-march`, and pass CSR/fence split via named extensions instead.
-- For vector-capable toolchains: `make riscv-v` uses `-march=rv64gcv_zicsr_zifencei`.
-- For Sophgo SG2000 (rv64imafdcv + CSR+fence split), use the provided target:
+- For hardware implementing **ratified RVV 1.0**: `make riscv-v` uses `-march=rv64gcv_zicsr_zifencei`.
+- For Sophgo SG2000 (T-Head C906):
 
 ```
 make sg2000
 ```
 
-This maps to `-march=rv64imafdcv_zicsr_zifencei -mtune=generic`. Adjust `MTUNE` if your toolchain provides a specific tuner.
-```
+This maps to `-march=rv64imafdc_zicsr_zifencei`, with **no `v`**. The C906
+implements the draft 0.7.1 vector extension, which is a different, incompatible
+encoding from ratified RVV 1.0 — and `v` in a GCC `-march` string means RVV 1.0.
+Building `rv64imafdcv` for this chip produces a binary that dies with
+`Illegal instruction`, and `-fno-tree-vectorize` does not save you: the compiler
+also uses vector registers to inline `memset`/`memcpy` and struct copies, so the
+first casualty is usually a plain struct initialiser, long before any kernel
+runs. Nothing is lost by dropping it — the default build is scalar on every ISA
+for fairness. If you want 0.7.1 as the hardware actually implements it (only
+useful with `VECTORIZE=1`, and needs GCC 14+), use `make sg2000-xthead`, which
+adds `_xtheadvector`.
 
 Fairness defaults (for cross-arch comparisons):
 - Auto-vectorization disabled: `-fno-tree-vectorize`
@@ -188,6 +197,20 @@ Enable for peak per-arch throughput:
 ```
 make VECTORIZE=1                 # allow compiler vectorization
 make VECTORIZE=1 FMA=1           # allow vectorization and FMA contraction
+```
+
+### Illegal instruction, or an `-march` that seems to have no effect
+
+Object files are stamped with the flags they were built with (`.build-flags`),
+so switching `MARCH` forces a rebuild. Older checkouts did not do this: `make`
+after `make sg2000` found `src/bench.o` up to date and silently kept the object
+built for the *previous* ISA, so the re-target appeared to succeed while the
+binary never changed — including the case where the retained object was the one
+containing instructions the CPU does not implement. If in doubt:
+
+```
+make clean && make sg2000
+objdump -d cpu-bench | grep -c vsetvli    # 0 = no RVV in the binary
 ```
 
 ## Run
