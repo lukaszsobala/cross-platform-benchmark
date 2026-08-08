@@ -89,9 +89,9 @@ Skymont to `L`≈256, a 2x difference in the length of call pattern the front en
 can hold.
 
 `DISPcap` turns that curve into one number without a magic threshold. Each rate
-is normalised between the plateau and the floor, giving `q` ∈ [0,1] = "how much
-of the available prediction win is this core still getting", and `q` is summed
-over the ladder, which is a factor of two per step:
+is normalised between the plateau and the fully-random floor, giving `q` ∈ [0,1]
+= "how much of the available prediction win is this core still getting", and `q`
+is summed over the span `L` = 8…16384, which is a factor of two per step:
 
 ```
 DISPcap = 8 * 2^(sum(q) - 1)      # calls
@@ -99,18 +99,61 @@ DISPcap = 8 * 2^(sum(q) - 1)      # calls
 
 A core that predicts everything up to `L` and nothing beyond reads out exactly
 `L`. Dividing the floor out is what removes the old bias, because the floor *is*
-the mispredict penalty. **Lion Cove reads 677–682 calls, Skymont 381–397: 1.75x,
-per clock, in the right direction.** A 90%-of-plateau threshold crossing was
-tried first and gave a larger separation (2.06x) but is not reproducible — the
-Skymont knee sits at 94% of plateau, so noise slides the crossing between ladder
-intervals and one core returned 206–322 calls across repeat runs. The integral
-form repeats to <1% on the P-cores and ~5% on the E-cores, because no single
-point can move it by more than its own 1/11th of the span.
+the mispredict penalty. Measured across five cores on three machines and two
+ISAs, all per clock:
 
-Run `./cpu-bench --disp-sweep` to get the whole curve on any target; it extends
-to `L` = 65536 so the choice of 8192 as the in-suite floor can be re-checked
-(on both these cores 8192 is already within 2% of fully random, and 8192
-selector bytes still fit in every L1 we target — 64 KiB does not).
+| core | machine | MHz | old metric, calls/kcycle | `DISP-thr`, calls/kcycle | `DISPcap`, calls |
+|---|---|---|---|---|---|
+| T-Head C906 | SG2000 | 663 | 72.7 | 73.3 | **none** |
+| Cortex-A53 | SG2000 | 964 | 50.9 | 74.5 | 23 |
+| Cortex-A55 | RK3588 | 1800 | **63.4** | 97.6 | 31 |
+| Cortex-A76 | RK3588 | 2400 | 50.8 | 138.9 | **3023** |
+| Skymont E | 258V | 3701 | 38.8 | 199 | 418 |
+| Lion Cove P | 258V | 4800 | 39.4 | 236 | 550 |
+
+The old column is in bold where it was worst: the little A55 led every core on
+it, and the A76 came *below* the A53. `DISPcap` orders them the way the
+microarchitectures do, and the two big/little pairs both come out right per
+clock — A76 over A55 by 97x, Lion Cove over Skymont by 1.32x.
+
+Three things in that table are worth reading carefully:
+
+- **The A76 beats Lion Cove by 5x.** It holds full rate to `L` = 2048 where Lion
+  Cove breaks at 1024. Part of that is a genuinely long-history indirect
+  predictor, but part is slack: the A76 needs 7.2 cycles per predicted call
+  against Lion Cove's 4.2, so it has more room to absorb an occasional
+  mispredict before the *time* moves. `DISPcap` measures the longest pattern
+  dispatched at full rate, and that is not quite the same thing as accuracy.
+  The fall itself is real and sharp, not a slack artefact — the A76 is at 67% of
+  plateau by 4096 and 41% by 8192.
+- **`none` for the C906** means the core was no faster calling one single
+  repeated target than calling a random stream: gain 1.003 across the entire
+  sweep. It has no usable indirect target prediction, so there is no capacity to
+  report, and its `DISP-thr` of 72.9 is a mispredict cost rather than a
+  prediction rate. That verdict comes from a period-1 reference point, which
+  every core with a BTB predicts; without it, a flat curve cannot be told apart
+  from a core that outruns the ladder.
+- **`DISP-thr` alone would not have fixed anything.** It separates Lion Cove
+  from Skymont by only 1.19x per clock, and rates the C906 above the A53.
+
+A 90%-of-plateau threshold crossing was tried first and gave a larger separation
+on the 258V but is not reproducible: the Skymont knee sits at 94% of plateau, so
+noise slides the crossing between ladder intervals and one core returned
+206–322 calls across repeat runs.
+
+**Measure `DISPcap` on a quiet machine.** The plateau is throughput-bound and
+speeds up when the machine is idle; the mispredicting end of the curve is
+flush-bound and does not. Background load therefore compresses the two together
+and *inflates* the result — the same P-core measured 546 at load 0.7 and 745 at
+load 1.7. Raising `--reps` does not fix continuous interference. Within one
+quiet run the P-cores repeat to ~2% and the E-cores to ~10%, the E-cores being
+worse because their knee sits on a steeper part of the curve.
+
+Run `./cpu-bench --disp-sweep` to get the whole curve on any target. The floor
+has to be the genuinely random point: an earlier version ended the ladder at
+8192 and treated that as the floor because it is within 2% of random on both
+258V core types, but on the A76 it is 13% high, and a floor set too high
+compresses every `q` beneath it.
 
 `DISP-thr` is the plateau of that curve, i.e. call/return throughput with the
 pattern learned: 4.7 cycles/call on Lion Cove against 5.0 on Skymont. It is a
@@ -248,14 +291,14 @@ column headers do not have to be memorised:
 ```
  CPU    MHz   INT-lat  INT-thr   ILP  MUL-thr    FP-lat   FP-thr  fILP      MEM  MEMlat   MLP  DISP-thr DISPcap     score
                Mops/s   Mops/s     x   Mmul/s   Mflop/s  Mflop/s     x     GB/s      ns     x   Mcall/s   calls   geomean
-   0   4700    4678.8  24653.2  5.27  11396.2    1558.0  11802.5  7.58    37.70    99.7  8.44    1029.8     681   17769.4
-   3   4800    4778.1  25176.1  5.27  11638.0    1593.1  12046.3  7.56    36.14   101.8  8.55    1051.3     681   17995.1
-   4   3701    3683.6  20549.1  5.58   4447.4    1473.3   9901.5  6.72    40.83   123.6  9.24     736.6     385   12057.5
-   7   3701    3683.8  20537.5  5.58   4447.5    1473.4   9902.0  6.72    42.62   119.8  8.80     735.5     397   12075.0
+   0   4700    4681.6  24634.8  5.26  11407.3    1559.5  11803.5  7.57    36.34   101.4  8.52    1110.0     546   18499.8
+   3   4800    4781.9  25166.5  5.26  11645.3    1594.1  12051.1  7.56    36.07   102.0  8.60    1134.6     549   18772.5
+   4   3701    3685.1  20558.4  5.58   4449.7    1474.1   9907.3  6.72    42.42   119.4  8.72     737.0     426   13493.1
+   7   3701    3684.5  20547.5  5.58   4448.2    1473.3   9906.6  6.72    43.30   120.0  8.90     736.9     387   13485.2
 ```
 
 (Core Ultra 7 258V: CPUs 0–3 are Lion Cove P-cores, 4–7 Skymont E-cores. Per
-clock the P-core leads by 2.02x on `MUL-thr`, 1.10x on `DISP-thr` and 1.75x on
+clock the P-core leads by 2.02x on `MUL-thr`, 1.19x on `DISP-thr` and 1.32x on
 `DISPcap`, while Skymont is marginally *ahead* per clock on plain ALU and FP
 throughput — its 8 ALUs against Lion Cove's 6. Most of the P-core's real-world
 advantage here is clock, multiply and front end, which is exactly why the suite
@@ -270,10 +313,12 @@ spread; pin the governor to `performance`).
 Compute phases repeat to within <1% across identical cores. `MEMlat` and the
 `MLP` derived from it still vary ~20%, which is physical page placement: without
 transparent huge pages a 16 MiB random chase spans 4096 pages and the DRAM
-bank/rank distribution differs per allocation. `DISPcap` repeats to <1% on a
-big core but ~5% on a little one, whose knee sits on a steeper part of the
-curve; raise `--time` if that matters, as the whole dispatch ladder scales with
-it (each of its 11 points gets half a phase).
+bank/rank distribution differs per allocation. `DISPcap` repeats to ~2% on a
+big core and ~10% on a little one, whose knee sits on a steeper part of the
+curve, and it is the one column that is biased rather than just noised by
+background load (see above) — quiesce the machine for it. Raise `--time` if
+you want tighter numbers; the whole dispatch ladder scales with it, each of its
+14 points getting half a phase.
 
 
 Notes:

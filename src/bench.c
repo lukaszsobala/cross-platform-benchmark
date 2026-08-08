@@ -194,24 +194,48 @@ typedef struct {
 //
 // The last entry is the old behaviour and serves as the unpredictable floor.
 static const size_t g_disp_periods[] = {
-    4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 65536
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 65536
 };
 #define DISP_SWEEP_N   ARRAY_LEN(g_disp_periods)
 // Backing array is sized for the largest period; smaller periods use a prefix.
 #define DISP_IDX_BYTES ((size_t)65536)
 
-// The ladder the suite itself walks, a x2 geometric span of the same curve.
-// It stops at 8192 for two reasons: measured on Lion Cove and Skymont, 8192 is
-// already within 2% of the fully-random floor (see --disp-sweep), and 8192
-// selector bytes still fit in every L1 we target. A 64 KiB array does not, so
-// the old "random" point was partly measuring L2, not prediction.
+// The ladder the suite itself walks: a single-target reference, a x2 geometric
+// span, and the unpredictable floor.
+//
+// Period 1 calls the same function every time, which any core with a BTB
+// predicts. It is not part of the span; it exists to tell "this core predicts
+// nothing beyond a single target" apart from "this core predicts everything the
+// ladder can throw at it", which look identical from the span alone.
+//
+// The floor has to be the genuinely random point. An earlier version ended the
+// ladder at 8192 and used that as the floor, on the grounds that 8192 was
+// within 2% of random on Lion Cove and Skymont. Measured on a Cortex-A76 that
+// is wrong by 13% -- it still predicts part of an 8192-long sequence -- and a
+// floor set 13% too high compresses every q below it. Cache residency is not a
+// reason to avoid 64 KiB here: the selector walk is sequential and consumes one
+// byte per call, i.e. one line per ~1.5 kcycles at these rates, which is
+// nothing next to a mispredict on every call.
 static const size_t g_disp_ladder[] = {
-    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192
+    1,                                                          // reference
+    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, // the span
+    65536                                                       // floor
 };
 #define DISP_LADDER_N     ARRAY_LEN(g_disp_ladder)
-#define DISP_LADDER_BYTES ((size_t)8192)
-// Periods averaged to establish the "everyone predicts this" plateau. x2 spaced
-// and flat to ~1% on every core measured, so the mean is a stable reference.
+#define DISP_LADDER_BYTES ((size_t)65536)
+#define DISP_REF_IDX      0
+#define DISP_SPAN_FIRST   1
+#define DISP_SPAN_LAST    (DISP_LADDER_N - 2)
+// Span points used to establish the "everyone predicts this" plateau, starting
+// at DISP_SPAN_FIRST. The best of them is taken, not the mean, for the same
+// reason every other phase keeps its best repetition: interference only ever
+// makes a measurement slower. It matters more here than elsewhere, because the
+// plateau is the *reference* the whole curve is normalised against -- a plateau
+// depressed by background load inflates every q beneath it, and taking the mean
+// of three points moved the reported capacity by 20% between a loaded and a
+// quiet run of the same machine. On a small core the curve is already falling
+// across these points and the best one is the least-degraded, which is also the
+// reference we want.
 #define DISP_PLATEAU_PTS  3
 // The capacity read-out integrates the whole curve rather than crossing a
 // threshold. At each ladder point the rate is normalised to
@@ -233,10 +257,13 @@ static const size_t g_disp_ladder[] = {
 // spreads 1.21x worst-case and reproduces to ~1% on the P-cores, because no
 // single point can move it by more than its own 1/11th of the span.
 // Discrimination is lower but still decisive: 1.7x rather than 2.1x.
-// Below this plateau/floor ratio, prediction is not buying the core anything
-// and the "knee" would be an artefact of a flat curve, so no capacity is
-// reported. Both cores here sit near 5x, so this is a long way from the data.
-#define DISP_MIN_GAIN     1.30
+// Below this plateau/floor ratio the curve is flat and there is no span to
+// integrate. Measured gains: Lion Cove 5.4, Skymont 5.1, Cortex-A76 2.7,
+// Cortex-A55 1.44, Cortex-A53 1.36, T-Head C906 1.003. The C906 is the case
+// this has to catch -- it has no usable indirect target prediction at all --
+// and the A53 is the nearest core that must NOT be caught, so the threshold
+// sits between them with room on both sides.
+#define DISP_MIN_GAIN     1.15
 
 // A kernel runs `n` units of work and returns; the driver times batches of them.
 typedef void (*kernel_fn)(void *ctx, uint64_t n);
@@ -1222,15 +1249,21 @@ static void print_legend_ratios(void) {
            "  table walks overlap as well.\n", CHASE_WAYS);
     printf("  DISPcap is a length, not a rate, so it is already independent of clock.\n"
            "  A fixed random call sequence of period L is repeated, L is swept %zu..%zu,\n"
-           "  and the resulting curve -- normalised between the rate at tiny L and the\n"
-           "  rate at the longest L -- is integrated over log2(L). A core that predicts\n"
-           "  everything up to L and nothing beyond reads out exactly L. '-' means the\n"
-           "  curve never fell, so the ladder says nothing: run --disp-sweep.\n"
+           "  and the curve -- normalised between the rate at small L and the rate at a\n"
+           "  fully random stream -- is integrated over log2(L). A core that predicts\n"
+           "  everything up to L and nothing beyond reads out exactly L. Measured:\n"
+           "  Cortex-A53 23, Cortex-A55 31, Skymont 418, Lion Cove 550, Cortex-A76 3023.\n"
+           "  Measure it on a quiet machine: background load depresses the plateau more\n"
+           "  than the mispredicting end of the curve, which inflates the result.\n"
+           "  'none' means the core was no faster even calling one single repeated\n"
+           "  target, i.e. no usable indirect prediction (measured: T-Head C906);\n"
+           "  '<%zu' means it loses the pattern before the span starts.\n"
            "  A purely random target stream is unpredictable for every core ever built,\n"
            "  so it measures mispredict *penalty*, which favours short pipelines. That\n"
            "  is what this column used to report, and why a Cortex-A55 beat a Lion Cove\n"
            "  on it per clock.\n",
-           g_disp_ladder[0], g_disp_ladder[DISP_LADDER_N - 1]);
+           g_disp_ladder[DISP_SPAN_FIRST], g_disp_ladder[DISP_SPAN_LAST],
+           g_disp_ladder[DISP_SPAN_FIRST]);
 }
 
 // Report the DRAM controller clock seen while the memory phases were running.
@@ -1271,35 +1304,65 @@ static double geomean(const double *v, int n) {
 //         it is the mispredict penalty the old metric was accidentally
 //         reporting -- kept visible, but no longer mistaken for core quality.
 //
-// Returns 0 if the ladder was never measured.
-static int disp_summary(const worker_t *w, double *thr, double *cap, double *gain) {
-    *thr = 0.0; *cap = 0.0; *gain = 0.0;
+//   *span the same integral before it is exponentiated, i.e. capacity in
+//         ladder steps. The score uses this rather than *cap: capacity spans
+//         two orders of magnitude between a C906 and a Cortex-A76, and a term
+//         with that much dynamic range would dominate a geomean of rates.
+//
+// Returns DISP_NA if the ladder was never measured, DISP_NONE if the core
+// showed no prediction win at any period including a single repeated target,
+// DISP_OK otherwise.
+#define DISP_NA   0
+#define DISP_OK   1
+#define DISP_NONE 2
+
+static int disp_summary(const worker_t *w, double *thr, double *cap,
+                        double *gain, double *span) {
+    *thr = 0.0; *cap = 0.0; *gain = 0.0; *span = 0.0;
     double plateau = 0.0;
     for (int i = 0; i < DISP_PLATEAU_PTS; ++i) {
-        if (w->disp_ladder[i] <= 0.0) return 0;
-        plateau += w->disp_ladder[i];
+        const double v = w->disp_ladder[DISP_SPAN_FIRST + i];
+        if (v <= 0.0) return DISP_NA;
+        if (v > plateau) plateau = v;
     }
-    plateau /= (double)DISP_PLATEAU_PTS;
     const double floor_rate = w->disp_ladder[DISP_LADDER_N - 1];
-    if (plateau <= 0.0 || floor_rate <= 0.0) return 0;
+    const double ref_rate = w->disp_ladder[DISP_REF_IDX];
+    if (plateau <= 0.0 || floor_rate <= 0.0 || ref_rate <= 0.0) return DISP_NA;
 
     *thr = plateau;
     *gain = plateau / floor_rate;
-    // A curve that never falls is not a core with an infinite predictor -- it
-    // is a ladder that does not reach far enough, or a core that predicts none
-    // of it. Either way there is no capacity to report; --disp-sweep tells the
-    // two apart.
-    if (*gain < DISP_MIN_GAIN) return 1;
 
-    double span = 0.0;
-    for (int i = 0; i < DISP_LADDER_N; ++i) {
+    if (*gain < DISP_MIN_GAIN) {
+        // Flat from period 8 upwards. If the single-target reference is no
+        // faster either, the core is not predicting indirect targets at all
+        // (measured: T-Head C906). If it is faster, the core predicts one
+        // target but loses the pattern before the ladder starts, so capacity
+        // is below the first span point rather than unknown.
+        if (ref_rate / floor_rate < DISP_MIN_GAIN) return DISP_NONE;
+        *cap = (double)g_disp_ladder[DISP_SPAN_FIRST] / 2.0;
+        return DISP_OK;
+    }
+
+    for (int i = DISP_SPAN_FIRST; i <= DISP_SPAN_LAST; ++i) {
         double q = (w->disp_ladder[i] - floor_rate) / (plateau - floor_rate);
         if (q > 1.0) q = 1.0;
         if (q < 0.0) q = 0.0;
-        span += q;
+        *span += q;
     }
-    *cap = (double)g_disp_ladder[0] * pow(2.0, span - 1.0);
-    return 1;
+    *cap = (double)g_disp_ladder[DISP_SPAN_FIRST] * pow(2.0, *span - 1.0);
+    return DISP_OK;
+}
+
+// Render DISPcap for a table cell. The interesting cases are at the ends: below
+// the ladder, past the ladder, and no prediction at all.
+static void disp_cap_str(int st, double cap, char *buf, size_t n) {
+    if (st == DISP_NONE)                             snprintf(buf, n, "none");
+    else if (st != DISP_OK || cap <= 0.0)            snprintf(buf, n, "-");
+    else if (cap < (double)g_disp_ladder[DISP_SPAN_FIRST])
+        snprintf(buf, n, "<%zu", g_disp_ladder[DISP_SPAN_FIRST]);
+    else if (cap >= (double)g_disp_ladder[DISP_SPAN_LAST])
+        snprintf(buf, n, ">=%zu", g_disp_ladder[DISP_SPAN_LAST]);
+    else                                             snprintf(buf, n, "%.0f", cap);
 }
 
 // Synthetic single-core score. Deliberately spans compute *and* the two things
@@ -1309,17 +1372,18 @@ static int disp_summary(const worker_t *w, double *thr, double *cap, double *gai
 // between cores are unaffected by them.
 static double core_score(const worker_t *w) {
     double v[6];
-    double disp_thr, disp_cap, disp_gain;
-    disp_summary(w, &disp_thr, &disp_cap, &disp_gain);
+    double disp_thr, disp_cap, disp_gain, disp_span;
+    const int st = disp_summary(w, &disp_thr, &disp_cap, &disp_gain, &disp_span);
     v[0] = w->int_thr_mops;
     v[1] = w->fp_thr_mflops;
     v[4] = w->mul_thr_mops * 4.0;
     v[2] = disp_thr * 20.0;
-    // Predictor capacity in calls. Not a rate, but the geomean only cares
-    // about ratios between cores, and this is the term that carries "the front
-    // end can learn what this code does" -- the reason the dispatch phase is in
-    // the score at all. Zero when the curve was flat, and geomean() drops it.
-    v[5] = disp_cap * 20.0;
+    // Predictor capacity, in ladder steps rather than in calls -- see
+    // disp_summary. +1 so that a core with no indirect prediction still scores
+    // (poorly) instead of dropping out of the geomean, which would let it off
+    // entirely: the T-Head C906 measures a span of zero, and that is a real
+    // result about the core, not missing data.
+    v[5] = st == DISP_NA ? 0.0 : (disp_span + 1.0) * 2000.0;
     // Random-access rate with all chases in flight, in millions/s.
     v[3] = w->mem_mlp_ns > 0.0 ? (1000.0 / w->mem_mlp_ns) * 100.0 : 0.0;
     return geomean(v, ARRAY_LEN(v));
@@ -1544,17 +1608,11 @@ int main(int argc, char **argv) {
                 }
             }
 
-            double disp_thr, disp_cap, disp_gain;
-            disp_summary(&w, &disp_thr, &disp_cap, &disp_gain);
+            double disp_thr, disp_cap, disp_gain, disp_span;
+            const int dst = disp_summary(&w, &disp_thr, &disp_cap, &disp_gain,
+                                         &disp_span);
             char capbuf[16];
-            if (disp_cap >= (double)g_disp_ladder[DISP_LADDER_N - 1]) {
-                snprintf(capbuf, sizeof(capbuf), ">=%zu",
-                         g_disp_ladder[DISP_LADDER_N - 1]);
-            } else if (disp_cap > 0.0) {
-                snprintf(capbuf, sizeof(capbuf), "%.0f", disp_cap);
-            } else {
-                snprintf(capbuf, sizeof(capbuf), "-");
-            }
+            disp_cap_str(dst, disp_cap, capbuf, sizeof(capbuf));
 
             printf("%4d %6s  %8.1f %8.1f %5.2f %8.1f  %8.1f %8.1f %5.2f  %7.2f %7.1f %5.2f  %8.1f %7s  %8.1f\n",
                    cpu_list[i], mhzbuf,
@@ -1591,7 +1649,7 @@ int main(int argc, char **argv) {
     double mul_thr = 0;
     double lat_ns_sum = 0, mlp_ns_sum = 0;
     double cap_sum = 0;
-    int lat_n = 0, mlp_n = 0, cap_n = 0;
+    int lat_n = 0, mlp_n = 0, cap_n = 0, cap_none = 0;
     uint64_t checksum = 0;
     for (int i = 0; i < threads; ++i) {
         int_lat += w[i].int_lat_mops;
@@ -1601,10 +1659,11 @@ int main(int argc, char **argv) {
         fp_thr  += w[i].fp_thr_mflops;
         gbps    += w[i].mem_gbps;
         {
-            double dthr, dcap, dgain;
-            disp_summary(&w[i], &dthr, &dcap, &dgain);
+            double dthr, dcap, dgain, dspan;
+            const int dst = disp_summary(&w[i], &dthr, &dcap, &dgain, &dspan);
             disp += dthr;
-            if (dcap > 0.0) { cap_sum += dcap; cap_n++; }
+            if (dst == DISP_OK && dcap > 0.0) { cap_sum += dcap; cap_n++; }
+            if (dst == DISP_NONE) cap_none++;
         }
         if (w[i].mem_lat_ns > 0.0) { lat_ns_sum += w[i].mem_lat_ns; lat_n++; }
         if (w[i].mem_mlp_ns > 0.0) { mlp_ns_sum += w[i].mem_mlp_ns; mlp_n++; }
@@ -1630,6 +1689,9 @@ int main(int argc, char **argv) {
         printf("%-9s %-23s %8s %11s %11.0f\n",
                "DISPcap", "indirect predictor size", "calls", "-",
                cap_sum / cap_n);
+    } else if (cap_none > 0) {
+        printf("%-9s %-23s %8s %11s %11s\n",
+               "DISPcap", "indirect predictor size", "calls", "-", "none");
     }
     if (mem_per_thread > 0) {
         printf("%-9s %-23s %8s %11.2f %11.2f\n",
