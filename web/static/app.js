@@ -13,6 +13,7 @@ const state = {
   params: new URLSearchParams(),   // the filters the current board was loaded with
   sort: "score",        // which metric the board is ranked by
   norm: "abs",
+  cols: "key",          // key metrics only, or every one of them
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -62,6 +63,13 @@ function unitOf(metric) {
   if (metric.kind === "rate") return metric.unit + "/GHz";
   if (metric.kind === "time") return "cycles";
   return metric.unit;
+}
+
+// The columns a table shows. The metric being sorted on is always one of them —
+// a board ordered by a number it does not print reads as arbitrary.
+function shownMetrics() {
+  if (state.cols === "all") return state.metrics;
+  return state.metrics.filter((m) => m.headline || m.key === state.sort);
 }
 
 function machineName(row) {
@@ -120,7 +128,9 @@ function filterParams() {
 }
 
 async function loadBoard() {
-  state.norm = $("#filters").elements.norm.value;
+  const form = $("#filters");
+  state.norm = form.elements.norm.value;
+  state.cols = form.elements.cols.value;
   // Remember what was actually applied: expanding a row has to ask for the
   // same filters and the same order, not whatever the form says by then.
   state.params = filterParams();
@@ -162,7 +172,7 @@ function selectBox(row) {
 
 function metricCells(tr, row) {
   tr.append(el("td", "num", row.mhz ? Math.round(row.mhz) : "—"));
-  for (const m of state.metrics) tr.append(el("td", "num", fmt(value(row, m))));
+  for (const m of shownMetrics()) tr.append(el("td", "num", fmt(value(row, m))));
 }
 
 function renderBoard() {
@@ -176,7 +186,7 @@ function renderBoard() {
   const hr = el("tr");
   hr.append(el("th", "num", "#"), el("th", "", ""), el("th", "wide", "machine"),
             el("th", "", "arch"), el("th", "", "build"), el("th", "num", "MHz"));
-  for (const m of state.metrics) {
+  for (const m of shownMetrics()) {
     const th = el("th", "num");
     th.append(el("span", "mname", m.label), el("span", "munit", unitOf(m)));
     hr.append(th);
@@ -339,6 +349,15 @@ function renderSelection() {
 // Run detail
 // ---------------------------------------------------------------------------
 
+function metaList(pairs) {
+  const dl = el("dl", "meta");
+  for (const [k, v] of pairs) {
+    if (!v) continue;
+    dl.append(el("dt", null, k), el("dd", null, v));
+  }
+  return dl;
+}
+
 async function showRun(id) {
   const run = await api(`/api/runs/${id}`);
   const rank = await api(`/api/runs/${id}/rank`).catch(() => ({}));
@@ -349,31 +368,36 @@ async function showRun(id) {
   if (run.label) box.append(el("p", "label big", run.label));
   if (run.notes) box.append(el("p", "notes", run.notes));
 
-  const meta = el("dl", "meta");
-  const pairs = [
+  // What identifies the run, then everything that qualifies it. The second set
+  // is what you go looking for once a number surprises you, not what you read
+  // on the way in, so it starts folded.
+  box.append(metaList([
     ["uploaded", run.created_at],
+    ["system", [run.sysname, run.os_release, run.machine].filter(Boolean).join(" ")],
+  ]));
+
+  const rest = metaList([
     ["mode", run.mode],
     ["arch", run.target],
     ["build", `${run.compiler || "?"}${run.compiler_version && run.compiler_version !== run.compiler ? ` (${run.compiler_version})` : ""}` +
               ` · ${run.vectorize ? "vectorize on" : "vectorize off"} · ${run.fma ? "FMA on" : "FMA off"}`],
     ["flags", run.build_flags ? `${run.cc || "cc"} ${run.build_flags}` : null],
-    ["system", [run.sysname, run.os_release, run.machine].filter(Boolean).join(" ")],
     ["config", `${run.threads ?? "?"} threads · ${run.seconds ?? "?"}s/phase × ${run.reps ?? "?"} reps · ` +
                 `${run.mem_bytes ? (run.mem_bytes / 1048576).toFixed(0) + " MiB/thread" : "no memory phases"} · ` +
                 `pin ${run.pin ? "on" : "off"}`],
     ["DRAM", run.dram_name ? `${run.dram_name} at ${fmt(run.dram_mhz_min, 0)}–${fmt(run.dram_mhz_max, 0)} MHz` : null],
     ["checksum", run.checksum],
-  ];
-  for (const [k, v] of pairs) {
-    if (!v) continue;
-    meta.append(el("dt", null, k), el("dd", null, v));
+  ]);
+  if (rest.childElementCount) {
+    const more = el("details", "more");
+    more.append(el("summary", null, "Build, config and checksum"), rest);
+    box.append(more);
   }
-  box.append(meta);
 
   if (rank.metrics && Object.keys(rank.metrics).length) {
     box.append(el("h3", null, `Best results`));
     const list = el("div", "percentiles");
-    for (const m of state.metrics) {
+    for (const m of shownMetrics()) {
       const r = rank.metrics[m.key];
       if (!r || r.percentile === null) continue;
       const line = el("div", "pct-row");
@@ -396,7 +420,7 @@ async function showRun(id) {
   const thead = el("thead");
   const hr = el("tr");
   hr.append(el("th", null, "scope"), el("th", "num", "cpu"), el("th", "num", "MHz"));
-  for (const m of state.metrics) hr.append(el("th", "num", m.label));
+  for (const m of shownMetrics()) hr.append(el("th", "num", m.label));
   thead.append(hr);
   const tbody = el("tbody");
   for (const c of run.cores) {
@@ -404,7 +428,7 @@ async function showRun(id) {
     tr.append(el("td", null, c.scope),
               el("td", "num", c.cpu ?? "—"),
               el("td", "num", c.mhz ? Math.round(c.mhz) : "—"));
-    for (const m of state.metrics) tr.append(el("td", "num", fmt(c[m.key])));
+    for (const m of shownMetrics()) tr.append(el("td", "num", fmt(c[m.key])));
     tbody.append(tr);
   }
   table.append(thead, tbody);
@@ -561,11 +585,15 @@ async function boot() {
     e.preventDefault();
     loadBoard().catch((err) => alert(err.message));
   });
-  $("#filters").elements.norm.addEventListener("change", () => {
-    state.norm = $("#filters").elements.norm.value;
-    renderBoard();
-    renderSelection();
-  });
+  // Both change how the rows are drawn, not which rows they are, so neither
+  // waits for Apply and neither refetches.
+  for (const name of ["norm", "cols"]) {
+    $("#filters").elements[name].addEventListener("change", () => {
+      state[name] = $("#filters").elements[name].value;
+      renderBoard();
+      renderSelection();
+    });
+  }
   $("#uploadform").addEventListener("submit", doUpload);
   $("#clearsel").addEventListener("click", () => {
     state.selected.clear();

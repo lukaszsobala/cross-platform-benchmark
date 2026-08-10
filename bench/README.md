@@ -87,6 +87,14 @@ Three of these need a word of interpretation:
 
 `score` is comparable across the cores of one run, not across machines.
 
+**A `total` row's `score` is a different quantity from a core's.** It is the same
+geomean over the same six components, but taken over the aggregated row — five of
+them summed across threads, and `DISPcap` left as the average because predictor
+size belongs to a core and does not add up. So it grows with core count, at
+roughly `threads^(5/6)` before contention; on the 4P+4E part above, eight threads
+come to about 4.5x one P-core. Rank machines against machines and cores against
+cores; a `total` next to a `cpu` row is meaningless.
+
 ### `DISPcap`: indirect predictor capacity
 
 The dispatch phase calls one of four tiny functions through a function pointer

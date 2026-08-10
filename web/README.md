@@ -62,9 +62,11 @@ is worth knowing before pointing `submit.sh` at a public hub.
   metric. Toggle *per GHz* to divide rates by clock and turn `MEMlat` into
   cycles, which compares microarchitecture rather than clock speed.
 - **Compare** — tick any rows and see them side by side, one bar group per
-  metric, normalised to the best of the selection.
-- **Run detail** — click a machine to see the full run: build flags, system,
-  config, DRAM clock, every record, and where the run's best values land as a
+  metric, normalised to the best of the selection. The one view that always
+  shows every metric: it is the drill-down, and trimming it would defeat it.
+- **Run detail** — click a machine to see the run: what it is and when it
+  landed, with the build flags, config, DRAM clock and checksum folded behind a
+  disclosure, then every record and where the run's best values land as a
   percentile of everything uploaded with the same build flags.
 - **Upload** — file picker or paste, plus the curl one-liner for the machine that
   actually ran the benchmark.
@@ -81,6 +83,17 @@ rest of them for the run. Rows at either level can be ticked for *Compare*.
 
 The alternative — a row per core — let one upload fill the top of the board with
 eight near-identical entries and pushed everyone else off it.
+
+### Three columns, not fourteen
+
+The benchmark reports fourteen rankable metrics per record. All fourteen at five
+significant figures is a data dump nobody reads, so the tables carry the
+`headline` set from `METRICS` — `score`, `INT-thr` and `MEM`: the geomean, the
+compute rate it is mostly made of, and the memory bandwidth it cannot stand in
+for — plus whichever metric the board is being sorted on, since a board ordered
+by a number it does not print reads as arbitrary. *Columns → all metrics*
+restores the rest. Nothing is dropped from the data: every metric is still
+sortable, still filtered on, still in *Compare*, and still in the raw document.
 
 Two comparability rules are enforced in the UI rather than left to the reader,
 because getting them wrong is the easiest way to draw a wrong conclusion:

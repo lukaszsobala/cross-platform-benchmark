@@ -51,6 +51,12 @@ always present; anything not measured is `null`, never absent and never `0`.
 `filp`, `mem_gbps`, `mem_lat_ns`, `mem_lat8_ns`, `mlp`, `disp_thr_mcall_s`,
 `disp_cap_calls`, `disp_prediction`, `disp_gain`, `disp_span`, `score`.
 
+`score` means something different by `scope`: on a `cpu` or `thread` record it is
+a single core's composite, on the `total` it is the same geomean over the summed
+throughputs and so scales with core count. Both are the same key with the same
+unit, so nothing rejects a comparison between them — the hub keeps them apart by
+only ever ranking a scope against itself.
+
 The set is exact in **both** directions — a record with an extra key fails the
 contract test, and so does one missing a key. A field only one side knows about
 is measured and then silently dropped, or stored as `NULL` forever; neither is
@@ -71,7 +77,10 @@ Five edits, in one commit, because a partial change is invisible at runtime:
 2. `CORE_FIELDS` in [web/server.py](../web/server.py) — JSON key → column.
 3. `METRICS` in [web/server.py](../web/server.py) — only if it should be
    rankable; this is what `/api/metrics` serves and what the front end builds
-   its columns from, so no front-end change is needed.
+   its columns from, so no front-end change is needed. Leave `headline` off
+   unless the metric belongs in every table by default: the tables show the
+   headline set plus whatever is being sorted on, and the rest are one select
+   away.
 4. `cores` in [web/schema.sql](../web/schema.sql) — the column.
 5. `Store.ADDED_COLUMNS` in [web/server.py](../web/server.py) — the migration
    that adds the column to a database made by an older build.

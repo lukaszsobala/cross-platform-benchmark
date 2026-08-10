@@ -1207,6 +1207,8 @@ static void print_legend(void) {
     }
     print_legend_ratios();
     fprintf(o, "  score is comparable across cores of one run, not across machines.\n");
+    fprintf(o, "  the total row's score sums the throughputs first, so it is a\n"
+               "  whole-machine number ~threads times a single core's, not one of them.\n");
 }
 
 // The DRAM controller clock seen during the memory phases. If it moved, the
@@ -1338,6 +1340,28 @@ typedef struct {
     int    disp_status;
     double score;
 } result_t;
+
+// The same six components as core_score(), rescaled to the whole machine: the
+// throughputs are the ones aggregate() summed, and the random-access rate is
+// multiplied by the thread count for the same reason -- n threads chase n sets
+// of pointers at once, so the machine retires n times one thread's misses.
+// DISPcap span is left as aggregate() averaged it: predictor size is a property
+// of a core and does not add up across them.
+//
+// The result is therefore ~n times a single core's score and is not comparable
+// with one. It answers "how much machine is there"; core_score() answers "how
+// good is a core".
+static double machine_score(const result_t *t, int n) {
+    double v[6];
+    v[0] = t->int_thr;
+    v[1] = t->fp_thr;
+    v[4] = t->mul_thr * 4.0;
+    v[2] = t->disp_thr * 20.0;
+    v[5] = t->disp_status == DISP_NA ? 0.0 : (t->disp_span + 1.0) * 2000.0;
+    v[3] = t->mem_lat8_ns > 0.0
+         ? (double)n * (1000.0 / t->mem_lat8_ns) * 100.0 : 0.0;
+    return geomean(v, ARRAY_LEN(v));
+}
 
 static result_t summarize(const worker_t *w, int cpu) {
     result_t r;
@@ -1561,6 +1585,7 @@ static void aggregate(const result_t *rows, int n, result_t *tot) {
     tot->ilp  = tot->int_lat > 0.0 ? tot->int_thr / tot->int_lat : 0.0;
     tot->filp = tot->fp_lat  > 0.0 ? tot->fp_thr  / tot->fp_lat  : 0.0;
     tot->mlp  = tot->mem_lat8_ns > 0.0 ? tot->mem_lat_ns / tot->mem_lat8_ns : 0.0;
+    tot->score = machine_score(tot, n);   // last: reads the fields set above
 }
 
 static int collect_threads(suite_t *s, const run_opts_t *o, int threads, int pin,
@@ -1656,6 +1681,12 @@ static void text_threads(const suite_t *s, size_t mem_per_thread) {
     if (t->mlp > 0.0) {
         printf("%-9s %-23s %8s %11s %11.2f\n", "MLP", "memory parallelism",
                "x", "-", t->mlp);
+    }
+    // Whole-machine only: it is a geomean of the totals, not of the per-thread
+    // column, and is ~n times what one core of this machine scores.
+    if (t->score > 0.0) {
+        printf("%-9s %-23s %8s %11.1f %11s\n", "score", "composite",
+               "geomean", t->score, "-");
     }
 }
 

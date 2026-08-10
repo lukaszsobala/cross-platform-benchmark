@@ -51,16 +51,22 @@ MAX_VALUE = 1e12            # nothing this benchmark reports comes near this
 #         time  -> per-clock normalisation multiplies by GHz (ns -> cycles)
 #         ratio -> already clock-independent
 #   better  which direction is an improvement; "none" means do not rank it
+#   headline  shown by default. Fourteen columns of five significant figures is
+#         a data dump, not a result, so the tables carry these three -- the
+#         geomean, the compute rate it is mostly made of, and memory bandwidth,
+#         which the geomean cannot stand in for -- plus whichever metric the
+#         board is being sorted on. The rest are one select away, and every
+#         metric is still ranked, filtered and compared on.
 METRICS = [
-    {"key": "score",       "label": "score",    "unit": "geomean", "kind": "rate",  "better": "high"},
-    {"key": "int_thr",     "label": "INT-thr",  "unit": "Mops/s",  "kind": "rate",  "better": "high"},
+    {"key": "score",       "label": "score",    "unit": "geomean", "kind": "rate",  "better": "high", "headline": True},
+    {"key": "int_thr",     "label": "INT-thr",  "unit": "Mops/s",  "kind": "rate",  "better": "high", "headline": True},
     {"key": "int_lat",     "label": "INT-lat",  "unit": "Mops/s",  "kind": "rate",  "better": "high"},
     {"key": "ilp",         "label": "ILP",      "unit": "x",       "kind": "ratio", "better": "high"},
     {"key": "mul_thr",     "label": "MUL-thr",  "unit": "Mmul/s",  "kind": "rate",  "better": "high"},
     {"key": "fp_thr",      "label": "FP-thr",   "unit": "Mflop/s", "kind": "rate",  "better": "high"},
     {"key": "fp_lat",      "label": "FP-lat",   "unit": "Mflop/s", "kind": "rate",  "better": "high"},
     {"key": "filp",        "label": "fILP",     "unit": "x",       "kind": "ratio", "better": "none"},
-    {"key": "mem_gbps",    "label": "MEM",      "unit": "GB/s",    "kind": "rate",  "better": "high"},
+    {"key": "mem_gbps",    "label": "MEM",      "unit": "GB/s",    "kind": "rate",  "better": "high", "headline": True},
     {"key": "mem_lat_ns",  "label": "MEMlat",   "unit": "ns",      "kind": "time",  "better": "low"},
     {"key": "mem_lat8_ns", "label": "MEMlat/8", "unit": "ns",      "kind": "time",  "better": "low"},
     {"key": "mlp",         "label": "MLP",      "unit": "x",       "kind": "ratio", "better": "high"},

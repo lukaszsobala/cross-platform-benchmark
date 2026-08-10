@@ -172,6 +172,19 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(set(srv.METRIC_KEYS) - set(srv.CORE_COLUMNS), set(),
                          "METRICS names a key with no cores column")
 
+    def test_the_headline_set_is_small_and_led_by_the_score(self):
+        """The columns a table shows before anyone asks for more.
+
+        The front end draws these plus whatever it is sorted on, so a headline
+        flag added without thought is a column added to every table at once.
+        """
+        headline = [m["key"] for m in srv.METRICS if m.get("headline")]
+        self.assertEqual(headline[0], "score", "the geomean leads")
+        self.assertLessEqual(len(headline), 4, "this is a summary, not a dump")
+        self.assertTrue(all(m["better"] != "none" for m in srv.METRICS
+                            if m.get("headline")),
+                        "a metric that is not a ranking cannot be a headline")
+
     def test_declared_columns_exist_in_the_database(self):
         with tempfile.TemporaryDirectory() as d:
             store = srv.Store(str(Path(d) / "t.sqlite3"))

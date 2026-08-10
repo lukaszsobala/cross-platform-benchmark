@@ -55,6 +55,12 @@
         <option value="ghz">per GHz</option>
       </select>
     </label>
+    <label>Columns
+      <select name="cols">
+        <option value="key">key metrics</option>
+        <option value="all">all metrics</option>
+      </select>
+    </label>
     <label class="grow">Search
       <input type="search" name="q" placeholder="CPU model, label or machine">
     </label>
@@ -62,7 +68,7 @@
   </form>
 
   <p class="note">
-    Tick any row, to compare it. Results are only comparable between builds with the same
+    Tick any row to compare it. Results are only comparable between builds with the same
     <strong>vectorize</strong> and <strong>FMA</strong> flags.
   </p>
 

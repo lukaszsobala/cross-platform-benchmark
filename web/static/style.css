@@ -202,6 +202,12 @@ th.num { text-align: right; }
 .meta { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 1rem; margin: 0.75rem 0; font-size: 0.85rem; }
 .meta dt { color: var(--muted); }
 .meta dd { margin: 0; overflow-wrap: anywhere; }
+details.more { margin: 0.5rem 0 0; }
+details.more > summary {
+  cursor: pointer; color: var(--muted); font-size: 0.82rem; width: fit-content;
+}
+details.more > summary:hover { color: var(--ink); }
+details.more .meta { margin: 0.5rem 0 0.25rem; }
 .notes { white-space: pre-wrap; }
 .pct-row { display: flex; align-items: center; gap: 0.6rem; margin: 0.2rem 0; }
 .pct-name { width: 5.5rem; font-size: 0.82rem; }
