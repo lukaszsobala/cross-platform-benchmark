@@ -166,6 +166,65 @@ class HubTest(unittest.TestCase):
         lats = [c["mem_lat_ns"] for c in out["cores"]]
         self.assertEqual(lats, sorted(lats))
 
+    # -- one upload, one row ----------------------------------------------
+    def test_upload_takes_one_leaderboard_row(self):
+        """A machine with 8 cores is one result, not eight."""
+        cores = [core(cpu=i, score=1000.0 + i) for i in range(8)]
+        out = self.upload(document("per-core", cores=cores))
+        self.assertEqual(out["records"], 8)
+        _, board = self.req("/api/cores?scope=cpu&sort=score&order=desc&limit=200")
+        mine = [c for c in board["cores"] if c["run_id"] == out["id"]]
+        self.assertEqual(len(mine), 1)
+        # The row stands for the whole upload and says how many it covers.
+        self.assertEqual(mine[0]["records"], 8)
+
+    def test_the_row_is_the_best_record_at_the_sorted_metric(self):
+        cores = [core(cpu=0, score=1000.0, mem_lat_ns=300.0),
+                 core(cpu=1, score=9000.0, mem_lat_ns=200.0),
+                 core(cpu=2, score=5000.0, mem_lat_ns=100.0)]
+        out = self.upload(document("per-core", cores=cores))
+
+        def row(sort, order):
+            _, b = self.req(f"/api/cores?scope=cpu&sort={sort}&order={order}&limit=200")
+            return [c for c in b["cores"] if c["run_id"] == out["id"]][0]
+
+        best = row("score", "desc")
+        self.assertEqual(best["cpu"], 1)
+        # Every column comes from that one core, so the row is a real
+        # measurement rather than a per-metric best of several.
+        self.assertEqual(best["mem_lat_ns"], 200.0)
+        quickest = row("mem_lat_ns", "asc")
+        self.assertEqual(quickest["cpu"], 2)
+        self.assertEqual(quickest["score"], 5000.0)
+
+    def test_records_of_one_run_are_addressable(self):
+        """What the expanded view of a board row asks for."""
+        cores = [core(cpu=i, score=1000.0 + i) for i in range(4)]
+        out = self.upload(document("per-core", cores=cores))
+        _, all_of = self.req(
+            f"/api/cores?run={out['id']}&scope=cpu&sort=score&order=desc")
+        self.assertEqual([c["cpu"] for c in all_of["cores"]], [3, 2, 1, 0])
+        self.assertTrue(all(c["run_id"] == out["id"] for c in all_of["cores"]))
+
+    def test_ids_address_records_not_runs(self):
+        """A shared comparison link names individual cores of the same run."""
+        out = self.upload(document("per-core",
+                                   cores=[core(cpu=0), core(cpu=1, score=1.0)]))
+        _, run = self.req(f"/api/runs/{out['id']}")
+        ids = ",".join(str(c["id"]) for c in run["cores"])
+        _, picked = self.req(f"/api/cores?ids={ids}")
+        self.assertEqual(len(picked["cores"]), 2)
+
+    def test_group_none_returns_every_record(self):
+        cores = [core(cpu=i) for i in range(3)]
+        out = self.upload(document("per-core", cores=cores))
+        _, flat = self.req("/api/cores?scope=cpu&group=none&limit=500")
+        self.assertEqual(len([c for c in flat["cores"] if c["run_id"] == out["id"]]), 3)
+
+    def test_rejects_bad_group(self):
+        code, _ = self.expect_error("/api/cores?group=everything")
+        self.assertEqual(code, 400)
+
     def test_rank_reports_percentile(self):
         out = self.upload()
         _, rank = self.req(f"/api/runs/{out['id']}/rank")

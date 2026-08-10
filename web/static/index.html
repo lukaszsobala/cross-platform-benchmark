@@ -25,10 +25,10 @@
 
 <section id="board" class="tab active">
   <form class="filters" id="filters">
-    <label>Records
+    <label>Rank by
       <select name="scope">
-        <option value="cpu">one core (--per-core)</option>
-        <option value="thread">one thread (default run)</option>
+        <option value="cpu">best core (--per-core)</option>
+        <option value="thread">best thread (default run)</option>
         <option value="total">whole machine (total)</option>
       </select>
     </label>
@@ -62,12 +62,10 @@
   </form>
 
   <p class="note">
-    Results are only comparable between builds with the same
-    <strong>vectorize</strong> and <strong>FMA</strong> flags; rows carry theirs.
-    <code>score</code> is a geomean of absolute rates, so it rewards clock as
-    well as microarchitecture — switch to <em>per GHz</em> to compare cores
-    rather than machines.
+    Tick any row, to compare it. Results are only comparable between builds with the same
+    <strong>vectorize</strong> and <strong>FMA</strong> flags.
   </p>
+
 
   <div class="scroller"><table id="board-table"><thead></thead><tbody></tbody></table></div>
   <p class="empty" id="board-empty" hidden>Nothing here yet. Be the first to upload a run.</p>

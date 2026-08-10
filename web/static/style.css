@@ -137,6 +137,20 @@ th.num { text-align: right; }
 }
 .label.big { font-style: normal; font-size: 0.9rem; }
 
+/* one row per upload, with its records folded underneath ------------------ */
+.run-head { display: flex; align-items: baseline; gap: 0.4rem; }
+.expander {
+  background: none; border: 0; padding: 0; cursor: pointer; font: inherit;
+  color: var(--muted); width: 1rem; flex: none; text-align: left;
+}
+.expander:hover { color: var(--ink); }
+.expander.blank { cursor: default; }
+.rowsub { display: block; color: var(--muted); font-size: 0.75rem; }
+.rowsub.inline { display: inline; margin-left: 0.5rem; }
+.child-row td { color: var(--muted); border-bottom-style: dotted; }
+.child-row .childname { padding-left: 1.4rem; }
+.child-row:hover { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+
 /* compare ---------------------------------------------------------------- */
 .cmp-head { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-bottom: 1.25rem; }
 .chip {

@@ -6,8 +6,12 @@
 
 const state = {
   metrics: [],          // from /api/metrics
-  rows: [],             // current leaderboard page
+  rows: [],             // current leaderboard page: one row per upload
+  children: new Map(),  // run id -> that upload's records, once expanded
+  expanded: new Set(),  // run ids currently showing their records
   selected: new Map(),  // core id -> row
+  params: new URLSearchParams(),   // the filters the current board was loaded with
+  sort: "score",        // which metric the board is ranked by
   norm: "abs",
 };
 
@@ -60,10 +64,36 @@ function unitOf(metric) {
   return metric.unit;
 }
 
+function machineName(row) {
+  return row.cpu_models || row.machine || "unknown CPU";
+}
+
+// The machine, for a leaderboard row. One upload is one row, so the row is
+// named after the machine and the record standing for it is spelled out
+// underneath by repText().
 function coreName(row) {
-  const model = row.cpu_models || row.machine || "unknown CPU";
+  const model = machineName(row);
   if (row.scope === "total") return `${model} · all ${row.threads ?? "?"} threads`;
   return row.cpu === null || row.cpu === undefined ? model : `${model} · cpu${row.cpu}`;
+}
+
+function recordName(row) {
+  if (row.scope === "total") return `all ${row.threads ?? "?"} threads`;
+  const what = row.scope === "thread" ? "thread" : "cpu";
+  return row.cpu === null || row.cpu === undefined ? what : `${what}${row.cpu}`;
+}
+
+// Which of the upload's records is on show, and how many it beat. The board is
+// ranked by one metric, so the row is that metric's best record -- every column
+// in it comes from that one core, not from a mix.
+function repText(row) {
+  const n = row.records ?? 1;
+  if (row.scope === "total") return "whole machine";
+  const unit = row.scope === "thread" ? "threads" : "cores";
+  const metric = state.metrics.find((m) => m.key === state.sort);
+  const label = metric ? metric.label : state.sort;
+  return n > 1 ? `best ${label} of ${n} ${unit} · ${recordName(row)}`
+               : `${recordName(row)}`;
 }
 
 function flagsText(row) {
@@ -91,9 +121,48 @@ function filterParams() {
 
 async function loadBoard() {
   state.norm = $("#filters").elements.norm.value;
-  const { cores } = await api("/api/cores?" + filterParams().toString());
+  // Remember what was actually applied: expanding a row has to ask for the
+  // same filters and the same order, not whatever the form says by then.
+  state.params = filterParams();
+  state.sort = state.params.get("sort") || "score";
+  // Which record represents an upload depends on the sort metric, so a reload
+  // invalidates anything already expanded.
+  state.children.clear();
+  state.expanded.clear();
+  const { cores } = await api("/api/cores?" + state.params.toString());
   state.rows = cores;
   renderBoard();
+}
+
+// The records of one upload, in the board's own order. Fetched on demand: a
+// per-core sweep of a 256-CPU machine is 256 rows nobody asked to see.
+async function toggleExpand(row) {
+  if (state.expanded.delete(row.run_id)) return renderBoard();
+  if (!state.children.has(row.run_id)) {
+    const p = new URLSearchParams(state.params);
+    p.set("run", row.run_id);
+    p.set("group", "none");
+    p.set("limit", "1024");
+    const { cores } = await api("/api/cores?" + p.toString());
+    state.children.set(row.run_id, cores);
+  }
+  state.expanded.add(row.run_id);
+  renderBoard();
+}
+
+function selectBox(row) {
+  const box = el("td");
+  const cb = el("input");
+  cb.type = "checkbox";
+  cb.checked = state.selected.has(row.id);
+  cb.addEventListener("change", () => toggleSelect(row, cb.checked));
+  box.append(cb);
+  return box;
+}
+
+function metricCells(tr, row) {
+  tr.append(el("td", "num", row.mhz ? Math.round(row.mhz) : "—"));
+  for (const m of state.metrics) tr.append(el("td", "num", fmt(value(row, m))));
 }
 
 function renderBoard() {
@@ -105,7 +174,7 @@ function renderBoard() {
   $("#board-empty").hidden = state.rows.length > 0;
 
   const hr = el("tr");
-  hr.append(el("th", "num", "#"), el("th", "", ""), el("th", "wide", "core"),
+  hr.append(el("th", "num", "#"), el("th", "", ""), el("th", "wide", "machine"),
             el("th", "", "arch"), el("th", "", "build"), el("th", "num", "MHz"));
   for (const m of state.metrics) {
     const th = el("th", "num");
@@ -115,32 +184,46 @@ function renderBoard() {
   thead.append(hr);
 
   state.rows.forEach((row, i) => {
-    const tr = el("tr");
-    tr.append(el("td", "num", i + 1));
-
-    const box = el("td");
-    const cb = el("input");
-    cb.type = "checkbox";
-    cb.checked = state.selected.has(row.id);
-    cb.addEventListener("change", () => toggleSelect(row, cb.checked));
-    box.append(cb);
-    tr.append(box);
+    const open = state.expanded.has(row.run_id);
+    const tr = el("tr", "run-row");
+    tr.append(el("td", "num", i + 1), selectBox(row));
 
     const name = el("td", "wide");
-    const link = el("button", "linkish", coreName(row));
+    const head = el("div", "run-head");
+    if ((row.records ?? 1) > 1) {
+      const ex = el("button", "expander", open ? "▾" : "▸");
+      ex.type = "button";
+      ex.title = open ? "hide this run's records" : "show every record in this run";
+      ex.setAttribute("aria-expanded", String(open));
+      ex.addEventListener("click", () => toggleExpand(row).catch((e) => alert(e.message)));
+      head.append(ex);
+    } else {
+      head.append(el("span", "expander blank", " "));
+    }
+    const link = el("button", "linkish", machineName(row));
     link.type = "button";
     link.addEventListener("click", () => showRun(row.run_id));
-    name.append(link);
+    head.append(link);
+    name.append(head);
     if (row.label) name.append(el("span", "label", row.label));
+    name.append(el("span", "rowsub", repText(row)));
     tr.append(name);
 
-    tr.append(el("td", "", row.target || "—"),
-              el("td", "flags", flagsText(row)),
-              el("td", "num", row.mhz ? Math.round(row.mhz) : "—"));
-    for (const m of state.metrics) {
-      tr.append(el("td", "num", fmt(value(row, m))));
-    }
+    tr.append(el("td", "", row.target || "—"), el("td", "flags", flagsText(row)));
+    metricCells(tr, row);
     tbody.append(tr);
+
+    if (!open) return;
+    for (const c of state.children.get(row.run_id) || []) {
+      const sub = el("tr", "child-row");
+      sub.append(el("td", "num", ""), selectBox(c));
+      const cname = el("td", "wide");
+      cname.append(el("span", "childname", recordName(c)));
+      if (c.id === row.id) cname.append(el("span", "rowsub inline", "ranked here"));
+      sub.append(cname, el("td", "", ""), el("td", "", ""));
+      metricCells(sub, c);
+      tbody.append(sub);
+    }
   });
 }
 
@@ -149,6 +232,9 @@ function toggleSelect(row, on) {
   else state.selected.delete(row.id);
   syncHash();
   renderSelection();
+  // A record can appear twice -- as a run's representative and in its expanded
+  // list -- so redraw to keep both boxes agreeing.
+  renderBoard();
 }
 
 // Keep the selection in the URL so a comparison can be shared as a link.
@@ -285,7 +371,7 @@ async function showRun(id) {
   box.append(meta);
 
   if (rank.metrics && Object.keys(rank.metrics).length) {
-    box.append(el("h3", null, `Where this run's best ${rank.scope} values land`));
+    box.append(el("h3", null, `Best results`));
     const list = el("div", "percentiles");
     for (const m of state.metrics) {
       const r = rank.metrics[m.key];
@@ -425,7 +511,9 @@ async function doUpload(ev) {
     } catch { /* the server already validated it */ }
     rememberRun({ id: res.id, token: res.delete_token, name,
                   at: new Date().toISOString().slice(0, 16).replace("T", " ") });
-    out.append(el("p", "ok", `Stored ${res.records} records as run ${res.id}.`));
+    out.append(el("p", "ok",
+      `Stored run ${res.id} — one leaderboard row, holding all ${res.records} ` +
+      `records. Expand it to see every core.`));
     const p2 = el("p");
     const link = el("button", "linkish", "See where it lands");
     link.type = "button";

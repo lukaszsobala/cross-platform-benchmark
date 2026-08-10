@@ -369,12 +369,24 @@ class Store:
     def cores(self, *, scope: str | None = "cpu", target: str | None = None,
               vectorize: int | None = None, fma: int | None = None,
               search: str | None = None, ids: list[int] | None = None,
+              run: int | None = None, group_run: bool = True,
               sort: str = "score", desc: bool = True, limit: int = 50) -> list[dict]:
+        """Records matching the filters, best first.
+
+        With `group_run` (the leaderboard's default) an upload contributes one
+        row, not one per core: the run's best record at `sort` stands for it,
+        and `records` says how many it was picked from. Without it every
+        matching record is a row of its own -- what the expanded view of a run
+        and a shared comparison link both address.
+        """
         where = ["1 = 1"]
         args: list[object] = []
         if scope is not None:
             where.append("c.scope = ?")
             args.append(scope)
+        if run is not None:
+            where.append("c.run_id = ?")
+            args.append(run)
         if target:
             where.append("r.target = ?")
             args.append(target)
@@ -394,14 +406,28 @@ class Store:
         # `sort` is whitelisted by the caller; never interpolate raw input here.
         assert sort in METRIC_KEYS or sort == "mhz"
         direction = "DESC" if desc else "ASC"
+        # Nulls last whichever way the metric runs, then the metric, then the
+        # id so the order is total. Used twice: once to pick each run's
+        # representative, once to order the board itself.
+        order = f"(c.{sort} IS NULL), c.{sort} {direction}, c.id ASC"
         sql = (
+            f"WITH matched AS ("
+            f"  SELECT c.id AS core_id, "
+            f"         COUNT(*)     OVER (PARTITION BY c.run_id) AS peers, "
+            f"         ROW_NUMBER() OVER (PARTITION BY c.run_id "
+            f"                            ORDER BY {order}) AS pick "
+            f"  FROM cores c JOIN runs r ON r.id = c.run_id "
+            f"  WHERE {' AND '.join(where)}) "
             f"SELECT c.id, c.run_id, c.scope, c.cpu, c.mhz, c.mhz_src, "
             f"       c.{', c.'.join(CORE_COLUMNS[3:])}, "
             f"       r.target, r.vectorize, r.fma, r.cpu_models, r.label, "
-            f"       r.created_at, r.mode, r.threads, r.compiler, r.machine "
-            f"FROM cores c JOIN runs r ON r.id = c.run_id "
-            f"WHERE {' AND '.join(where)} "
-            f"ORDER BY (c.{sort} IS NULL), c.{sort} {direction}, c.id ASC "
+            f"       r.created_at, r.mode, r.threads, r.compiler, r.machine, "
+            f"       m.peers AS records "
+            f"FROM matched m "
+            f"JOIN cores c ON c.id = m.core_id "
+            f"JOIN runs r ON r.id = c.run_id "
+            + ("WHERE m.pick = 1 " if group_run else "")
+            + f"ORDER BY {order} "
             f"LIMIT ?")
         args.append(limit)
         with self.connect() as db:
@@ -632,11 +658,23 @@ class Handler(BaseHTTPRequestHandler):
             v = query.get(name, [default])[0]
             return v if v not in ("", None) else default
 
-        # An explicit id list addresses records directly (a shared comparison
-        # link), so it is not narrowed by the leaderboard's scope default.
-        scope = one("scope", None if one("ids") else "cpu")
+        # An explicit id list, or one run's records, addresses records directly
+        # -- a shared comparison link, or the expanded view of one board row --
+        # so neither is narrowed by the leaderboard's scope default, and neither
+        # is collapsed to one row per run.
+        addressed = bool(one("ids") or one("run"))
+        scope = one("scope", None if addressed else "cpu")
         if scope is not None and scope not in SCOPES:
             raise Invalid(f"unknown scope {scope!r}")
+        group = one("group", "none" if addressed else "run")
+        if group not in ("run", "none"):
+            raise Invalid("group must be 'run' or 'none'")
+        run = one("run")
+        if run is not None:
+            try:
+                run = int(run)
+            except ValueError:
+                raise Invalid("run must be an integer")
         sort = one("sort", "score")
         if sort not in METRIC_KEYS and sort != "mhz":
             raise Invalid(f"unknown sort metric {sort!r}")
@@ -657,6 +695,8 @@ class Handler(BaseHTTPRequestHandler):
             fma=flag.get(str(one("fma", "")).lower()),
             search=_text(one("q"), 64, "q"),
             ids=ids,
+            run=run,
+            group_run=(group == "run"),
             sort=sort,
             desc=(order == "desc"),
             limit=clamp_int(one("limit", "50"), 1, 500, 50),

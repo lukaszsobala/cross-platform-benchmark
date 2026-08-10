@@ -11,7 +11,7 @@ service can be moved elsewhere as one folder.
 ```sh
 python3 server.py                        # http://127.0.0.1:8080
 python3 server.py --db /var/lib/cpu-bench/runs.sqlite3 --host 0.0.0.0 --port 8080
-python3 test_server.py                   # 29 tests, ~0.6s
+python3 test_server.py                   # 35 tests, ~0.6s
 ```
 
 From the repo root, `make serve` and `make test` do the first and last of those.
@@ -57,17 +57,30 @@ is worth knowing before pointing `submit.sh` at a public hub.
 
 ## What the page does
 
-- **Leaderboard** — every uploaded record, filtered by architecture, by build
-  flags and by scope (one core / one thread / whole machine), sorted by any
+- **Leaderboard** — **one row per upload**, filtered by architecture, by build
+  flags and by scope (best core / best thread / whole machine), sorted by any
   metric. Toggle *per GHz* to divide rates by clock and turn `MEMlat` into
   cycles, which compares microarchitecture rather than clock speed.
 - **Compare** — tick any rows and see them side by side, one bar group per
   metric, normalised to the best of the selection.
-- **Run detail** — click a core to see the full run: build flags, system, config,
-  DRAM clock, every record, and where the run's best values land as a percentile
-  of everything uploaded with the same build flags.
+- **Run detail** — click a machine to see the full run: build flags, system,
+  config, DRAM clock, every record, and where the run's best values land as a
+  percentile of everything uploaded with the same build flags.
 - **Upload** — file picker or paste, plus the curl one-liner for the machine that
   actually ran the benchmark.
+
+### One upload is one row
+
+A run measures every core, so a 128-core machine arrives as 128 records. They
+are all stored and all shown, but they are one *result*: the board is grouped by
+upload, and each row is the record that came out best at the metric being sorted
+on — pick `MEMlat` and the row becomes the machine's quickest core, not its
+fastest one. Every column in a row comes from that single record, so a row is a
+core that existed rather than a per-metric best of several, and `▸` unfolds the
+rest of them for the run. Rows at either level can be ticked for *Compare*.
+
+The alternative — a row per core — let one upload fill the top of the board with
+eight near-identical entries and pushed everyone else off it.
 
 Two comparability rules are enforced in the UI rather than left to the reader,
 because getting them wrong is the easiest way to draw a wrong conclusion:
@@ -91,9 +104,16 @@ because getting them wrong is the easiest way to draw a wrong conclusion:
 | `GET` | `/api/runs/<id>/raw` | the original uploaded document, verbatim |
 | `GET` | `/api/runs/<id>/rank` | percentile per metric within the matching build population |
 | `DELETE` | `/api/runs/<id>` | withdraw a run; needs the `X-Delete-Token` header |
-| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&ids=&sort=&order=&limit=` | leaderboard rows |
+| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&sort=&order=&limit=` | leaderboard rows: one per upload, each the run's best record at `sort`, with `records` counting those it stands for |
+| `GET` | `/api/cores?run=<id>&scope=&sort=&order=` | every record of one run, in board order — what a row unfolds to |
+| `GET` | `/api/cores?ids=1,2,3` | named records, for a shared comparison link |
 | `GET` | `/api/metrics` | metric definitions (key, label, unit, direction) |
 | `GET` | `/api/stats` | run/record counts per architecture |
+
+The three `/api/cores` forms differ only in `group`, which is `run` (collapse to
+one row per upload) by default and `none` when `run=` or `ids=` is given, since
+both of those address records rather than rank them. Pass it explicitly to
+override either default.
 
 `/api/metrics` is the single source of truth for the metric set *as far as the
 front end is concerned* — it builds its columns from that response, so no
