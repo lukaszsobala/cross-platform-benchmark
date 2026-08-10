@@ -57,12 +57,15 @@ is worth knowing before pointing `submit.sh` at a public hub.
 
 ## What the page does
 
-- **Leaderboard** — **one row per upload**, filtered by architecture, by build
-  flags and by scope (best core / best thread / whole machine). Click a column
-  heading to rank by it; clicking the one already ranked on turns it around, and
-  a metric starts at its own good end, so `MEMlat` opens quickest-first. Toggle
-  *per GHz* to divide rates by clock and turn `MEMlat` into cycles, which
-  compares microarchitecture rather than clock speed.
+- **Leaderboard** — **one row per upload**, opening on whole-machine totals and
+  filtered by architecture, by build flags and by scope (whole machine / best
+  core / best thread). The dropdowns apply themselves; only the search box waits
+  to be submitted, since a board that reshuffles on every keystroke is unusable.
+  Click a column heading to rank by it; clicking the one already ranked on turns
+  it around, and a metric starts at its own good end, so `MEMlat` opens
+  quickest-first. Toggle *per GHz* to divide the core rates by clock and turn
+  `MEMlat` into cycles, which compares microarchitecture rather than clock
+  speed. `MEM` is left in `GB/s` either way — see below.
 - **Compare** — tick any rows and see them side by side, one bar group per
   metric, normalised to the best of the selection. The one view that always
   shows every metric: it is the drill-down, and trimming it would defeat it.
@@ -100,6 +103,22 @@ on, still in *Compare*, and still in the raw document.
 Sorting on a metric outside the headline set is how you reach it without
 *detailed*: the column appears because it is being ranked on, and leaves again
 when something else is.
+
+### What *per GHz* does not touch
+
+Each metric carries a `kind` saying how the core clock enters it, and *per GHz*
+follows it: `rate` divides, `time` multiplies (ns become cycles), `ratio` and
+`fixed` pass through.
+
+`MEM` is `fixed`. The bandwidth phase streams a buffer deliberately sized past
+LLC, so what it measures is the memory controller and the DRAM clock, not the
+core's — `GB/s` per core-GHz would answer no question anyone has, and would
+flatter whichever core happened to be clocked lower while measuring the very
+same memory. It stays in `GB/s` in both views.
+
+`MEMlat` is DRAM-bound too but stays `time`, because latency in core cycles *is*
+a real quantity: it is what the stall costs this core, and a faster core does
+lose more cycles to the same nanoseconds. The asymmetry is deliberate.
 
 Two comparability rules are enforced in the UI rather than left to the reader,
 because getting them wrong is the easiest way to draw a wrong conclusion:

@@ -10,7 +10,6 @@
 <body>
 <header>
   <h1>cpu-bench results</h1>
-  <p class="sub">Upload the output of <code>cpu-bench --json</code> and compare it with everyone else's.</p>
   <p class="stats" id="stats"></p>
 </header>
 
@@ -27,9 +26,9 @@
   <form class="filters" id="filters">
     <label>Rank by
       <select name="scope">
+        <option value="total">whole machine</option>
         <option value="cpu">best core</option>
         <option value="thread">best thread</option>
-        <option value="total">whole machine</option>
       </select>
     </label>
     <label>Arch
@@ -53,17 +52,16 @@
       </select>
     </label>
     <label class="check" title="show every metric, not just the headline ones">
-      <input type="checkbox" name="detailed"> detailed
+      <input type="checkbox" name="detailed"> Detailed
     </label>
     <label class="grow">Search
       <input type="search" name="q" placeholder="CPU model, label or machine">
     </label>
-    <button type="submit">Apply</button>
+    <button type="submit">Search</button>
   </form>
 
   <p class="note">
-    Click a column to rank by it. Tick any row to compare it. Results are only
-    comparable between builds with the same <strong>vectorize</strong> and
+    Results are only comparable between builds with the same <strong>vectorize</strong> and
     <strong>FMA</strong> flags.
   </p>
 

@@ -50,6 +50,16 @@ MAX_VALUE = 1e12            # nothing this benchmark reports comes near this
 #   kind  rate  -> per-clock normalisation divides by GHz
 #         time  -> per-clock normalisation multiplies by GHz (ns -> cycles)
 #         ratio -> already clock-independent
+#         fixed -> the core clock is not what sets it; never normalise
+#
+#   MEM is `fixed` rather than `rate`. It is a DRAM streaming figure -- the
+#   buffer is sized past LLC deliberately -- so the memory controller and the
+#   DRAM clock set it, not the core's. GB/s per core-GHz would answer no
+#   question: it would flatter whichever core happened to be clocked lower
+#   while measuring the same memory. MEMlat stays `time` even though it is also
+#   a DRAM figure, because latency in core cycles is a real quantity -- it is
+#   what the stall costs *this* core, and a faster core does lose more cycles
+#   to the same nanoseconds.
 #   better  which direction is an improvement; "none" means do not rank it
 #   headline  shown by default. Fourteen columns of five significant figures is
 #         a data dump, not a result, so the tables carry these three -- the
@@ -66,7 +76,7 @@ METRICS = [
     {"key": "fp_thr",      "label": "FP-thr",   "unit": "Mflop/s", "kind": "rate",  "better": "high"},
     {"key": "fp_lat",      "label": "FP-lat",   "unit": "Mflop/s", "kind": "rate",  "better": "high"},
     {"key": "filp",        "label": "fILP",     "unit": "x",       "kind": "ratio", "better": "none"},
-    {"key": "mem_gbps",    "label": "MEM",      "unit": "GB/s",    "kind": "rate",  "better": "high", "headline": True},
+    {"key": "mem_gbps",    "label": "MEM",      "unit": "GB/s",    "kind": "fixed", "better": "high", "headline": True},
     {"key": "mem_lat_ns",  "label": "MEMlat",   "unit": "ns",      "kind": "time",  "better": "low"},
     {"key": "mem_lat8_ns", "label": "MEMlat/8", "unit": "ns",      "kind": "time",  "better": "low"},
     {"key": "mlp",         "label": "MLP",      "unit": "x",       "kind": "ratio", "better": "high"},
@@ -74,6 +84,10 @@ METRICS = [
     {"key": "disp_cap",    "label": "DISPcap",  "unit": "calls",   "kind": "ratio", "better": "high"},
 ]
 METRIC_KEYS = [m["key"] for m in METRICS]
+# The front end switches on these strings and falls through to "leave the value
+# alone" for anything it does not know, so a typo here is a metric that quietly
+# stops being normalised. The contract test pins the vocabulary.
+METRIC_KINDS = {"rate", "time", "ratio", "fixed"}
 
 # JSON key -> (column, type) for one core/thread record.
 CORE_FIELDS = [

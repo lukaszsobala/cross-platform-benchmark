@@ -13,6 +13,7 @@ const state = {
   params: new URLSearchParams(),   // the filters the current board was loaded with
   sort: "score",        // which metric the board is ranked by, set by its header
   order: "desc",
+  search: "",           // the last submitted search, not what is in the box
   norm: "abs",
   detailed: false,      // every metric, rather than the headline set
 };
@@ -46,8 +47,10 @@ function fmt(v, digits) {
   return v.toFixed(3);
 }
 
-// Per-GHz normalisation. Rates divide by clock, latencies in ns become cycles,
-// ratios and lengths are already clock-independent.
+// Per-GHz normalisation. Rates divide by clock and latencies in ns become
+// cycles; `ratio` and `fixed` pass through untouched -- the first is already
+// clock-independent, the second is not the core clock's to set (see METRICS in
+// server.py). Nothing here invents a unit the metric table did not ask for.
 function value(row, metric) {
   const raw = row[metric.key];
   if (raw === null || raw === undefined) return null;
@@ -79,8 +82,7 @@ function machineName(row) {
 
 // Machine and record together, for the compare chips: there a row has been
 // lifted out of the board and has to identify itself on its own. The board
-// itself names the machine only -- which record stands for it shows up when the
-// run is unfolded, marked "ranked here".
+// itself names the machine only.
 function coreName(row) {
   const model = machineName(row);
   if (row.scope === "total") return `${model} · all ${row.threads ?? "?"} threads`;
@@ -106,12 +108,16 @@ function flagsText(row) {
 function filterParams() {
   const form = $("#filters");
   const p = new URLSearchParams();
-  for (const name of ["scope", "target", "vectorize", "fma", "q"]) {
+  // The dropdowns reload the board the moment they change, so their live value
+  // is always the applied one.
+  for (const name of ["scope", "target", "vectorize", "fma"]) {
     const v = form.elements[name].value;
     if (v) p.set(name, v);
   }
-  // Sorting is not a filter: it lives on the column headers, so it comes from
-  // state rather than the form and takes effect without waiting for Apply.
+  // The search box does not: half-typed text is not a filter anyone asked for,
+  // so it applies on submit and is held here until then.
+  if (state.search) p.set("q", state.search);
+  // Sorting is not a filter either -- it lives on the column headers.
   p.set("sort", state.sort);
   p.set("order", state.order);
   p.set("limit", "100");
@@ -248,7 +254,6 @@ function renderBoard() {
       sub.append(el("td", "num", ""), selectBox(c));
       const cname = el("td", "wide");
       cname.append(el("span", "childname", recordName(c)));
-      if (c.id === row.id) cname.append(el("span", "rowsub inline", "ranked here"));
       sub.append(cname, el("td", "", ""), el("td", "", ""));
       metricCells(sub, c);
       tbody.append(sub);
@@ -595,10 +600,20 @@ async function boot() {
 
   $("#filters").addEventListener("submit", (e) => {
     e.preventDefault();
+    // Submitting the form is the search: it is the one filter that waits to be
+    // asked for, since a board that reshuffles on every keystroke is unusable.
+    state.search = $("#filters").elements.q.value.trim();
     loadBoard().catch((err) => alert(err.message));
   });
-  // Both change how the rows are drawn, not which rows they are, so neither
-  // waits for Apply and neither refetches.
+  // Picking from a dropdown is the whole gesture -- there is nothing to confirm
+  // afterwards, so each one reloads the board itself.
+  for (const name of ["scope", "target", "vectorize", "fma"]) {
+    $("#filters").elements[name].addEventListener("change", () => {
+      loadBoard().catch((err) => alert(err.message));
+    });
+  }
+  // These two change how the rows are drawn, not which rows they are, so
+  // neither refetches.
   const redraw = () => { renderBoard(); renderSelection(); };
   $("#filters").elements.norm.addEventListener("change", (e) => {
     state.norm = e.target.value;

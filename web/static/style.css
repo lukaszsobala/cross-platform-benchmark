@@ -159,8 +159,6 @@ th.sorted .sorth { color: var(--accent); }
 }
 .expander:hover { color: var(--ink); }
 .expander.blank { cursor: default; }
-.rowsub { display: block; color: var(--muted); font-size: 0.75rem; }
-.rowsub.inline { display: inline; margin-left: 0.5rem; }
 .child-row td { color: var(--muted); border-bottom-style: dotted; }
 .child-row .childname { padding-left: 1.4rem; }
 .child-row:hover { background: color-mix(in srgb, var(--accent) 4%, transparent); }

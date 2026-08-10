@@ -172,6 +172,12 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(set(srv.METRIC_KEYS) - set(srv.CORE_COLUMNS), set(),
                          "METRICS names a key with no cores column")
 
+    def test_every_metric_has_a_known_kind(self):
+        """A misspelt kind is invisible: it normalises as 'leave alone'."""
+        for m in srv.METRICS:
+            with self.subTest(m["key"]):
+                self.assertIn(m["kind"], srv.METRIC_KINDS)
+
     def test_the_headline_set_is_small_and_led_by_the_score(self):
         """The columns a table shows before anyone asks for more.
 
