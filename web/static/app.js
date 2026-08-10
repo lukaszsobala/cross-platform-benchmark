@@ -9,14 +9,34 @@ const state = {
   rows: [],             // current leaderboard page: one row per upload
   children: new Map(),  // run id -> that upload's records, once expanded
   expanded: new Set(),  // run ids currently showing their records
-  selected: new Map(),  // core id -> row
+  selected: new Map(),  // core id -> row; all of one scope, see retargetSelection
   params: new URLSearchParams(),   // the filters the current board was loaded with
   sort: "score",        // which metric the board is ranked by, set by its header
   order: "desc",
   search: "",           // the last submitted search, not what is in the box
   norm: "abs",
   detailed: false,      // every metric, rather than the headline set
+  scopeNote: "",        // what changing scope did to the selection, if anything
 };
+
+// Which way a metric runs, in words and in one glyph. Every place a metric is
+// named says this: a bar is drawn from the measurement itself, so nothing in
+// the picture tells you which end of it wins.
+const DIRECTIONS = {
+  high: { text: "higher is better", mark: "↑" },
+  low:  { text: "lower is better",  mark: "↓" },
+  none: { text: "not a ranking",    mark: "" },
+};
+
+const SCOPE_LABELS = {
+  total: "whole-machine",
+  cpu: "per-core",
+  thread: "per-thread",
+};
+
+function direction(metric) {
+  return (metric && DIRECTIONS[metric.better]) || null;
+}
 
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, text) => {
@@ -148,9 +168,14 @@ async function loadBoard() {
   // invalidates anything already expanded.
   state.children.clear();
   state.expanded.clear();
+  // Follow the scope being ranked, so a comparison is never half one kind of
+  // record and half another. Uses the params just applied, so the record it
+  // picks per run is the one the board is about to show.
+  await retargetSelection(state.params.get("scope"));
   const { cores } = await api("/api/cores?" + state.params.toString());
   state.rows = cores;
   renderBoard();
+  renderSelection();
 }
 
 // The records of one upload, in the board's own order. Fetched on demand: a
@@ -174,7 +199,8 @@ function selectBox(row) {
   const cb = el("input");
   cb.type = "checkbox";
   cb.checked = state.selected.has(row.id);
-  cb.addEventListener("change", () => toggleSelect(row, cb.checked));
+  cb.addEventListener("change", () =>
+    toggleSelect(row, cb.checked).catch((e) => alert(e.message)));
   box.append(cb);
   return box;
 }
@@ -185,15 +211,19 @@ function selectBox(row) {
 // the number is rather than in a control away from it.
 function sortHeader(label, unit, key) {
   const active = state.sort === key;
+  // Spelling "higher is better" out fifteen times across one header row would
+  // double the table's width, so a column carries the glyph and says the words
+  // in its tooltip; the legend under the table gives both in full.
+  const dir = direction(state.metrics.find((x) => x.key === key));
   const th = el("th", active ? "num sorted" : "num");
   th.setAttribute("aria-sort", !active ? "none"
     : state.order === "desc" ? "descending" : "ascending");
   const btn = el("button", "sorth");
   btn.type = "button";
-  btn.title = `sort by ${label}`;
+  btn.title = dir ? `sort by ${label} — ${dir.text}` : `sort by ${label}`;
   const name = el("span", "mname", label);
   if (active) name.append(el("span", "arrow", state.order === "desc" ? "▾" : "▴"));
-  btn.append(name, el("span", "munit", unit));
+  btn.append(name, el("span", "munit", dir && dir.mark ? `${unit} ${dir.mark}` : unit));
   btn.addEventListener("click", () => sortBy(key));
   th.append(btn);
   return th;
@@ -261,9 +291,62 @@ function renderBoard() {
   });
 }
 
-function toggleSelect(row, on) {
-  if (on) state.selected.set(row.id, row);
-  else state.selected.delete(row.id);
+// The record that stands for one run at the board's metric, in a given scope --
+// the same pick the leaderboard makes, asked for one run at a time.
+async function representative(runId, scope) {
+  // Built from the ranking alone, not from state.params: the board's filters
+  // narrow what is ranked, and a ticked run must not vanish because the search
+  // box no longer matches it.
+  const p = new URLSearchParams();
+  p.set("run", String(runId));
+  p.set("scope", scope);
+  p.set("group", "run");
+  p.set("sort", state.sort);
+  p.set("order", state.order);
+  p.set("limit", "1");
+  const { cores } = await api("/api/cores?" + p.toString());
+  return cores[0] || null;
+}
+
+// One comparison, one scope. A 'total' row is the sum over every thread, so
+// setting it beside a single core's numbers compares a machine with a part of
+// one -- the bars would be true and the reading of them false. Changing scope
+// therefore carries the selection across rather than dropping it: the same
+// machines stay ticked, as their record in the scope now being ranked, and the
+// rows they were ticked on lose their tick. A run with nothing in the new scope
+// (a --per-core upload has no whole-machine total) has to leave, and says so.
+async function retargetSelection(scope) {
+  const rows = [...state.selected.values()];
+  if (!scope || !rows.length || rows.every((r) => r.scope === scope)) return;
+  const next = new Map();
+  const lost = [];
+  for (const r of rows) {
+    if (r.scope === scope) {
+      next.set(r.id, r);
+      continue;
+    }
+    const rec = await representative(r.run_id, scope);
+    if (rec) next.set(rec.id, rec);
+    else lost.push(machineName(r));
+  }
+  state.selected = next;
+  state.scopeNote = lost.length
+    ? `${lost.join(", ")} has no ${SCOPE_LABELS[scope] || scope} record, so it ` +
+      `left the comparison when the ranking changed.`
+    : "";
+  syncHash();
+}
+
+async function toggleSelect(row, on) {
+  if (on) {
+    // Ticking across scopes moves the whole comparison to the new one rather
+    // than mixing the two.
+    await retargetSelection(row.scope);
+    state.selected.set(row.id, row);
+  } else {
+    state.selected.delete(row.id);
+    if (!state.selected.size) state.scopeNote = "";
+  }
   syncHash();
   renderSelection();
   // A record can appear twice -- as a run's representative and in its expanded
@@ -303,6 +386,7 @@ function renderSelection() {
   const warn = $("#compare-warn");
   body.replaceChildren();
   warn.replaceChildren();
+  if (state.scopeNote) warn.append(el("p", "warn", state.scopeNote));
   if (!n) return;
 
   const rows = [...state.selected.values()];
@@ -314,6 +398,10 @@ function renderSelection() {
       "or FMA-contracted build does more work per instruction, so the compute " +
       "numbers are not comparable with a scalar one."));
   }
+  // The backstop. retargetSelection keeps the selection to one scope at every
+  // door into it, so this should not fire -- but a mixed comparison reads as a
+  // result rather than as a mistake, and that is not a thing to leave to an
+  // invariant holding.
   const scopes = new Set(rows.map((r) => r.scope));
   if (scopes.size > 1) {
     warn.append(el("p", "warn",
@@ -337,12 +425,12 @@ function renderSelection() {
     const finite = vals.filter((v) => v !== null);
     const best = m.better === "low" ? Math.min(...finite) : Math.max(...finite);
     const max = Math.max(...finite);
+    const dir = direction(m);
 
     const block = el("div", "cmp-metric");
     const h = el("div", "cmp-title");
     h.append(el("strong", null, m.label), el("span", "munit", unitOf(m)));
-    if (m.better === "low") h.append(el("span", "hint", "lower is better"));
-    if (m.better === "none") h.append(el("span", "hint", "not a ranking"));
+    if (dir) h.append(el("span", "hint", dir.text));
     block.append(h);
 
     rows.forEach((r, i) => {
@@ -350,19 +438,21 @@ function renderSelection() {
       const line = el("div", "bar-row");
       const bar = el("div", "bar");
       const fill = el("div", `fill c${i % 6}`);
-      // A longer bar always means a better result, so a lower-is-better metric
-      // is drawn as best/value rather than value/max -- otherwise the slowest
-      // memory latency in the group would draw the most impressive bar.
-      const frac = v === null ? 0
-                 : m.better === "low" ? (v ? best / v : 0)
-                 : (max ? v / max : 0);
+      // The bar is the measurement, not a verdict: its length is the value
+      // against the largest in the selection, whichever way the metric runs.
+      // Which end wins is said in words above the group, so a 384 ns latency
+      // draws the long bar its number deserves and the "best" mark beside the
+      // 109 ns one says who took it.
+      const frac = v === null || !max ? 0 : v / max;
       fill.style.width = frac ? `${Math.max(1, frac * 100)}%` : "0%";
       bar.append(fill);
       line.append(bar, el("span", "bar-val", fmt(v)));
-      if (v !== null && best && m.better !== "none") {
-        const rel = m.better === "low" ? best / v : v / best;
-        line.append(el("span", "bar-rel", rel >= 0.999 ? "best" : `${(rel * 100).toFixed(0)}%`));
-      }
+      // Always present, even when empty: a missing cell would let one row's
+      // bar run wider than the rest and break the shared scale by eye.
+      const rel = v !== null && best && m.better !== "none"
+        ? (m.better === "low" ? best / v : v / best) : null;
+      line.append(el("span", "bar-rel", rel === null ? ""
+        : rel >= 0.999 ? "best" : `${(rel * 100).toFixed(0)}%`));
       block.append(line);
     });
     body.append(block);
@@ -424,15 +514,20 @@ async function showRun(id) {
     for (const m of shownMetrics()) {
       const r = rank.metrics[m.key];
       if (!r || r.percentile === null) continue;
+      const dir = direction(m);
       const line = el("div", "pct-row");
       line.append(el("span", "pct-name", m.label));
+      // These bars are a standing, not a measurement, and a standing has only
+      // one good end however the metric runs -- so the direction is said here
+      // too, to keep it from being read as one of the value bars in Compare.
+      line.append(el("span", "pct-dir", dir ? dir.text : ""));
       const bar = el("div", "bar");
       const fill = el("div", "fill c0");
       fill.style.width = `${Math.max(1, r.percentile)}%`;
       bar.append(fill);
       line.append(bar);
       line.append(el("span", "pct-val",
-        `${r.percentile.toFixed(0)}th of ${r.population}`));
+        `beats ${r.percentile.toFixed(0)}% of ${r.population}`));
       list.append(line);
     }
     box.append(list);
@@ -444,7 +539,12 @@ async function showRun(id) {
   const thead = el("thead");
   const hr = el("tr");
   hr.append(el("th", null, "scope"), el("th", "num", "cpu"), el("th", "num", "MHz"));
-  for (const m of shownMetrics()) hr.append(el("th", "num", m.label));
+  for (const m of shownMetrics()) {
+    const dir = direction(m);
+    const th = el("th", "num", dir && dir.mark ? `${m.label} ${dir.mark}` : m.label);
+    if (dir) th.title = `${m.label} — ${dir.text}`;
+    hr.append(th);
+  }
   thead.append(hr);
   const tbody = el("tbody");
   for (const c of run.cores) {
@@ -458,6 +558,7 @@ async function showRun(id) {
   table.append(thead, tbody);
   scroller.append(table);
   box.append(scroller);
+  box.append(el("p", "note legend", "↑ higher is better · ↓ lower is better"));
 
   const dl = el("a", "linkish", "download the original JSON");
   dl.href = `/api/runs/${run.id}/raw`;
@@ -517,6 +618,7 @@ function renderMine() {
         localStorage.setItem("cpu-bench-uploads",
           JSON.stringify(myRuns().filter((e) => e.id !== entry.id)));
         state.selected.clear();
+        state.scopeNote = "";
         renderSelection();
         renderMine();
         loadBoard().catch(() => {});
@@ -626,6 +728,7 @@ async function boot() {
   $("#uploadform").addEventListener("submit", doUpload);
   $("#clearsel").addEventListener("click", () => {
     state.selected.clear();
+    state.scopeNote = "";
     syncHash();
     renderSelection();
     renderBoard();
@@ -638,13 +741,6 @@ async function boot() {
     if (e.key === "Escape") $("#detail").hidden = true;
   });
 
-  const stats = await api("/api/stats").catch(() => null);
-  if (stats) {
-    const parts = [`${stats.runs} runs`, `${stats.records} records`];
-    for (const t of stats.targets) parts.push(`${t.target}: ${t.n}`);
-    $("#stats").textContent = parts.join(" · ");
-  }
-
   renderMine();
   renderSelection();
   await loadBoard();
@@ -653,10 +749,25 @@ async function boot() {
   const cmp = location.hash.match(/compare=([\d,]+)/);
   if (cmp) {
     const { cores } = await api("/api/cores?limit=64&ids=" + cmp[1]);
-    for (const row of cores) state.selected.set(row.id, row);
+    // A link names records directly, so it is the one way a mixed selection can
+    // still arrive. Take the scope of the first and keep the board on it; the
+    // rest of that scope come along, anything else is left behind rather than
+    // silently compared against a whole machine.
+    const scope = cores.length ? cores[0].scope : null;
+    const kept = cores.filter((c) => c.scope === scope);
+    for (const row of kept) state.selected.set(row.id, row);
+    state.scopeNote = kept.length < cores.length
+      ? `${cores.length - kept.length} row(s) in that link were a different ` +
+        `scope and were left out: one comparison holds one kind of record.`
+      : "";
+    if (scope && $("#filters").elements.scope.value !== scope) {
+      $("#filters").elements.scope.value = scope;
+      await loadBoard();
+    }
+    syncHash();
     renderSelection();
     renderBoard();
-    if (cores.length) showTab("compare");
+    if (kept.length) showTab("compare");
   }
   const m = location.hash.match(/run=(\d+)/);
   if (m) showRun(Number(m[1])).catch(() => {});

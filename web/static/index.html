@@ -10,7 +10,6 @@
 <body>
 <header>
   <h1>cpu-bench results</h1>
-  <p class="stats" id="stats"></p>
 </header>
 
 <nav class="tabs" id="tabs">
@@ -67,11 +66,16 @@
 
 
   <div class="scroller"><table id="board-table"><thead></thead><tbody></tbody></table></div>
+  <p class="note legend">↑ higher is better · ↓ lower is better</p>
   <p class="empty" id="board-empty" hidden>Nothing here yet. Be the first to upload a run.</p>
 </section>
 
 <section id="compare" class="tab">
-  <p class="note" id="compare-note">Tick rows in the leaderboard to compare them here.</p>
+  <p class="note" id="compare-note">
+    Tick rows in the leaderboard to compare them here. A comparison holds one
+    kind of record — changing <strong>Rank by</strong> carries the same machines
+    over to whole-machine, best-core or best-thread rather than mixing them.
+  </p>
   <div id="compare-warn"></div>
   <div id="compare-body"></div>
   <button type="button" id="clearsel" hidden>Clear selection</button>

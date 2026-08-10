@@ -1,12 +1,12 @@
 # cpu-bench results hub
 
 A small web service for collecting `cpu-bench --json` results and comparing them
-with everyone else's.
+with everyone else's. It is an addition to the benchmark, not the point of it:
+[bench/README.md](../bench/README.md) is what explains the numbers.
 
 Python 3 standard library only — `http.server` + `sqlite3`, no framework, no
 build step — matching the benchmark's own no-dependencies policy. Everything
-lives in this directory and nothing outside it is referenced, so the whole
-service can be moved elsewhere as one folder.
+lives in this directory, so the whole service moves as one folder.
 
 ```sh
 python3 server.py                        # http://127.0.0.1:8080
@@ -34,19 +34,11 @@ The reply carries the run id and a **delete token** — the only way to withdraw
 run later, so keep it. Uploading through the web page stores the token in the
 browser's local storage and lists it under *My uploads*.
 
-**Submit `--full` runs.** A full run carries both halves — one record per core
-from the per-core sweep, plus one per thread and a whole-machine total from the
-multi-threaded run — and only the pair is interpretable: the totals say what the
-machine does at once, the per-core records say what each core type does on its
-own. `--per-core` and plain runs are accepted too and simply carry the one half.
+**Submit `--full` runs.** Only the pair of halves is interpretable: the totals
+say what the machine does at once, the per-core records say what each core type
+does on its own. `--per-core` and plain runs are accepted and carry the one half.
 A `--disp-sweep` dump is rejected; it is a diagnostic curve with no summary
 metrics to rank.
-
-Every upload records the toolchain that produced it: compiler and version, the
-driver invoked (which is what distinguishes a cross-compile) and the exact
-`CFLAGS` the binary was built with. Two results built with different `-march` or
-`-O` levels are not the same measurement, and the run detail shows the string so
-that is visible rather than assumed.
 
 **`build.flags` is verbatim, so check what is in it.** It is whatever `CFLAGS`
 the binary was compiled with, baked in at build time and published unedited. A
@@ -57,80 +49,32 @@ is worth knowing before pointing `submit.sh` at a public hub.
 
 ## What the page does
 
-- **Leaderboard** — **one row per upload**, opening on whole-machine totals and
-  filtered by architecture, by build flags and by scope (whole machine / best
-  core / best thread). The dropdowns apply themselves; only the search box waits
-  to be submitted, since a board that reshuffles on every keystroke is unusable.
-  Click a column heading to rank by it; clicking the one already ranked on turns
-  it around, and a metric starts at its own good end, so `MEMlat` opens
-  quickest-first. Toggle *per GHz* to divide the core rates by clock and turn
-  `MEMlat` into cycles, which compares microarchitecture rather than clock
-  speed. `MEM` is left in `GB/s` either way — see below.
-- **Compare** — tick any rows and see them side by side, one bar group per
-  metric, normalised to the best of the selection. The one view that always
-  shows every metric: it is the drill-down, and trimming it would defeat it.
-- **Run detail** — click a machine to see the run: what it is and when it
-  landed, with the build flags, config, DRAM clock and checksum folded behind a
-  disclosure, then every record and where the run's best values land as a
-  percentile of everything uploaded with the same build flags.
+- **Leaderboard** — one row per upload, ranked by whichever column heading you
+  click and filtered by architecture, build flags and scope (whole machine /
+  best core / best thread). `▸` unfolds the records behind a row. Three metrics
+  are shown by default plus whichever is being ranked on; *detailed* restores
+  the rest. *per GHz* divides the core rates by clock and turns `MEMlat` into
+  cycles; `MEM` stays in `GB/s` either way, being set by the memory controller
+  rather than the core clock.
+- **Compare** — tick rows and see them side by side, every metric, one bar group
+  each. A bar is the measurement, scaled against the largest in the selection,
+  and each group says *higher is better* or *lower is better* in words. One
+  comparison holds one scope: a whole-machine total is the sum over every
+  thread, so changing **Rank by** carries the ticks across to that scope rather
+  than mixing the two.
+- **Run detail** — the run, its build flags and config, every record it carries,
+  and where its best values land as a percentile of everything uploaded with the
+  same build flags.
 - **Upload** — file picker or paste, plus the curl one-liner for the machine that
   actually ran the benchmark.
 
-### One upload is one row
-
-A run measures every core, so a 128-core machine arrives as 128 records. They
-are all stored and all shown, but they are one *result*: the board is grouped by
-upload, and each row is the record that came out best at the metric being sorted
-on — pick `MEMlat` and the row becomes the machine's quickest core, not its
-fastest one. Every column in a row comes from that single record, so a row is a
-core that existed rather than a per-metric best of several, and `▸` unfolds the
-rest of them for the run. Rows at either level can be ticked for *Compare*.
-
-The alternative — a row per core — let one upload fill the top of the board with
-eight near-identical entries and pushed everyone else off it.
-
-### Three columns, not fourteen
-
-The benchmark reports fourteen rankable metrics per record. All fourteen at five
-significant figures is a data dump nobody reads, so the tables carry the
-`headline` set from `METRICS` — `score`, `INT-thr` and `MEM`: the geomean, the
-compute rate it is mostly made of, and the memory bandwidth it cannot stand in
-for — plus whichever metric the board is being sorted on, since a board ordered
-by a number it does not print reads as arbitrary. *detailed* restores the rest.
-Nothing is dropped from the data: every metric is still sortable, still filtered
-on, still in *Compare*, and still in the raw document.
-
-Sorting on a metric outside the headline set is how you reach it without
-*detailed*: the column appears because it is being ranked on, and leaves again
-when something else is.
-
-### What *per GHz* does not touch
-
-Each metric carries a `kind` saying how the core clock enters it, and *per GHz*
-follows it: `rate` divides, `time` multiplies (ns become cycles), `ratio` and
-`fixed` pass through.
-
-`MEM` is `fixed`. The bandwidth phase streams a buffer deliberately sized past
-LLC, so what it measures is the memory controller and the DRAM clock, not the
-core's — `GB/s` per core-GHz would answer no question anyone has, and would
-flatter whichever core happened to be clocked lower while measuring the very
-same memory. It stays in `GB/s` in both views.
-
-`MEMlat` is DRAM-bound too but stays `time`, because latency in core cycles *is*
-a real quantity: it is what the stall costs this core, and a faster core does
-lose more cycles to the same nanoseconds. The asymmetry is deliberate.
-
-Two comparability rules are enforced in the UI rather than left to the reader,
-because getting them wrong is the easiest way to draw a wrong conclusion:
-
-- Results are only comparable between builds with matching **vectorize** and
-  **FMA** flags. Every row shows its flags, the filters can pin them, the
-  percentile is computed only within a matching population, and the compare view
-  warns when a selection mixes them.
-- `score` is a geomean of absolute rates, so it rewards clock as much as
-  microarchitecture, and the benchmark's own README calls it comparable across
-  the cores of one run rather than across machines. It is shown, but *per GHz*
-  is the honest cross-machine view.
+Two comparability rules are enforced here rather than left to the reader, since
+getting them wrong is the easiest way to draw a wrong conclusion. Results only
+compare between builds with matching **vectorize** and **FMA** flags — the
+filters can pin them, percentiles are computed only within a matching
+population, and *Compare* warns when a selection mixes them. And `score` is a
+geomean of absolute rates, so it rewards clock as much as microarchitecture;
+*per GHz* is the honest cross-machine view.
 
 ## API
 
@@ -142,16 +86,15 @@ because getting them wrong is the easiest way to draw a wrong conclusion:
 | `GET` | `/api/runs/<id>/raw` | the original uploaded document, verbatim |
 | `GET` | `/api/runs/<id>/rank` | percentile per metric within the matching build population |
 | `DELETE` | `/api/runs/<id>` | withdraw a run; needs the `X-Delete-Token` header |
-| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&sort=&order=&limit=` | leaderboard rows: one per upload, each the run's best record at `sort`, with `records` counting those it stands for |
-| `GET` | `/api/cores?run=<id>&scope=&sort=&order=` | every record of one run, in board order — what a row unfolds to |
+| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&sort=&order=&limit=` | leaderboard rows: one per upload, each the run's best record at `sort` |
+| `GET` | `/api/cores?run=<id>&scope=&sort=&order=` | every record of one run, in board order |
 | `GET` | `/api/cores?ids=1,2,3` | named records, for a shared comparison link |
 | `GET` | `/api/metrics` | metric definitions (key, label, unit, direction) |
 | `GET` | `/api/stats` | run/record counts per architecture |
 
-The three `/api/cores` forms differ only in `group`, which is `run` (collapse to
-one row per upload) by default and `none` when `run=` or `ids=` is given, since
-both of those address records rather than rank them. Pass it explicitly to
-override either default.
+The three `/api/cores` forms differ only in `group`, which is `run` (one row per
+upload) by default and `none` when `run=` or `ids=` is given, since both of those
+address records rather than rank them. Pass it explicitly to override either.
 
 `/api/metrics` is the single source of truth for the metric set *as far as the
 front end is concerned* — it builds its columns from that response, so no
@@ -163,10 +106,9 @@ is in [schema/cpu-bench-1.md](../schema/cpu-bench-1.md).
 
 Two SQLite tables ([schema.sql](schema.sql)): `runs` holds the metadata and the
 verbatim upload, `cores` holds one flattened row per record so the leaderboard
-can sort and filter in SQL. A `--full` upload is one `runs` row with both kinds of
-record hanging off it, told apart by `cores.scope`. The original document is
-always kept, so a change to the flattening can be replayed over existing uploads,
-and a database made by an older build gains new columns on startup.
+can sort and filter in SQL. The original document is always kept, so a change to
+the flattening can be replayed over existing uploads, and a database made by an
+older build gains new columns on startup.
 
 ## Notes on operating it
 

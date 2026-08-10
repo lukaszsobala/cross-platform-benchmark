@@ -280,7 +280,9 @@ def validate(payload: object) -> tuple[dict, list[dict]]:
         scope = _text(rec.get("scope"), 16, "scope") or default_scope
         if scope not in SCOPES:
             raise Invalid(f"unknown scope {scope!r}")
-        row = {"scope": scope}
+        # Mixed on purpose: a record is a scope name and fourteen numbers, any
+        # of which the benchmark may leave out.
+        row: dict[str, object] = {"scope": scope}
         for jkey, col, kind in CORE_FIELDS:
             v = rec.get(jkey)
             if kind == "num":
@@ -338,6 +340,9 @@ class Store:
                 f"INSERT INTO runs ({','.join(cols)}) "
                 f"VALUES ({','.join('?' * len(cols))})",
                 [run[c] for c in cols])
+            # sqlite3 sets lastrowid on every successful INSERT into a rowid
+            # table; None here would mean the row above did not happen.
+            assert cur.lastrowid is not None
             run_id = int(cur.lastrowid)
             ccols = ["run_id", "scope"] + CORE_COLUMNS
             db.executemany(
@@ -589,8 +594,11 @@ class Handler(BaseHTTPRequestHandler):
     def fail(self, status: int, message: str):
         self.send_json(status, {"error": message})
 
-    def log_message(self, fmt, *args):      # one tidy line per request
-        sys.stderr.write("%s - %s\n" % (self.client_key(), fmt % args))
+    # `format` shadows the builtin, and is the name BaseHTTPRequestHandler gives
+    # this parameter -- an override that renames it is one a caller passing it
+    # by keyword would not survive.
+    def log_message(self, format, *args):   # one tidy line per request
+        sys.stderr.write("%s - %s\n" % (self.client_key(), format % args))
 
     # -- routing -----------------------------------------------------------
     def do_GET(self):
@@ -682,7 +690,8 @@ class Handler(BaseHTTPRequestHandler):
         # -- a shared comparison link, or the expanded view of one board row --
         # so neither is narrowed by the leaderboard's scope default, and neither
         # is collapsed to one row per run.
-        addressed = bool(one("ids") or one("run"))
+        raw_ids = one("ids")
+        addressed = bool(raw_ids or one("run"))
         scope = one("scope", None if addressed else "cpu")
         if scope is not None and scope not in SCOPES:
             raise Invalid(f"unknown scope {scope!r}")
@@ -702,9 +711,9 @@ class Handler(BaseHTTPRequestHandler):
         if order not in ("asc", "desc"):
             raise Invalid("order must be asc or desc")
         ids = None
-        if one("ids"):
+        if raw_ids:
             try:
-                ids = [int(x) for x in one("ids").split(",") if x][:64]
+                ids = [int(x) for x in raw_ids.split(",") if x][:64]
             except ValueError:
                 raise Invalid("ids must be a comma-separated list of integers")
         flag = {"1": 1, "0": 0, "true": 1, "false": 0}

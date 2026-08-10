@@ -1,3 +1,8 @@
 {
-    "python.analysis.diagnosticMode": "workspace"
+    "python.analysis.diagnosticMode": "workspace",
+    // tests/test_contract.py puts web/ on sys.path before importing `server`;
+    // the analyser cannot see that, so tell it where the module lives.
+    "python.analysis.extraPaths": [
+        "web"
+    ]
 }

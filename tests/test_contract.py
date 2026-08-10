@@ -214,7 +214,11 @@ class ContractTest(unittest.TestCase):
                     got = store.run(run_id)
                     raw = store.raw(run_id)
 
-                self.assertIsNotNone(got)
+                # fail() rather than assertIsNotNone(): it ends the test the
+                # same way and leaves `got` and `raw` non-optional for
+                # everything below, which is all subscripting them.
+                if got is None or raw is None:
+                    self.fail("the run just inserted did not read back")
                 self.assertEqual(json.loads(raw), doc,
                                  "the verbatim copy must be the document that "
                                  "was uploaded, not the flattened rows")

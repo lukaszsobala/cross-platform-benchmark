@@ -18,8 +18,8 @@ from pathlib import Path
 import server as srv
 
 
-def core(scope="cpu", cpu=0, **over):
-    rec = {
+def core(scope="cpu", cpu: int | None = 0, **over):
+    rec: dict[str, object] = {
         "scope": scope, "cpu": cpu, "mhz": 4000.0, "mhz_src": "measured",
         "int_lat_mops": 4000.0, "int_thr_mops": 20000.0, "ilp": 5.0,
         "mul_thr_mmul_s": 9000.0, "fp_lat_mflops": 1500.0,
@@ -349,7 +349,7 @@ class ValidateTest(unittest.TestCase):
             srv.validate(document("per-core", cores=[core(scope="weird")]))
 
     def test_missing_measurements_rejected(self):
-        empty = {k: None for k in core()}
+        empty: dict[str, object] = {k: None for k in core()}
         empty["scope"] = "cpu"
         with self.assertRaises(srv.Invalid):
             srv.validate(document("per-core", cores=[empty]))
