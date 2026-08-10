@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cpu-bench results</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<header>
+  <h1>cpu-bench results</h1>
+  <p class="sub">Upload the output of <code>cpu-bench --json</code> and compare it with everyone else's.</p>
+  <p class="stats" id="stats"></p>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button type="button" data-tab="board" class="active">Leaderboard</button>
+  <button type="button" data-tab="compare">Compare <span id="selcount"></span></button>
+  <button type="button" data-tab="upload">Upload</button>
+  <button type="button" data-tab="mine">My uploads</button>
+</nav>
+
+<main>
+
+<section id="board" class="tab active">
+  <form class="filters" id="filters">
+    <label>Records
+      <select name="scope">
+        <option value="cpu">one core (--per-core)</option>
+        <option value="thread">one thread (default run)</option>
+        <option value="total">whole machine (total)</option>
+      </select>
+    </label>
+    <label>Arch
+      <select name="target">
+        <option value="">any</option>
+        <option value="x86_64">x86_64</option>
+        <option value="aarch64">aarch64</option>
+        <option value="riscv64">riscv64</option>
+      </select>
+    </label>
+    <label>Vectorize
+      <select name="vectorize"><option value="">any</option><option value="0">off</option><option value="1">on</option></select>
+    </label>
+    <label>FMA
+      <select name="fma"><option value="">any</option><option value="0">off</option><option value="1">on</option></select>
+    </label>
+    <label>Sort by
+      <select name="sort" id="sortsel"></select>
+    </label>
+    <label>Values
+      <select name="norm">
+        <option value="abs">absolute</option>
+        <option value="ghz">per GHz</option>
+      </select>
+    </label>
+    <label class="grow">Search
+      <input type="search" name="q" placeholder="CPU model, label or machine">
+    </label>
+    <button type="submit">Apply</button>
+  </form>
+
+  <p class="note">
+    Results are only comparable between builds with the same
+    <strong>vectorize</strong> and <strong>FMA</strong> flags; rows carry theirs.
+    <code>score</code> is a geomean of absolute rates, so it rewards clock as
+    well as microarchitecture — switch to <em>per GHz</em> to compare cores
+    rather than machines.
+  </p>
+
+  <div class="scroller"><table id="board-table"><thead></thead><tbody></tbody></table></div>
+  <p class="empty" id="board-empty" hidden>Nothing here yet. Be the first to upload a run.</p>
+</section>
+
+<section id="compare" class="tab">
+  <p class="note" id="compare-note">Tick rows in the leaderboard to compare them here.</p>
+  <div id="compare-warn"></div>
+  <div id="compare-body"></div>
+  <button type="button" id="clearsel" hidden>Clear selection</button>
+</section>
+
+<section id="upload" class="tab">
+  <h2>From the shell</h2>
+  <pre id="curl"></pre>
+  <p class="note">
+    Use <code>--per-core</code> for a per-core sweep (the most comparable form on
+    a heterogeneous machine), or a plain run for whole-machine numbers. Quiesce
+    the machine first: background load depresses every result and biases
+    <code>DISPcap</code> upward.
+  </p>
+
+  <h2>From this page</h2>
+  <form id="uploadform">
+    <label>Result file
+      <input type="file" id="file" accept=".json,application/json">
+    </label>
+    <label>…or paste the JSON
+      <textarea id="paste" rows="6" spellcheck="false" placeholder='{ "schema": "cpu-bench/1", ... }'></textarea>
+    </label>
+    <label>Label (optional)
+      <input type="text" id="label" maxlength="200" placeholder="e.g. workstation, quiet, performance governor">
+    </label>
+    <label>Notes (optional)
+      <textarea id="notes" rows="2" maxlength="2000" placeholder="cooling, kernel, anything that explains the numbers"></textarea>
+    </label>
+    <button type="submit">Upload</button>
+  </form>
+  <div id="uploadresult"></div>
+</section>
+
+<section id="mine" class="tab">
+  <p class="note">
+    Uploads made from this browser. The delete token is kept in this browser's
+    local storage only — it is the only way to withdraw a run, so save it if you
+    care about being able to.
+  </p>
+  <div id="minelist"></div>
+</section>
+
+</main>
+
+<div id="detail" class="modal" hidden>
+  <div class="modal-card">
+    <button type="button" id="detail-close" aria-label="Close">×</button>
+    <div id="detail-body"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

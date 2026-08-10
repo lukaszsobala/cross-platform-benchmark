@@ -1,5 +1,8 @@
-cpu-bench
-.build-flags
-src/*.o
+bench/cpu-bench
+bench/.build-flags
 *.o
 .DS_Store
+__pycache__/
+web/*.sqlite3
+web/*.sqlite3-wal
+web/*.sqlite3-shm
