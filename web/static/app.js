@@ -11,9 +11,10 @@ const state = {
   expanded: new Set(),  // run ids currently showing their records
   selected: new Map(),  // core id -> row
   params: new URLSearchParams(),   // the filters the current board was loaded with
-  sort: "score",        // which metric the board is ranked by
+  sort: "score",        // which metric the board is ranked by, set by its header
+  order: "desc",
   norm: "abs",
-  cols: "key",          // key metrics only, or every one of them
+  detailed: false,      // every metric, rather than the headline set
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -68,7 +69,7 @@ function unitOf(metric) {
 // The columns a table shows. The metric being sorted on is always one of them —
 // a board ordered by a number it does not print reads as arbitrary.
 function shownMetrics() {
-  if (state.cols === "all") return state.metrics;
+  if (state.detailed) return state.metrics;
   return state.metrics.filter((m) => m.headline || m.key === state.sort);
 }
 
@@ -76,9 +77,10 @@ function machineName(row) {
   return row.cpu_models || row.machine || "unknown CPU";
 }
 
-// The machine, for a leaderboard row. One upload is one row, so the row is
-// named after the machine and the record standing for it is spelled out
-// underneath by repText().
+// Machine and record together, for the compare chips: there a row has been
+// lifted out of the board and has to identify itself on its own. The board
+// itself names the machine only -- which record stands for it shows up when the
+// run is unfolded, marked "ranked here".
 function coreName(row) {
   const model = machineName(row);
   if (row.scope === "total") return `${model} · all ${row.threads ?? "?"} threads`;
@@ -89,19 +91,6 @@ function recordName(row) {
   if (row.scope === "total") return `all ${row.threads ?? "?"} threads`;
   const what = row.scope === "thread" ? "thread" : "cpu";
   return row.cpu === null || row.cpu === undefined ? what : `${what}${row.cpu}`;
-}
-
-// Which of the upload's records is on show, and how many it beat. The board is
-// ranked by one metric, so the row is that metric's best record -- every column
-// in it comes from that one core, not from a mix.
-function repText(row) {
-  const n = row.records ?? 1;
-  if (row.scope === "total") return "whole machine";
-  const unit = row.scope === "thread" ? "threads" : "cores";
-  const metric = state.metrics.find((m) => m.key === state.sort);
-  const label = metric ? metric.label : state.sort;
-  return n > 1 ? `best ${label} of ${n} ${unit} · ${recordName(row)}`
-               : `${recordName(row)}`;
 }
 
 function flagsText(row) {
@@ -117,24 +106,38 @@ function flagsText(row) {
 function filterParams() {
   const form = $("#filters");
   const p = new URLSearchParams();
-  for (const name of ["scope", "target", "vectorize", "fma", "sort", "q"]) {
+  for (const name of ["scope", "target", "vectorize", "fma", "q"]) {
     const v = form.elements[name].value;
     if (v) p.set(name, v);
   }
-  const metric = state.metrics.find((m) => m.key === p.get("sort"));
-  p.set("order", metric && metric.better === "low" ? "asc" : "desc");
+  // Sorting is not a filter: it lives on the column headers, so it comes from
+  // state rather than the form and takes effect without waiting for Apply.
+  p.set("sort", state.sort);
+  p.set("order", state.order);
   p.set("limit", "100");
   return p;
+}
+
+// The direction a metric is worth reading in the first time you click it:
+// down the rankings, whichever end of the scale that is.
+function naturalOrder(key) {
+  const m = state.metrics.find((x) => x.key === key);
+  return m && m.better === "low" ? "asc" : "desc";
+}
+
+function sortBy(key) {
+  if (state.sort === key) state.order = state.order === "desc" ? "asc" : "desc";
+  else { state.sort = key; state.order = naturalOrder(key); }
+  loadBoard().catch((e) => alert(e.message));
 }
 
 async function loadBoard() {
   const form = $("#filters");
   state.norm = form.elements.norm.value;
-  state.cols = form.elements.cols.value;
+  state.detailed = form.elements.detailed.checked;
   // Remember what was actually applied: expanding a row has to ask for the
   // same filters and the same order, not whatever the form says by then.
   state.params = filterParams();
-  state.sort = state.params.get("sort") || "score";
   // Which record represents an upload depends on the sort metric, so a reload
   // invalidates anything already expanded.
   state.children.clear();
@@ -170,6 +173,26 @@ function selectBox(row) {
   return box;
 }
 
+// A column header that ranks the board by its own column. Clicking the one
+// already sorted on turns it around; clicking another starts it at its natural
+// end. Every metric the server will sort on has one, so the sort is wherever
+// the number is rather than in a control away from it.
+function sortHeader(label, unit, key) {
+  const active = state.sort === key;
+  const th = el("th", active ? "num sorted" : "num");
+  th.setAttribute("aria-sort", !active ? "none"
+    : state.order === "desc" ? "descending" : "ascending");
+  const btn = el("button", "sorth");
+  btn.type = "button";
+  btn.title = `sort by ${label}`;
+  const name = el("span", "mname", label);
+  if (active) name.append(el("span", "arrow", state.order === "desc" ? "▾" : "▴"));
+  btn.append(name, el("span", "munit", unit));
+  btn.addEventListener("click", () => sortBy(key));
+  th.append(btn);
+  return th;
+}
+
 function metricCells(tr, row) {
   tr.append(el("td", "num", row.mhz ? Math.round(row.mhz) : "—"));
   for (const m of shownMetrics()) tr.append(el("td", "num", fmt(value(row, m))));
@@ -185,12 +208,9 @@ function renderBoard() {
 
   const hr = el("tr");
   hr.append(el("th", "num", "#"), el("th", "", ""), el("th", "wide", "machine"),
-            el("th", "", "arch"), el("th", "", "build"), el("th", "num", "MHz"));
-  for (const m of shownMetrics()) {
-    const th = el("th", "num");
-    th.append(el("span", "mname", m.label), el("span", "munit", unitOf(m)));
-    hr.append(th);
-  }
+            el("th", "", "arch"), el("th", "", "build"),
+            sortHeader("MHz", "", "mhz"));
+  for (const m of shownMetrics()) hr.append(sortHeader(m.label, unitOf(m), m.key));
   thead.append(hr);
 
   state.rows.forEach((row, i) => {
@@ -216,7 +236,6 @@ function renderBoard() {
     head.append(link);
     name.append(head);
     if (row.label) name.append(el("span", "label", row.label));
-    name.append(el("span", "rowsub", repText(row)));
     tr.append(name);
 
     tr.append(el("td", "", row.target || "—"), el("td", "flags", flagsText(row)));
@@ -573,13 +592,6 @@ async function boot() {
 
   const meta = await api("/api/metrics");
   state.metrics = meta.metrics;
-  const sortsel = $("#sortsel");
-  for (const m of state.metrics) {
-    const o = el("option", null, m.label);
-    o.value = m.key;
-    sortsel.append(o);
-  }
-  sortsel.value = "score";
 
   $("#filters").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -587,13 +599,15 @@ async function boot() {
   });
   // Both change how the rows are drawn, not which rows they are, so neither
   // waits for Apply and neither refetches.
-  for (const name of ["norm", "cols"]) {
-    $("#filters").elements[name].addEventListener("change", () => {
-      state[name] = $("#filters").elements[name].value;
-      renderBoard();
-      renderSelection();
-    });
-  }
+  const redraw = () => { renderBoard(); renderSelection(); };
+  $("#filters").elements.norm.addEventListener("change", (e) => {
+    state.norm = e.target.value;
+    redraw();
+  });
+  $("#filters").elements.detailed.addEventListener("change", (e) => {
+    state.detailed = e.target.checked;
+    redraw();
+  });
   $("#uploadform").addEventListener("submit", doUpload);
   $("#clearsel").addEventListener("click", () => {
     state.selected.clear();

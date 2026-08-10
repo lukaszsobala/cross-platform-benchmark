@@ -58,9 +58,11 @@ is worth knowing before pointing `submit.sh` at a public hub.
 ## What the page does
 
 - **Leaderboard** — **one row per upload**, filtered by architecture, by build
-  flags and by scope (best core / best thread / whole machine), sorted by any
-  metric. Toggle *per GHz* to divide rates by clock and turn `MEMlat` into
-  cycles, which compares microarchitecture rather than clock speed.
+  flags and by scope (best core / best thread / whole machine). Click a column
+  heading to rank by it; clicking the one already ranked on turns it around, and
+  a metric starts at its own good end, so `MEMlat` opens quickest-first. Toggle
+  *per GHz* to divide rates by clock and turn `MEMlat` into cycles, which
+  compares microarchitecture rather than clock speed.
 - **Compare** — tick any rows and see them side by side, one bar group per
   metric, normalised to the best of the selection. The one view that always
   shows every metric: it is the drill-down, and trimming it would defeat it.
@@ -91,9 +93,13 @@ significant figures is a data dump nobody reads, so the tables carry the
 `headline` set from `METRICS` — `score`, `INT-thr` and `MEM`: the geomean, the
 compute rate it is mostly made of, and the memory bandwidth it cannot stand in
 for — plus whichever metric the board is being sorted on, since a board ordered
-by a number it does not print reads as arbitrary. *Columns → all metrics*
-restores the rest. Nothing is dropped from the data: every metric is still
-sortable, still filtered on, still in *Compare*, and still in the raw document.
+by a number it does not print reads as arbitrary. *detailed* restores the rest.
+Nothing is dropped from the data: every metric is still sortable, still filtered
+on, still in *Compare*, and still in the raw document.
+
+Sorting on a metric outside the headline set is how you reach it without
+*detailed*: the column appears because it is being ranked on, and leaves again
+when something else is.
 
 Two comparability rules are enforced in the UI rather than left to the reader,
 because getting them wrong is the easiest way to draw a wrong conclusion:

@@ -86,6 +86,10 @@ main { max-width: 1100px; margin: 0 auto; }
   font-size: 0.78rem; color: var(--muted);
 }
 .filters .grow { flex: 1 1 12rem; }
+.filters .check {
+  flex-direction: row; align-items: center; gap: 0.4rem; padding-bottom: 0.4rem;
+  cursor: pointer; white-space: nowrap;
+}
 select, input, textarea, button[type="submit"] {
   font: inherit; color: var(--ink); background: var(--bg);
   border: 1px solid var(--line); border-radius: 6px; padding: 0.35rem 0.5rem;
@@ -128,6 +132,16 @@ tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 th.num { text-align: right; }
+/* the header is the sort control */
+th .sorth {
+  background: none; border: 0; padding: 0; margin: 0; font: inherit;
+  color: inherit; letter-spacing: inherit; text-transform: inherit;
+  cursor: pointer; width: 100%; text-align: right;
+}
+th .sorth:hover { color: var(--ink); }
+th.sorted { color: var(--ink); }
+th.sorted .sorth { color: var(--accent); }
+.arrow { margin-left: 0.2rem; }
 .wide { white-space: normal; min-width: 15rem; }
 .mname { display: block; }
 .munit { display: block; font-weight: 400; text-transform: none; letter-spacing: 0; opacity: 0.75; }
