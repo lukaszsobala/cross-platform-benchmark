@@ -961,6 +961,7 @@ static void detect_cpu_models(char *out, size_t outsz) {
     fclose(f);
 }
 
+// Short compiler name and version, e.g. "gcc 15.2.0".
 static void compiler_string(char *out, size_t outsz) {
 #if defined(__clang__)
     snprintf(out, outsz, "clang %d.%d.%d",
@@ -972,6 +973,26 @@ static void compiler_string(char *out, size_t outsz) {
     snprintf(out, outsz, "cc");
 #endif
 }
+
+// The toolchain's own full version banner, which carries the distribution's
+// patch level -- two "gcc 15.2.0" builds are not always the same compiler.
+static const char *compiler_version(void) {
+#ifdef __VERSION__
+    return __VERSION__;
+#else
+    return "";
+#endif
+}
+
+// The driver and flags this binary was compiled with, baked in by the Makefile.
+// Without them a result cannot be checked for comparability: -march, -ffast-math
+// or a different -O level change the numbers and are invisible otherwise.
+#ifndef BUILD_CC
+#define BUILD_CC "cc"
+#endif
+#ifndef BUILD_FLAGS
+#define BUILD_FLAGS ""
+#endif
 
 #ifdef NO_TREE_VECTORIZE
 #define VECTORIZE_ON 0
@@ -994,6 +1015,7 @@ static void print_platform(void) {
 #endif
     fprintf(o, ", target=%s, vectorize=%s, fma=%s\n", arch_string(),
             VECTORIZE_ON ? "on" : "off", FMA_ON ? "on" : "off");
+    if (BUILD_FLAGS[0]) fprintf(o, "flags: %s %s\n", BUILD_CC, BUILD_FLAGS);
 
     struct utsname u;
     if (uname(&u) == 0) {
@@ -1069,6 +1091,8 @@ static void usage(const char *prog) {
         "  --threads N        threads to run (default: online CPUs)\n"
         "  --cpus LIST        pin to these CPUs, e.g. 0-3,6 (default: 0..threads-1)\n"
         "  --per-core         run the suite single-threaded on each CPU in turn\n"
+        "  --full             both: the multi-threaded run and the per-core\n"
+        "                     sweep in one report. Use this for uploads\n"
         "  --disp-sweep       diagnostic: sweep the indirect-dispatch selector\n"
         "                     period on each CPU and print calls/cycle vs period\n"
         "  --time SEC         measured seconds per phase (default 0.5)\n"
@@ -1435,6 +1459,9 @@ static void json_open(const char *mode, const run_opts_t *o, int threads,
     printf("{\n  \"schema\": \"cpu-bench/1\"");
     j_str("mode", mode);
     printf(",\n  \"build\": { \"compiler\": \"%s\"", cc);
+    j_str("compiler_version", compiler_version());
+    j_str("cc", BUILD_CC);
+    j_str("flags", BUILD_FLAGS);
     j_str("target", arch_string());
     printf(", \"vectorize\": %s, \"fma\": %s }",
            VECTORIZE_ON ? "true" : "false", FMA_ON ? "true" : "false");
@@ -1461,11 +1488,269 @@ static void json_open(const char *mode, const run_opts_t *o, int threads,
 
 static void json_close(void) { printf("\n}\n"); }
 
+// ---------------------------------------------------------------------------
+// Phases
+// ---------------------------------------------------------------------------
+
+// Everything one invocation measured. --full carries both halves: the
+// multi-threaded run says what the machine does at once, the per-core sweep says
+// what each core type does on its own, and only the pair is worth comparing
+// against another machine.
+typedef struct {
+    result_t *threads;      // one per thread of the multi-threaded run
+    int       n_threads;
+    result_t  total;        // their aggregate
+    int       have_threads;
+
+    result_t *cores;        // one per CPU of the per-core sweep
+    int       n_cores;
+
+    uint64_t  checksum;
+    double    dram_lo, dram_hi;
+} suite_t;
+
+static void suite_free(suite_t *s) {
+    free(s->threads);
+    free(s->cores);
+    s->threads = NULL;
+    s->cores = NULL;
+}
+
+static void note_dram(suite_t *s, double mhz) {
+    if (mhz <= 0.0) return;
+    if (mhz > s->dram_hi) s->dram_hi = mhz;
+    if (s->dram_lo == 0.0 || mhz < s->dram_lo) s->dram_lo = mhz;
+}
+
+// Aggregate the per-thread rows: rates sum, latencies and ratios average.
+static void aggregate(const result_t *rows, int n, result_t *tot) {
+    memset(tot, 0, sizeof(*tot));
+    tot->cpu = -1;
+    double lat_n = 0, mlp_n = 0, cap_n = 0, mhz_n = 0;
+    int cap_none = 0;
+    for (int i = 0; i < n; ++i) {
+        const result_t *r = &rows[i];
+        tot->int_lat   += r->int_lat;
+        tot->int_thr   += r->int_thr;
+        tot->mul_thr   += r->mul_thr;
+        tot->fp_lat    += r->fp_lat;
+        tot->fp_thr    += r->fp_thr;
+        tot->mem_gbps  += r->mem_gbps;
+        tot->disp_thr  += r->disp_thr;
+        tot->disp_gain += r->disp_gain;
+        tot->disp_span += r->disp_span;
+        if (r->mhz > 0.0)         { tot->mhz += r->mhz; mhz_n++; }
+        if (r->mhz_estimated)     tot->mhz_estimated = 1;
+        if (r->mem_lat_ns > 0.0)  { tot->mem_lat_ns += r->mem_lat_ns; lat_n++; }
+        if (r->mem_lat8_ns > 0.0) { tot->mem_lat8_ns += r->mem_lat8_ns; mlp_n++; }
+        if (r->disp_status == DISP_OK && r->disp_cap > 0.0) {
+            tot->disp_cap += r->disp_cap;
+            cap_n++;
+        } else if (r->disp_status == DISP_NONE) {
+            cap_none++;
+        }
+    }
+    const double d = n > 0 ? (double)n : 1.0;
+    if (mhz_n > 0) tot->mhz /= mhz_n;
+    if (lat_n > 0) tot->mem_lat_ns /= lat_n;
+    if (mlp_n > 0) tot->mem_lat8_ns /= mlp_n;
+    if (cap_n > 0) tot->disp_cap /= cap_n;
+    tot->disp_gain /= d;
+    tot->disp_span /= d;
+    tot->disp_status = cap_n > 0 ? DISP_OK : (cap_none > 0 ? DISP_NONE : DISP_NA);
+    tot->ilp  = tot->int_lat > 0.0 ? tot->int_thr / tot->int_lat : 0.0;
+    tot->filp = tot->fp_lat  > 0.0 ? tot->fp_thr  / tot->fp_lat  : 0.0;
+    tot->mlp  = tot->mem_lat8_ns > 0.0 ? tot->mem_lat_ns / tot->mem_lat8_ns : 0.0;
+}
+
+static int collect_threads(suite_t *s, const run_opts_t *o, int threads, int pin,
+                           const int *cpu_list, int n_cpus) {
+    worker_t *w = (worker_t *)calloc((size_t)threads, sizeof(*w));
+    result_t *res = (result_t *)calloc((size_t)threads, sizeof(*res));
+    if (!w || !res) { perror("calloc"); free(w); free(res); return -1; }
+    for (int i = 0; i < threads; ++i) w[i].cpu = pin ? cpu_list[i % n_cpus] : -1;
+
+    if (run_workers(w, threads, o) != 0) { free(w); free(res); return -1; }
+
+    for (int i = 0; i < threads; ++i) {
+        res[i] = summarize(&w[i], w[i].cpu);
+        note_dram(s, w[i].dram_mhz_observed);
+        s->checksum ^= w[i].checksum;
+    }
+    aggregate(res, threads, &s->total);
+    s->threads = res;
+    s->n_threads = threads;
+    s->have_threads = 1;
+    free(w);
+    return 0;
+}
+
+static void text_per_core_row(const result_t *r);
+
+// One CPU at a time, so a heterogeneous machine reports each core type. In text
+// mode rows print as they finish: the sweep is the long part of a --full run.
+static int collect_per_core(suite_t *s, const run_opts_t *o, const int *cpu_list,
+                            int n_cpus, int pin, int text_rows) {
+    result_t *res = (result_t *)calloc((size_t)n_cpus, sizeof(*res));
+    if (!res) { perror("calloc"); return -1; }
+    for (int i = 0; i < n_cpus; ++i) {
+        worker_t w;
+        memset(&w, 0, sizeof(w));
+        w.cpu = pin ? cpu_list[i] : -1;
+        if (run_workers(&w, 1, o) != 0) { free(res); return -1; }
+        res[i] = summarize(&w, cpu_list[i]);
+        note_dram(s, w.dram_mhz_observed);
+        s->checksum ^= w.checksum;
+        if (text_rows) text_per_core_row(&res[i]);
+    }
+    s->cores = res;
+    s->n_cores = n_cpus;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Emitters
+// ---------------------------------------------------------------------------
+
+static void text_threads(const suite_t *s, size_t mem_per_thread) {
+    const result_t *t = &s->total;
+    const double n = s->n_threads > 0 ? (double)s->n_threads : 1.0;
+    printf("%-9s %-23s %8s %11s %11s\n",
+           "metric", "what it measures", "unit", "total", "per-thread");
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "INT-lat", "integer latency", "Mops/s", t->int_lat, t->int_lat / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "INT-thr", "integer throughput", "Mops/s", t->int_thr, t->int_thr / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "MUL-thr", "multiply throughput", "Mmul/s", t->mul_thr, t->mul_thr / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "FP-lat", "FP latency", "Mflop/s", t->fp_lat, t->fp_lat / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "FP-thr", "FP throughput", "Mflop/s", t->fp_thr, t->fp_thr / n);
+    printf("%-9s %-23s %8s %11.1f %11.1f\n",
+           "DISP-thr", "indirect dispatch rate", "Mcall/s", t->disp_thr, t->disp_thr / n);
+    if (t->disp_status == DISP_OK) {
+        printf("%-9s %-23s %8s %11s %11.0f\n",
+               "DISPcap", "indirect predictor size", "calls", "-", t->disp_cap);
+    } else if (t->disp_status == DISP_NONE) {
+        printf("%-9s %-23s %8s %11s %11s\n",
+               "DISPcap", "indirect predictor size", "calls", "-", "none");
+    }
+    if (mem_per_thread > 0) {
+        printf("%-9s %-23s %8s %11.2f %11.2f\n",
+               "MEM", "memory bandwidth", "GB/s", t->mem_gbps, t->mem_gbps / n);
+        if (t->mem_lat_ns > 0.0) {
+            printf("%-9s %-23s %8s %11s %11.1f\n",
+                   "MEMlat", "memory latency", "ns", "-", t->mem_lat_ns);
+        }
+        if (t->mem_lat8_ns > 0.0) {
+            printf("%-9s %-23s %8s %11s %11.1f\n",
+                   "MEMlat/8", "latency, 8 chases", "ns", "-", t->mem_lat8_ns);
+        }
+    }
+    // Derived ratios: per-thread only, so the "total" column stays blank.
+    printf("%-9s %-23s %8s %11s %11.2f\n", "ILP", "instruction parallelism",
+           "x", "-", t->ilp);
+    printf("%-9s %-23s %8s %11s %11.2f\n", "fILP", "FP ops in flight",
+           "x", "-", t->filp);
+    if (t->mlp > 0.0) {
+        printf("%-9s %-23s %8s %11s %11.2f\n", "MLP", "memory parallelism",
+               "x", "-", t->mlp);
+    }
+}
+
+#define PER_CORE_FMT "%4s %6s  %8s %8s %5s %8s  %8s %8s %5s  %7s %7s %5s  %8s %7s  %8s\n"
+
+static void text_per_core_header(void) {
+    printf(PER_CORE_FMT, "CPU", "MHz", "INT-lat", "INT-thr", "ILP", "MUL-thr",
+           "FP-lat", "FP-thr", "fILP", "MEM", "MEMlat", "MLP",
+           "DISP-thr", "DISPcap", "score");
+    printf(PER_CORE_FMT, "", "", "Mops/s", "Mops/s", "x", "Mmul/s",
+           "Mflop/s", "Mflop/s", "x", "GB/s", "ns", "x",
+           "Mcall/s", "calls", "geomean");
+}
+
+static void text_per_core_row(const result_t *r) {
+    char mhzbuf[16], capbuf[16];
+    if (r->mhz <= 0.0)         snprintf(mhzbuf, sizeof(mhzbuf), "?");
+    else if (r->mhz_estimated) snprintf(mhzbuf, sizeof(mhzbuf), "~%.0f", r->mhz);
+    else                       snprintf(mhzbuf, sizeof(mhzbuf), "%.0f", r->mhz);
+    disp_cap_str(r->disp_status, r->disp_cap, capbuf, sizeof(capbuf));
+    printf("%4d %6s  %8.1f %8.1f %5.2f %8.1f  %8.1f %8.1f %5.2f  %7.2f %7.1f %5.2f  %8.1f %7s  %8.1f\n",
+           r->cpu, mhzbuf,
+           r->int_lat, r->int_thr, r->ilp, r->mul_thr,
+           r->fp_lat, r->fp_thr, r->filp,
+           r->mem_gbps, r->mem_lat_ns, r->mlp,
+           r->disp_thr, capbuf, r->score);
+    fflush(stdout);
+}
+
+// Best/worst core of the sweep: on a heterogeneous machine this is the
+// big/little ratio, and on a homogeneous one it is a noise estimate.
+static double core_spread(const suite_t *s) {
+    double best = 0.0, worst = 0.0;
+    for (int i = 0; i < s->n_cores; ++i) {
+        const double v = s->cores[i].score;
+        if (v <= 0.0) continue;
+        if (v > best) best = v;
+        if (worst == 0.0 || v < worst) worst = v;
+    }
+    return worst > 0.0 ? best / worst : 0.0;
+}
+
+static void text_per_core_footer(const suite_t *s) {
+    const double spread = core_spread(s);
+    if (spread > 0.0) {
+        fprintf(msg(), "\nfastest/slowest core ratio: %.2fx\n", spread);
+    }
+}
+
+static void emit_tsv(const suite_t *s) {
+    printf(RESULT_COLUMNS);
+    for (int i = 0; i < s->n_threads; ++i) tsv_result("thread", &s->threads[i]);
+    if (s->have_threads) tsv_result("total", &s->total);
+    for (int i = 0; i < s->n_cores; ++i) tsv_result("cpu", &s->cores[i]);
+    if (s->have_threads) {
+        fprintf(msg(), "checksum: 0x%016llx\n", (unsigned long long)s->checksum);
+    }
+}
+
+static void emit_json(const suite_t *s, const char *mode, const run_opts_t *o,
+                      int threads, int pin, int clock_raw) {
+    json_open(mode, o, threads, pin, clock_raw);
+    if (s->dram_hi > 0.0) {
+        printf(",\n  \"dram\": { \"name\": \"%s\", \"mhz_min\": %.6g,"
+               " \"mhz_max\": %.6g }", g_dram_name, s->dram_lo, s->dram_hi);
+    }
+    if (s->have_threads) {
+        printf(",\n  \"threads\": [\n");
+        for (int i = 0; i < s->n_threads; ++i) {
+            json_result(&s->threads[i], "thread", "    ");
+            printf("%s\n", i + 1 < s->n_threads ? "," : "");
+        }
+        printf("  ],\n  \"total\": ");
+        json_result(&s->total, "total", "");
+    }
+    if (s->n_cores > 0) {
+        printf(",\n  \"cores\": [\n");
+        for (int i = 0; i < s->n_cores; ++i) {
+            json_result(&s->cores[i], "cpu", "    ");
+            printf("%s\n", i + 1 < s->n_cores ? "," : "");
+        }
+        printf("  ]");
+        const double spread = core_spread(s);
+        if (spread > 0.0) printf(",\n  \"core_spread\": %.6g", spread);
+    }
+    printf(",\n  \"checksum\": \"0x%016llx\"", (unsigned long long)s->checksum);
+    json_close();
+}
+
 int main(int argc, char **argv) {
     int threads = get_cpu_count();
     int cpu_list[1024];
     int n_cpus = 0;
     int per_core = 0;
+    int full = 0;
     int disp_sweep = 0;
     int pin = 1;
     int use_clock_raw = 1;
@@ -1486,6 +1771,8 @@ int main(int argc, char **argv) {
             if (n_cpus <= 0) { fprintf(stderr, "bad --cpus list\n"); return 2; }
         } else if (!strcmp(a, "--per-core")) {
             per_core = 1;
+        } else if (!strcmp(a, "--full")) {
+            full = 1;
         } else if (!strcmp(a, "--disp-sweep")) {
             disp_sweep = 1;
         } else if (!strcmp(a, "--time") && i + 1 < argc) {
@@ -1543,7 +1830,7 @@ int main(int argc, char **argv) {
     // Default CPU list: 0..threads-1, or every online CPU in --per-core mode.
     if (n_cpus == 0) {
         const int online = get_cpu_count();
-        const int want = (per_core || disp_sweep) ? online : threads;
+        const int want = (per_core || full || disp_sweep) ? online : threads;
         for (int i = 0; i < want && i < ARRAY_LEN(cpu_list); ++i) cpu_list[i] = i;
         n_cpus = want < ARRAY_LEN(cpu_list) ? want : ARRAY_LEN(cpu_list);
     }
@@ -1551,38 +1838,42 @@ int main(int argc, char **argv) {
     find_dram_devfreq();
     print_platform();
 
-    // Size the default working set from the cache the machine actually has. A
-    // fixed 16 MiB default silently measures cache, not DRAM, on anything with a
-    // large last-level cache -- a 12 MiB LLC leaves a 16 MiB buffer only 1.3x
-    // oversubscribed, which is nowhere near enough.
+    // Size the default working set from the cache the machine actually has: a
+    // fixed default silently measures cache rather than DRAM on anything with a
+    // large last-level cache. The two phases need different sizes -- N threads
+    // share the cache, one core has it to itself -- so --full sizes each of
+    // them separately rather than running one of the two mis-sized.
+    size_t mem_mt = mem_per_thread;    // multi-threaded run, per thread
+    size_t mem_pc = mem_per_thread;    // per-core sweep, single thread
     if (!mem_explicit) {
         const size_t llc = detect_llc_bytes();
         if (llc > 0) {
-            const int eff = per_core ? 1 : (threads > 0 ? threads : 1);
-            const size_t want = (llc * 4) / (size_t)eff;
-            if (want > mem_per_thread) mem_per_thread = want;
+            const int eff = threads > 0 ? threads : 1;
+            const size_t want_mt = (llc * 4) / (size_t)eff;
+            if (want_mt > mem_mt) mem_mt = want_mt;
+            if (llc * 4 > mem_pc) mem_pc = llc * 4;
         }
     }
     if (mem_total > 0) {
-        const int div = per_core ? 1 : threads;
-        mem_per_thread = mem_total / (size_t)(div > 0 ? div : 1);
+        mem_mt = mem_total / (size_t)(threads > 0 ? threads : 1);
+        mem_pc = mem_total;
     }
-    if (mem_per_thread > 0 && mem_per_thread < (size_t)(1 << 20)) {
-        mem_per_thread = (size_t)(1 << 20);
-    }
-    // Round down to a whole number of 4 KiB pages and 32-byte groups.
-    mem_per_thread &= ~(size_t)4095;
+    if (mem_mt > 0 && mem_mt < (size_t)(1 << 20)) mem_mt = (size_t)(1 << 20);
+    if (mem_pc > 0 && mem_pc < (size_t)(1 << 20)) mem_pc = (size_t)(1 << 20);
+    // Round down to a whole number of 4 KiB pages.
+    mem_mt &= ~(size_t)4095;
+    mem_pc &= ~(size_t)4095;
 
     run_opts_t opts = {
         .seconds = duration,
         .warmup = warmup,
         .reps = reps,
-        .mem_per_thread = mem_per_thread,
+        .mem_per_thread = mem_mt,
         .seed = seed,
     };
 
     warn_if_loaded(threads);
-    warn_if_working_set_small(mem_per_thread, threads, per_core);
+    warn_if_working_set_small(per_core ? mem_pc : mem_mt, threads, per_core);
 
     // -----------------------------------------------------------------------
     // Selector-period sweep (diagnostic)
@@ -1670,228 +1961,57 @@ int main(int argc, char **argv) {
     }
 
     // -----------------------------------------------------------------------
-    // Per-core sweep
+    // Measured phases
     // -----------------------------------------------------------------------
-    if (per_core) {
-        fprintf(msg(), "mode: per-core sweep over %d CPUs, %.2fs/phase x %d reps "
+    suite_t s;
+    memset(&s, 0, sizeof(s));
+    const int want_threads = !per_core;     // --full implies both
+    const int want_cores   = per_core || full;
+
+    if (want_threads) {
+        fprintf(msg(), "config: threads=%d time=%.2fs/phase x%d reps warmup=%.2fs "
+                       "mem=%zu MiB/thread pin=%s\n\n",
+                threads, duration, reps, warmup, mem_mt >> 20, pin ? "on" : "off");
+        opts.mem_per_thread = mem_mt;
+        if (collect_threads(&s, &opts, threads, pin, cpu_list, n_cpus) != 0) {
+            suite_free(&s);
+            return 1;
+        }
+        if (g_format == FMT_TEXT) text_threads(&s, mem_mt);
+    }
+
+    if (want_cores) {
+        fprintf(msg(), "%smode: per-core sweep over %d CPUs, %.2fs/phase x %d reps "
                        "(best kept),\n      warmup %.2fs, mem %zu MiB/thread\n\n",
-                n_cpus, duration, reps, warmup, mem_per_thread >> 20);
-
-        result_t *res = (result_t *)calloc((size_t)n_cpus, sizeof(*res));
-        if (!res) { perror("calloc"); return 1; }
-
-        if (g_format == FMT_TEXT) {
-            printf("%4s %6s  %8s %8s %5s %8s  %8s %8s %5s  %7s %7s %5s  %8s %7s  %8s\n",
-                   "CPU", "MHz", "INT-lat", "INT-thr", "ILP", "MUL-thr",
-                   "FP-lat", "FP-thr", "fILP", "MEM", "MEMlat", "MLP",
-                   "DISP-thr", "DISPcap", "score");
-            printf("%4s %6s  %8s %8s %5s %8s  %8s %8s %5s  %7s %7s %5s  %8s %7s  %8s\n",
-                   "", "", "Mops/s", "Mops/s", "x", "Mmul/s",
-                   "Mflop/s", "Mflop/s", "x", "GB/s", "ns", "x",
-                   "Mcall/s", "calls", "geomean");
-        } else if (g_format == FMT_TSV) {
-            printf(RESULT_COLUMNS);
+                want_threads ? "\n" : "", n_cpus, duration, reps, warmup,
+                mem_pc >> 20);
+        opts.mem_per_thread = mem_pc;
+        if (g_format == FMT_TEXT) text_per_core_header();
+        if (collect_per_core(&s, &opts, cpu_list, n_cpus, pin,
+                             g_format == FMT_TEXT) != 0) {
+            suite_free(&s);
+            return 1;
         }
-
-        double best = 0.0, worst = 0.0;
-        double dram_lo = 0.0, dram_hi = 0.0;
-        for (int i = 0; i < n_cpus; ++i) {
-            worker_t w;
-            memset(&w, 0, sizeof(w));
-            w.cpu = pin ? cpu_list[i] : -1;
-            if (run_workers(&w, 1, &opts) != 0) { free(res); return 1; }
-
-            const result_t r = summarize(&w, cpu_list[i]);
-            res[i] = r;
-            if (r.score > best) best = r.score;
-            if (worst == 0.0 || r.score < worst) worst = r.score;
-            if (w.dram_mhz_observed > 0.0) {
-                if (w.dram_mhz_observed > dram_hi) dram_hi = w.dram_mhz_observed;
-                if (dram_lo == 0.0 || w.dram_mhz_observed < dram_lo) {
-                    dram_lo = w.dram_mhz_observed;
-                }
-            }
-
-            if (g_format == FMT_TEXT) {
-                char mhzbuf[16], capbuf[16];
-                if (r.mhz <= 0.0)          snprintf(mhzbuf, sizeof(mhzbuf), "?");
-                else if (r.mhz_estimated)  snprintf(mhzbuf, sizeof(mhzbuf), "~%.0f", r.mhz);
-                else                       snprintf(mhzbuf, sizeof(mhzbuf), "%.0f", r.mhz);
-                disp_cap_str(r.disp_status, r.disp_cap, capbuf, sizeof(capbuf));
-                printf("%4d %6s  %8.1f %8.1f %5.2f %8.1f  %8.1f %8.1f %5.2f  %7.2f %7.1f %5.2f  %8.1f %7s  %8.1f\n",
-                       r.cpu, mhzbuf,
-                       r.int_lat, r.int_thr, r.ilp, r.mul_thr,
-                       r.fp_lat, r.fp_thr, r.filp,
-                       r.mem_gbps, r.mem_lat_ns, r.mlp,
-                       r.disp_thr, capbuf, r.score);
-                fflush(stdout);
-            } else if (g_format == FMT_TSV) {
-                tsv_result("cpu", &r);
-                fflush(stdout);
-            }
-        }
-
-        if (g_format == FMT_JSON) {
-            json_open("per-core", &opts, 1, pin, use_clock_raw);
-            if (dram_hi > 0.0) {
-                printf(",\n  \"dram\": { \"name\": \"%s\", \"mhz_min\": %.6g,"
-                       " \"mhz_max\": %.6g }", g_dram_name, dram_lo, dram_hi);
-            }
-            printf(",\n  \"cores\": [\n");
-            for (int i = 0; i < n_cpus; ++i) {
-                json_result(&res[i], "cpu", "    ");
-                printf("%s\n", i + 1 < n_cpus ? "," : "");
-            }
-            printf("  ]");
-            if (worst > 0.0) printf(",\n  \"core_spread\": %.6g", best / worst);
-            json_close();
-        } else if (worst > 0.0) {
-            fprintf(msg(), "\nfastest/slowest core ratio: %.2fx\n", best / worst);
-        }
-        if (g_format != FMT_JSON) report_dram(dram_lo, dram_hi);
-        print_legend();
-        free(res);
-        return 0;
+        if (g_format == FMT_TEXT) text_per_core_footer(&s);
     }
 
     // -----------------------------------------------------------------------
-    // Normal (multi-threaded) run
+    // Results
     // -----------------------------------------------------------------------
-    worker_t *w = (worker_t *)calloc((size_t)threads, sizeof(*w));
-    if (!w) { perror("calloc"); return 1; }
-    for (int i = 0; i < threads; ++i) {
-        w[i].cpu = pin ? cpu_list[i % n_cpus] : -1;
-    }
-
-    fprintf(msg(), "config: threads=%d time=%.2fs/phase x%d reps warmup=%.2fs "
-                   "mem=%zu MiB/thread pin=%s\n\n",
-            threads, duration, reps, warmup, mem_per_thread >> 20,
-            pin ? "on" : "off");
-
-    if (run_workers(w, threads, &opts) != 0) { free(w); return 1; }
-
-    result_t *res = (result_t *)calloc((size_t)threads, sizeof(*res));
-    if (!res) { perror("calloc"); free(w); return 1; }
-
-    // Aggregate: rates sum across threads, latencies and ratios average.
-    result_t tot;
-    memset(&tot, 0, sizeof(tot));
-    tot.cpu = -1;
-    double lat_n = 0, mlp_n = 0, cap_n = 0, mhz_n = 0;
-    int cap_none = 0, cap_na = 0;
-    double dram_lo = 0.0, dram_hi = 0.0;
-    uint64_t checksum = 0;
-    for (int i = 0; i < threads; ++i) {
-        res[i] = summarize(&w[i], w[i].cpu);
-        const result_t *r = &res[i];
-        tot.int_lat  += r->int_lat;
-        tot.int_thr  += r->int_thr;
-        tot.mul_thr  += r->mul_thr;
-        tot.fp_lat   += r->fp_lat;
-        tot.fp_thr   += r->fp_thr;
-        tot.mem_gbps += r->mem_gbps;
-        tot.disp_thr += r->disp_thr;
-        tot.disp_gain += r->disp_gain;
-        tot.disp_span += r->disp_span;
-        if (r->mhz > 0.0)         { tot.mhz += r->mhz; mhz_n++; }
-        if (r->mhz_estimated)     tot.mhz_estimated = 1;
-        if (r->mem_lat_ns > 0.0)  { tot.mem_lat_ns += r->mem_lat_ns; lat_n++; }
-        if (r->mem_lat8_ns > 0.0) { tot.mem_lat8_ns += r->mem_lat8_ns; mlp_n++; }
-        if (r->disp_status == DISP_OK && r->disp_cap > 0.0) {
-            tot.disp_cap += r->disp_cap;
-            cap_n++;
-        } else if (r->disp_status == DISP_NONE) cap_none++;
-        else cap_na++;
-        const double d = w[i].dram_mhz_observed;
-        if (d > 0.0) {
-            if (d > dram_hi) dram_hi = d;
-            if (dram_lo == 0.0 || d < dram_lo) dram_lo = d;
-        }
-        checksum ^= w[i].checksum;
-    }
-    const double n = (double)threads;
-    if (mhz_n > 0) tot.mhz /= mhz_n;
-    if (lat_n > 0) tot.mem_lat_ns /= lat_n;
-    if (mlp_n > 0) tot.mem_lat8_ns /= mlp_n;
-    if (cap_n > 0) tot.disp_cap /= cap_n;
-    tot.disp_gain /= n;
-    tot.disp_span /= n;
-    tot.disp_status = cap_n > 0 ? DISP_OK : (cap_none > 0 ? DISP_NONE : DISP_NA);
-    tot.ilp  = tot.int_lat > 0.0 ? tot.int_thr / tot.int_lat : 0.0;
-    tot.filp = tot.fp_lat  > 0.0 ? tot.fp_thr  / tot.fp_lat  : 0.0;
-    tot.mlp  = tot.mem_lat8_ns > 0.0 ? tot.mem_lat_ns / tot.mem_lat8_ns : 0.0;
-    (void)cap_na;
+    const char *mode = full ? "full" : (per_core ? "per-core" : "threads");
 
     if (g_format == FMT_TSV) {
-        printf(RESULT_COLUMNS);
-        for (int i = 0; i < threads; ++i) tsv_result("thread", &res[i]);
-        tsv_result("total", &tot);
-        fprintf(msg(), "checksum: 0x%016llx\n", (unsigned long long)checksum);
+        emit_tsv(&s);
     } else if (g_format == FMT_JSON) {
-        json_open("threads", &opts, threads, pin, use_clock_raw);
-        if (dram_hi > 0.0) {
-            printf(",\n  \"dram\": { \"name\": \"%s\", \"mhz_min\": %.6g,"
-                   " \"mhz_max\": %.6g }", g_dram_name, dram_lo, dram_hi);
-        }
-        printf(",\n  \"threads\": [\n");
-        for (int i = 0; i < threads; ++i) {
-            json_result(&res[i], "thread", "    ");
-            printf("%s\n", i + 1 < threads ? "," : "");
-        }
-        printf("  ],\n  \"total\": ");
-        json_result(&tot, "total", "");
-        printf(",\n  \"checksum\": \"0x%016llx\"", (unsigned long long)checksum);
-        json_close();
-    } else {
-        printf("%-9s %-23s %8s %11s %11s\n",
-               "metric", "what it measures", "unit", "total", "per-thread");
-        printf("%-9s %-23s %8s %11.1f %11.1f\n",
-               "INT-lat", "integer latency", "Mops/s", tot.int_lat, tot.int_lat / n);
-        printf("%-9s %-23s %8s %11.1f %11.1f\n",
-               "INT-thr", "integer throughput", "Mops/s", tot.int_thr, tot.int_thr / n);
-        printf("%-9s %-23s %8s %11.1f %11.1f\n",
-               "MUL-thr", "multiply throughput", "Mmul/s", tot.mul_thr, tot.mul_thr / n);
-        printf("%-9s %-23s %8s %11.1f %11.1f\n",
-               "FP-lat", "FP latency", "Mflop/s", tot.fp_lat, tot.fp_lat / n);
-        printf("%-9s %-23s %8s %11.1f %11.1f\n",
-               "FP-thr", "FP throughput", "Mflop/s", tot.fp_thr, tot.fp_thr / n);
-        printf("%-9s %-23s %8s %11.1f %11.1f\n",
-               "DISP-thr", "indirect dispatch rate", "Mcall/s", tot.disp_thr, tot.disp_thr / n);
-        if (tot.disp_status == DISP_OK) {
-            printf("%-9s %-23s %8s %11s %11.0f\n",
-                   "DISPcap", "indirect predictor size", "calls", "-", tot.disp_cap);
-        } else if (tot.disp_status == DISP_NONE) {
-            printf("%-9s %-23s %8s %11s %11s\n",
-                   "DISPcap", "indirect predictor size", "calls", "-", "none");
-        }
-        if (mem_per_thread > 0) {
-            printf("%-9s %-23s %8s %11.2f %11.2f\n",
-                   "MEM", "memory bandwidth", "GB/s", tot.mem_gbps, tot.mem_gbps / n);
-            if (lat_n > 0) {
-                printf("%-9s %-23s %8s %11s %11.1f\n",
-                       "MEMlat", "memory latency", "ns", "-", tot.mem_lat_ns);
-            }
-            if (mlp_n > 0) {
-                printf("%-9s %-23s %8s %11s %11.1f\n",
-                       "MEMlat/8", "latency, 8 chases", "ns", "-", tot.mem_lat8_ns);
-            }
-        }
-        // Derived ratios: per-thread only, so the "total" column stays blank.
-        printf("%-9s %-23s %8s %11s %11.2f\n", "ILP", "instruction parallelism",
-               "x", "-", tot.ilp);
-        printf("%-9s %-23s %8s %11s %11.2f\n", "fILP", "FP ops in flight",
-               "x", "-", tot.filp);
-        if (lat_n > 0 && mlp_n > 0) {
-            printf("%-9s %-23s %8s %11s %11.2f\n", "MLP", "memory parallelism",
-                   "x", "-", tot.mlp);
-        }
-        printf("\nchecksum: 0x%016llx\n", (unsigned long long)checksum);
+        emit_json(&s, mode, &opts, threads, pin, use_clock_raw);
+    } else if (s.have_threads) {
+        printf("\nchecksum: 0x%016llx\n", (unsigned long long)s.checksum);
     }
 
-    if (g_format != FMT_JSON) report_dram(dram_lo, dram_hi);
-    print_legend_ratios();
+    if (g_format != FMT_JSON) report_dram(s.dram_lo, s.dram_hi);
+    if (want_cores) print_legend();
+    else            print_legend_ratios();
 
-    free(res);
-    free(w);
+    suite_free(&s);
     return 0;
 }

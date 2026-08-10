@@ -93,9 +93,12 @@ sg2000-xthead:
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
 
+# BUILD_CC/BUILD_FLAGS are baked in so a result carries the exact toolchain and
+# flags it was produced with -- an -march or a -ffast-math nobody remembers
+# passing is otherwise invisible in the numbers.
 src/%.o: src/%.c $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -DBUILD_CC='"$(CC)"' -DBUILD_FLAGS='"$(CFLAGS)"' -c -o $@ $<
 
 clean:
 	rm -f $(TARGET) $(OBJS) $(FLAGSTAMP)

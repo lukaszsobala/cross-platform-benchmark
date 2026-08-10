@@ -56,7 +56,7 @@ is part of that.
 ## What it measures
 
 | Metric | Unit | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `INT-lat` | Mops/s | integer latency: one dependent chain of 1-cycle ALU ops |
 | `INT-thr` | Mops/s | integer throughput: 8 independent chains |
 | `ILP` | x | `INT-thr / INT-lat` — integer issue width |
@@ -107,7 +107,7 @@ between the plateau and the fully-random floor, giving `q` ∈ [0,1] = "how much
 the available prediction win is this core still getting", and `q` is summed over
 the span `L` = 8…16384, a factor of two per step:
 
-```
+```text
 DISPcap = 8 * 2^(sum(q) - 1)      # calls
 ```
 
@@ -131,7 +131,7 @@ independent calls.
 
 ## Build (GCC 13+)
 
-```
+```sh
 make
 make native                          # -march/-mtune best-effort for the host
 make MARCH=x86-64-v3 MTUNE=generic
@@ -142,7 +142,7 @@ Fairness defaults for cross-arch comparisons: auto-vectorization off
 (`-fno-tree-vectorize`) and FMA contraction off (`-ffp-contract=off`). Enable for
 peak per-arch throughput:
 
-```
+```sh
 make VECTORIZE=1                 # allow compiler vectorization
 make VECTORIZE=1 FMA=1           # allow vectorization and FMA contraction
 ```
@@ -171,17 +171,18 @@ Object files are stamped with the flags they were built with (`.build-flags`), s
 switching `MARCH` forces a rebuild rather than silently keeping an object built
 for the previous ISA. If in doubt:
 
-```
+```sh
 make clean && make sg2000
 objdump -d cpu-bench | grep -c vsetvli    # 0 = no RVV in the binary
 ```
 
 ## Run
 
-```
+```sh
 ./cpu-bench --help
 ./cpu-bench                                  # all cores, all phases
 ./cpu-bench --per-core                       # sweep each CPU single-threaded
+./cpu-bench --full                           # both of the above in one report
 ./cpu-bench --disp-sweep                     # indirect-dispatch curve vs period
 ./cpu-bench --cpus 4-7 --threads 4           # only the big cluster
 ./cpu-bench --time 2.0 --reps 5              # longer and more repetitions
@@ -194,7 +195,13 @@ objdump -d cpu-bench | grep -c vsetvli    # 0 = no RVV in the binary
 
 Defaults: threads = online cores, `--time 0.5` per phase, `--reps 3`,
 `--warmup 0.15`, pinned, `--clock raw`. The memory working set defaults to
-`max(16 MiB, 4 x LLC / threads)` per thread, read from sysfs.
+`max(16 MiB, 4 x LLC / threads)` per thread, read from sysfs — `--full` sizes the
+two phases separately, since N threads share the cache and one core does not.
+
+`--full` runs the multi-threaded run and then the per-core sweep, and reports
+both. That is the form worth keeping and sharing: the first says what the machine
+does at once, the second what each core type does on its own, and neither is
+interpretable without knowing the other.
 
 `cpu-bench` warns if the load average suggests the machine is busy, if the
 working set does not clear last-level cache, and reports the DRAM controller
@@ -221,16 +228,24 @@ appends the prose: what every column means, how to read the ratios, and how
 **stdout** and moves every other line — platform banner, warnings, DRAM clock,
 verbose prose — to **stderr**, so the result stream can be piped directly:
 
-```
+```sh
 ./cpu-bench --per-core --tsv > cores.tsv
 ./cpu-bench --json | jq '.total.int_thr_mops'
 ./cpu-bench --disp-sweep --tsv | ...
 ```
 
 TSV emits a header line and one row per `scope`: `cpu` per core in `--per-core`,
-`thread` per thread plus a `total` row in the default run, and one row per
-(cpu, period) point in `--disp-sweep`. Rates sum into the `total` row; latencies,
-ratios and `DISPcap` average. Values that were not measured are empty.
+`thread` per thread plus a `total` row in the default run, both sets in `--full`,
+and one row per (cpu, period) point in `--disp-sweep`. Rates sum into the `total`
+row; latencies, ratios and `DISPcap` average. Unmeasured values are empty.
+
+A `--full` document carries both phases: `threads` + `total` and `cores`.
+
+Every result records the toolchain it was produced with — `build.compiler`, the
+compiler's own version banner, the driver, and the exact `CFLAGS` the binary was
+compiled with (baked in by the Makefile). An `-march` or an `-ffast-math` nobody
+remembers passing changes the numbers and is otherwise invisible; the text output
+prints the same string on its `flags:` line.
 
 JSON emits one object per run carrying `build`, `system` and `config` metadata
 alongside the same records, with `null` for anything not measured:
@@ -238,11 +253,15 @@ alongside the same records, with `null` for anything not measured:
 ```json
 {
   "schema": "cpu-bench/1",
-  "mode": "threads",
-  "build": { "compiler": "gcc 15.2.0", "target": "x86_64", "vectorize": false, "fma": false },
+  "mode": "full",
+  "build": { "compiler": "gcc 15.2.0", "compiler_version": "15.2.0", "cc": "cc",
+             "flags": "-O3 -pipe -std=c2x ...", "target": "x86_64",
+             "vectorize": false, "fma": false },
   "config": { "threads": 8, "seconds_per_phase": 0.5, "reps": 3, "...": "..." },
   "threads": [ { "scope": "thread", "cpu": 0, "int_thr_mops": 24570.3, "...": "..." } ],
   "total":   { "scope": "total", "cpu": null, "...": "..." },
+  "cores":   [ { "scope": "cpu", "cpu": 0, "score": 18318.0, "...": "..." } ],
+  "core_spread": 1.43,
   "checksum": "0x..."
 }
 ```
@@ -256,6 +275,17 @@ bank/rank distribution differs per allocation. `DISPcap` repeats to a few percen
 on a big core and worse on a small one, whose knee sits on a steeper part of the
 curve. Raise `--time` for tighter numbers; the whole dispatch ladder scales with
 it, each of its 14 points getting half a phase.
+
+## Sharing results
+
+[`web/`](web/) is a small self-contained service for collecting results and
+comparing them with other machines: `python3 web/server.py`, then
+
+```sh
+./cpu-bench --full --json | web/submit.sh -l "my box"
+```
+
+See [web/README.md](web/README.md).
 
 Notes:
 
