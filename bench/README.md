@@ -9,17 +9,17 @@ The suite runs a set of tiny kernels, each for a fixed wall-clock slice, and
 reports the rate achieved. Four things shape the design:
 
 **Latency and throughput are measured separately.** Every compute kernel exists
-in two variants built from the *same* op sequence: one dependency chain (latency)
+in two forms built from the *same* op sequence: one dependency chain (latency)
 and 8 independent chains (throughput). Their ratio is how much instruction-level
 parallelism the core extracts, which is the main thing that separates a wide
 out-of-order core from a narrow in-order one. A single-chain benchmark rates them
 almost equally.
 
 **Each kernel isolates one resource.** The integer kernel is add/xor/sub only —
-one instruction, one cycle, on every target ISA — so its latency variant pins to
+one instruction, one cycle, on every target ISA — so its latency form pins to
 1 op/cycle and the ratio reads out issue width. Integer multiply is the scarcest
 resource on most cores, so a kernel containing one is multiplier-bound in *both*
-variants and the ratio cancels; multiply therefore gets its own phase. The FP
+forms and the ratio cancels; multiply therefore gets its own phase. The FP
 kernel is one multiply and one add in balance, for the same reason.
 
 **Timing is batched and repeated.** Kernels run in batches sized so that each
@@ -134,7 +134,7 @@ and *inflates* the result. This is the one column that is biased, rather than
 just noised, by interference, so raising `--reps` does not fix it.
 
 `./cpu-bench --disp-sweep` prints the whole rate-vs-period curve for any target,
-both for the dependent-accumulator kernel the suite uses and for a variant with
+both for the dependent-accumulator kernel the suite uses and for one with
 independent calls.
 
 ## Build (GCC 13+)
@@ -150,16 +150,53 @@ make MARCH=x86-64-v3 MTUNE=generic
 make CFLAGS="-O3 -march=native -mtune=native"
 ```
 
-Fairness defaults for cross-arch comparisons: auto-vectorization off
-(`-fno-tree-vectorize`) and FMA contraction off (`-ffp-contract=off`). Enable for
-peak per-arch throughput:
+### Build variants
+
+Auto-vectorization and FMA contraction are translation-unit flags — no pragma
+switches them per function — so a binary that can measure more than one of them
+has to compile the kernels more than once. `make` does exactly that:
+[src/kernels.c](src/kernels.c) is compiled four times, and all four objects are
+linked into the one `cpu-bench`.
+
+| variant | flags |
+| --- | --- |
+| `scalar-nofma` | `-fno-tree-vectorize -ffp-contract=off` |
+| `vector-nofma` | `-ftree-vectorize -ffp-contract=off` |
+| `scalar-fma` | `-fno-tree-vectorize -ffp-contract=fast` |
+| `vector-fma` | `-ftree-vectorize -ffp-contract=fast` |
+
+`scalar-nofma` is the default and the one cross-ISA comparisons want: no
+vectorization and no FMA contraction, so the kernel is the op sequence the
+source says it is on every target.
 
 ```sh
-make VECTORIZE=1                 # allow compiler vectorization
-make VECTORIZE=1 FMA=1           # allow vectorization and FMA contraction
+./cpu-bench --list-variants           # what this binary carries, and why
+./cpu-bench --variant vector-fma      # measure one
+./cpu-bench --variants                # measure each distinct one, and compare
+./cpu-bench --variants=all            # all four, distinct or not
+./cpu-bench --variants=scalar-nofma,vector-fma
 ```
 
-Keep `VECTORIZE`/`FMA` consistent across the machines you compare.
+`--variants` runs the whole suite once per variant, so it takes as many times as
+long; it prints each run in full and then a table of what moved.
+
+**Which variants are distinct is a property of `-march`, not of the flags.**
+Without a vector unit `-ftree-vectorize` has nothing to emit, and without a
+hardware fused multiply-add `-ffp-contract=fast` has nothing to contract — in
+either case the two builds are the same machine code and running both measures
+one build twice. `--variants` therefore runs only the ones the target can tell
+apart: four on AArch64 and on x86-64 built for `x86-64-v3` or above, two
+(`scalar-nofma`, `scalar-fma`) on plain `rv64gc` and on baseline `x86-64`.
+`--list-variants` says which, and why.
+
+This is also why building for the SG2000 stays safe: the vector variants are in
+the binary, but `-march=rv64imafdc…` has no `v` for them to emit, so nothing
+compiles to an instruction the C906 cannot execute. `--variants` there runs the
+two FP variants and skips the vector pair as identical.
+
+Keep the variant consistent across the machines you compare — the hub stores
+`vectorize`/`fma` per run for exactly that reason, and a `vector-fma` number
+means nothing next to a baseline one.
 
 ### RISC-V notes
 
@@ -174,10 +211,12 @@ The canonical `-march` ISA string excludes privilege letters (`S`, `U`), so
   for this chip produces a binary that dies with `Illegal instruction`, and
   `-fno-tree-vectorize` does not save you: the compiler also uses vector
   registers to inline `memset`/`memcpy` and struct copies, so the first casualty
-  is usually a struct initialiser, long before any kernel runs. Nothing is lost,
-  as the default build is scalar on every ISA anyway. For 0.7.1 as the hardware
-  actually implements it (only useful with `VECTORIZE=1`, needs GCC 14+), use
-  `make sg2000-xthead`.
+  is usually a struct initialiser, long before any kernel runs. Nothing is lost:
+  with no `v` in the `-march`, the binary's two vector variants compile to the
+  same scalar code as its two scalar ones, which is exactly what
+  `--list-variants` reports there. For 0.7.1 as the hardware actually implements
+  it (needs GCC 14+, and only tells you anything under `--variant vector-nofma`
+  or `vector-fma`), use `make sg2000-xthead`.
 
 Object files are stamped with the flags they were built with (`.build-flags`), so
 switching `MARCH` forces a rebuild rather than silently keeping an object built
@@ -195,6 +234,8 @@ objdump -d cpu-bench | grep -c vsetvli    # 0 = no RVV in the binary
 ./cpu-bench                                  # all cores, all phases
 ./cpu-bench --per-core                       # sweep each CPU single-threaded
 ./cpu-bench --full                           # both of the above in one report
+./cpu-bench --full --variants                # ...once per build variant
+./cpu-bench --variant vector-fma             # one named variant
 ./cpu-bench --disp-sweep                     # indirect-dispatch curve vs period
 ./cpu-bench --cpus 4-7 --threads 4           # only the big cluster
 ./cpu-bench --time 2.0 --reps 5              # longer and more repetitions
@@ -249,15 +290,18 @@ verbose prose — to **stderr**, so the result stream can be piped directly:
 TSV emits a header line and one row per `scope`: `cpu` per core in `--per-core`,
 `thread` per thread plus a `total` row in the default run, both sets in `--full`,
 and one row per (cpu, period) point in `--disp-sweep`. Rates sum into the `total`
-row; latencies, ratios and `DISPcap` average. Unmeasured values are empty.
+row; latencies, ratios and `DISPcap` average. Unmeasured values are empty. The
+leading `variant` column names the build each row was measured with, so a
+`--variants` run stays one table.
 
 A `--full` document carries both phases: `threads` + `total` and `cores`.
 
 Every result records the toolchain it was produced with — `build.compiler`, the
-compiler's own version banner, the driver, and the exact `CFLAGS` the binary was
-compiled with (baked in by the Makefile). An `-march` or an `-ffast-math` nobody
-remembers passing changes the numbers and is otherwise invisible; the text output
-prints the same string on its `flags:` line.
+compiler's own version banner, the driver, and the exact `CFLAGS` the measured
+code was compiled with (the shared ones baked in by the Makefile, the variant's
+own pair appended). An `-march` or an `-ffast-math` nobody remembers passing
+changes the numbers and is otherwise invisible; the text output prints the same
+string on its `flags:` line.
 
 JSON emits one object per run carrying `build`, `system` and `config` metadata
 alongside the same records, with `null` for anything not measured:
@@ -278,6 +322,16 @@ alongside the same records, with `null` for anything not measured:
 }
 ```
 
+`--variants --json` emits a JSON **array** of exactly these documents, one per
+variant, in the order they ran. Each element is an unchanged `cpu-bench/1`
+document — the hub keys a run on `build.vectorize` / `build.fma` already, so the
+variants are separate uploads rather than one document with a new shape, and
+nothing about the schema changes. `submit.sh` posts each element in turn.
+
+```sh
+./cpu-bench --full --variants --json | jq -r '.[] | "\(.build.flags) \(.total.score)"'
+```
+
 ## Stability of the numbers
 
 Compute phases repeat to within ~1% across identical cores. `MEMlat` and the
@@ -295,7 +349,10 @@ comparing them with other machines: `make serve` from the repo root, then
 
 ```sh
 ./cpu-bench --full --json | ../web/submit.sh -l "my box"
+./cpu-bench --full --variants --json | ../web/submit.sh -l "my box"
 ```
+
+The second uploads one run per variant, each labelled with the variant's name.
 
 See [web/README.md](../web/README.md). The document the two exchange is
 specified in [schema/cpu-bench-1.md](../schema/cpu-bench-1.md) — read it before
@@ -305,7 +362,9 @@ Notes:
 
 - The numbers are synthetic and not directly comparable to industry benchmarks.
 - The checksum discourages dead-code elimination and confirms that runs with
-  different configuration really did differ.
+  different configuration really did differ. It legitimately differs between
+  variants: contracting `x*c + b` into one FMA drops a rounding step, so the FP
+  state it folds in is not bit-identical.
 - For apples-to-apples comparisons, pin clocks and disable turbo and frequency
   scaling.
 - Avoid `-ffast-math` if you care about strict FP semantics; results will change.

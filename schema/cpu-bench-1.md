@@ -41,6 +41,26 @@ on machines exposing a DRAM devfreq node; `system` is only as complete as
 A `--disp-sweep` dump carries the same `schema` and `mode: "disp-sweep"`. The
 hub **rejects** it: it is a diagnostic curve with no summary metrics to rank.
 
+## More than one document
+
+`cpu-bench --variants` measures the same machine once per build variant and
+writes a JSON **array** of the documents above, one per variant, in the order
+they ran. Each element is an ordinary `cpu-bench/1` document and the array is
+the only thing that is new — so this is not a schema change, and the hub is not
+asked to understand it.
+
+That works because a variant *is* `build.vectorize` and `build.fma`, which the
+hub already stores per run and indexes on. Four variants are four runs of one
+machine, which is exactly the shape the leaderboard needs to put them side by
+side. Posting the array as one body would instead need a run to hold four of
+every metric, and every comparison in the hub to learn about a dimension it does
+not have.
+
+`validate()` takes one document, so the splitting happens before the upload:
+[web/submit.sh](../web/submit.sh) posts each element in turn, appending the
+variant name to the label. Anything else feeding the hub has to do the same —
+`jq '.[0]'`, or a loop.
+
 ## Records
 
 One object per measured core, thread, or whole-machine total. Every key below is

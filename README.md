@@ -14,8 +14,14 @@ GCC 13+ or Clang, on x86_64, AArch64 and RISC-V.
 ```sh
 make                                            # build -> bench/cpu-bench
 bench/cpu-bench --full                          # measure this machine
+bench/cpu-bench --full --variants               # ...once per build variant
 bench/cpu-bench --full --json | web/submit.sh -l "my box"
 ```
+
+One binary carries four compilations of the kernels — auto-vectorization off/on
+crossed with FMA contraction off/on — and `--variants` runs each of them that
+the host ISA can tell apart, then compares them. The default is still the
+scalar, unfused build that cross-ISA comparisons need.
 
 **[bench/README.md](bench/README.md) is the benchmark**: how each phase works,
 what every metric means, and what a number may and may not be compared against.
@@ -23,8 +29,8 @@ Read it before reading a result — several of the metrics say something other
 than what their name suggests.
 
 The top-level `Makefile` forwards the benchmark's tuning targets and variables
-unchanged, so `make native`, `make sg2000` and `make VECTORIZE=1` work from here
-as well as from [bench/](bench/).
+unchanged, so `make native`, `make sg2000` and `make MARCH=x86-64-v3` work from
+here as well as from [bench/](bench/).
 
 ## The results hub
 

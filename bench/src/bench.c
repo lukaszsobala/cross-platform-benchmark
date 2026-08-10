@@ -1,12 +1,10 @@
 // Portable CPU benchmark: integer, FP, memory and indirect-dispatch kernels for
 // 64-bit x86_64 / aarch64 / riscv64. libc + pthreads only, no intrinsics.
 //
-// Every compute kernel exists in a LAT variant (one dependency chain) and a THR
-// variant (LANES independent chains) built from the same op sequence, so thr/lat
-// reads out how much parallelism the core extracts. No `volatile` in a hot loop
-// (it would measure store-to-load forwarding); dead code is prevented by a
-// checksum the caller reads. FP state stays in normal range for any iteration
-// count, so no Inf/NaN/denormal timing penalties ever enter a measurement.
+// This file is the driver: it selects CPUs, times batches, aggregates and
+// reports. The kernels it times live in kernels.c, which is compiled once per
+// build variant (scalar/vector x FMA off/on) because both toggles are
+// translation-unit flags. See kernels.h for that interface.
 
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -25,19 +23,11 @@
 #include <sched.h>
 #endif
 
+#include "kernels.h"
+
 #ifndef ARRAY_LEN
 #define ARRAY_LEN(x) ((int)(sizeof(x) / sizeof((x)[0])))
 #endif
-
-#if defined(__GNUC__) || defined(__clang__)
-#define NOINLINE __attribute__((noinline))
-#else
-#define NOINLINE
-#endif
-
-// Independent chains in the throughput kernels: enough to saturate the widest
-// core targeted, few enough to stay in the register file of a 16-GPR ISA.
-#define LANES 8
 
 // ---------------------------------------------------------------------------
 // Output mode
@@ -86,76 +76,37 @@ static inline uint64_t xs64(uint64_t *s) {
 }
 
 // ---------------------------------------------------------------------------
-// Kernels
+// Build variants
 // ---------------------------------------------------------------------------
 //
-// One integer step: four dependent single-cycle ALU ops.
+// Auto-vectorization and FMA contraction cannot be switched per function, so
+// the binary carries four compilations of kernels.c and picks one at runtime.
+// The order is the order --variants runs them: the cross-ISA fairness baseline
+// first, then one toggle at a time, then both.
 //
-// Deliberately contains NO multiply: a multiply-bound kernel is multiplier-bound
-// in both variants, so their ratio cancels and reports the same ILP for any core
-// width. add/xor/sub against a register is one instruction and one cycle on
-// every target ISA, so this measures issue width and nothing else; multiply
-// capability is measured separately below.
-//
-// Only two constants, reused, so the kernel fits 8 lanes + 2 constants + a
-// counter without spilling even on 16-GPR x86-64. The intervening xors stop the
-// compiler folding `+k1` and `-k1` together.
-#define INT_STEP(a, k1, k2)                           \
-    do {                                              \
-        (a) += (k1);                                  \
-        (a) ^= (k2);                                  \
-        (a) -= (k1);                                  \
-        (a) ^= (k2);                                  \
-    } while (0)
-#define INT_OPS_PER_STEP 4u
-
-// One multiply step, kept apart from the ALU kernel so that integer multiplier
-// throughput is its own number instead of silently gating ILP.
-// Odd * odd stays odd, so a lane can never collapse to zero.
-#define MUL_STEP(a, m) do { (a) *= (m); } while (0)
-#define MUL_OPS_PER_STEP 1u
-
-// One FP step: one multiply and one add, so the kernel measures FP throughput
-// rather than saturating whichever pipe it over-uses.
-//
-// x = x*c + b with |c| < 1 converges to the fixed point b/(1-c) and stays there,
-// so the state is bounded for any iteration count and can never reach Inf, NaN
-// or a denormal. With -ffp-contract=off this is fmul+fadd; with FMA enabled it
-// folds to one FMA. Either way it is 2 FLOPs.
-#define FP_STEP(x, c, b) do { (x) = (x) * (c) + (b); } while (0)
-#define FP_OPS_PER_STEP 2u
-
-typedef struct { uint64_t l[LANES]; uint64_t k[2]; } int_ctx_t;
-typedef struct { uint64_t l[LANES]; uint64_t m; } mul_ctx_t;
-typedef struct { double x[LANES], b[LANES], c; } fp_ctx_t;
-
+// `distinct` is whether the toggles can change code generation for the -march
+// this binary was built for (see TARGET_HAS_SIMD / TARGET_HAS_FMA). A variant
+// that is not distinct is still present and still runnable -- it is simply the
+// same machine code as the baseline, so a default --variants run skips it
+// rather than measuring one build twice.
 typedef struct {
-    uint64_t *buf;
-    size_t    nqwords;
-    uint64_t  acc[4];
-} mem_ctx_t;
+    const kernel_set_t *k;
+    int distinct;
+} variant_t;
 
-// CHASE_WAYS independent pointer-chase cycles. One cycle measures raw
-// random-access latency; all of them in lockstep measures how much of that
-// latency the core overlaps. The speedup can exceed CHASE_WAYS because the
-// serial chase also serializes TLB page-table walks.
-#define CHASE_WAYS 8
+static const variant_t g_variants[] = {
+    { &kernels_scalar_nofma, 1 },
+    { &kernels_vector_nofma, TARGET_HAS_SIMD },
+    { &kernels_scalar_fma,   TARGET_HAS_FMA },
+    { &kernels_vector_fma,   TARGET_HAS_SIMD && TARGET_HAS_FMA },
+};
+#define N_VARIANTS ARRAY_LEN(g_variants)
+// The fairness default: scalar FP, no auto-vectorization, no FMA contraction.
+#define VARIANT_DEFAULT 0
 
-typedef struct {
-    void   **cur[CHASE_WAYS];
-} chase_ctx_t;
-
-// Indirect dispatch through a table of tiny functions selected by data. Cannot
-// be if-converted or devirtualized, so it exercises the indirect branch
-// predictor and the front end.
-typedef uint64_t (*op_fn)(uint64_t);
-
-typedef struct {
-    const uint8_t *idx;
-    size_t         mask;
-    size_t         pos;
-    uint64_t       acc;
-} disp_ctx_t;
+// ---------------------------------------------------------------------------
+// Indirect-dispatch ladders
+// ---------------------------------------------------------------------------
 
 // Selector-sequence periods swept by --disp-sweep, in calls.
 //
@@ -214,171 +165,6 @@ static const size_t g_disp_ladder[] = {
 // integrate -- the core has no usable indirect prediction.
 #define DISP_MIN_GAIN     1.15
 
-// A kernel runs `n` units of work and returns; the driver times batches of them.
-typedef void (*kernel_fn)(void *ctx, uint64_t n);
-
-// The k-constants come from the context rather than being literals, so the
-// compiler cannot fold `+k1` and `-k3` together across the intervening xors.
-NOINLINE static void int_kernel_lat(void *vctx, uint64_t n) {
-    int_ctx_t *c = (int_ctx_t *)vctx;
-    const uint64_t k1 = c->k[0], k2 = c->k[1];
-    uint64_t a0 = c->l[0];
-    for (uint64_t i = 0; i < n; ++i) {
-        INT_STEP(a0, k1, k2);
-    }
-    c->l[0] = a0;
-}
-
-NOINLINE static void int_kernel_thr(void *vctx, uint64_t n) {
-    int_ctx_t *c = (int_ctx_t *)vctx;
-    const uint64_t k1 = c->k[0], k2 = c->k[1];
-    uint64_t a0 = c->l[0], a1 = c->l[1], a2 = c->l[2], a3 = c->l[3];
-    uint64_t a4 = c->l[4], a5 = c->l[5], a6 = c->l[6], a7 = c->l[7];
-    for (uint64_t i = 0; i < n; ++i) {
-        INT_STEP(a0, k1, k2); INT_STEP(a1, k1, k2);
-        INT_STEP(a2, k1, k2); INT_STEP(a3, k1, k2);
-        INT_STEP(a4, k1, k2); INT_STEP(a5, k1, k2);
-        INT_STEP(a6, k1, k2); INT_STEP(a7, k1, k2);
-    }
-    c->l[0] = a0; c->l[1] = a1; c->l[2] = a2; c->l[3] = a3;
-    c->l[4] = a4; c->l[5] = a5; c->l[6] = a6; c->l[7] = a7;
-}
-
-// Integer multiply throughput: LANES independent multiply chains.
-NOINLINE static void mul_kernel_thr(void *vctx, uint64_t n) {
-    mul_ctx_t *c = (mul_ctx_t *)vctx;
-    const uint64_t m = c->m;
-    uint64_t a0 = c->l[0], a1 = c->l[1], a2 = c->l[2], a3 = c->l[3];
-    uint64_t a4 = c->l[4], a5 = c->l[5], a6 = c->l[6], a7 = c->l[7];
-    for (uint64_t i = 0; i < n; ++i) {
-        MUL_STEP(a0, m); MUL_STEP(a1, m); MUL_STEP(a2, m); MUL_STEP(a3, m);
-        MUL_STEP(a4, m); MUL_STEP(a5, m); MUL_STEP(a6, m); MUL_STEP(a7, m);
-    }
-    c->l[0] = a0; c->l[1] = a1; c->l[2] = a2; c->l[3] = a3;
-    c->l[4] = a4; c->l[5] = a5; c->l[6] = a6; c->l[7] = a7;
-}
-
-NOINLINE static void fp_kernel_lat(void *vctx, uint64_t n) {
-    fp_ctx_t *f = (fp_ctx_t *)vctx;
-    const double co = f->c;
-    const double b0 = f->b[0];
-    double x0 = f->x[0];
-    for (uint64_t i = 0; i < n; ++i) {
-        FP_STEP(x0, co, b0);
-    }
-    f->x[0] = x0;
-}
-
-NOINLINE static void fp_kernel_thr(void *vctx, uint64_t n) {
-    fp_ctx_t *f = (fp_ctx_t *)vctx;
-    const double co = f->c;
-    const double b0 = f->b[0], b1 = f->b[1], b2 = f->b[2], b3 = f->b[3];
-    const double b4 = f->b[4], b5 = f->b[5], b6 = f->b[6], b7 = f->b[7];
-    double x0 = f->x[0], x1 = f->x[1], x2 = f->x[2], x3 = f->x[3];
-    double x4 = f->x[4], x5 = f->x[5], x6 = f->x[6], x7 = f->x[7];
-    for (uint64_t i = 0; i < n; ++i) {
-        FP_STEP(x0, co, b0); FP_STEP(x1, co, b1);
-        FP_STEP(x2, co, b2); FP_STEP(x3, co, b3);
-        FP_STEP(x4, co, b4); FP_STEP(x5, co, b5);
-        FP_STEP(x6, co, b6); FP_STEP(x7, co, b7);
-    }
-    f->x[0] = x0; f->x[1] = x1; f->x[2] = x2; f->x[3] = x3;
-    f->x[4] = x4; f->x[5] = x5; f->x[6] = x6; f->x[7] = x7;
-}
-
-// One unit = one full read+write sweep of the buffer.
-NOINLINE static void mem_kernel_bw(void *vctx, uint64_t n) {
-    mem_ctx_t *m = (mem_ctx_t *)vctx;
-    uint64_t *p = m->buf;
-    const size_t nq = m->nqwords;
-    uint64_t a0 = m->acc[0], a1 = m->acc[1], a2 = m->acc[2], a3 = m->acc[3];
-    for (uint64_t pass = 0; pass < n; ++pass) {
-        // Four independent accumulators so the sweep is bandwidth-bound rather
-        // than bound by a serial add chain.
-        for (size_t i = 0; i + 3 < nq; i += 4) {
-            uint64_t v0 = p[i + 0], v1 = p[i + 1];
-            uint64_t v2 = p[i + 2], v3 = p[i + 3];
-            a0 += v0; a1 += v1; a2 += v2; a3 += v3;
-            p[i + 0] = v0 + 1u; p[i + 1] = v1 + 1u;
-            p[i + 2] = v2 + 1u; p[i + 3] = v3 + 1u;
-        }
-    }
-    m->acc[0] = a0; m->acc[1] = a1; m->acc[2] = a2; m->acc[3] = a3;
-}
-
-// One unit = one dependent load. No compiler transform can break this chain.
-NOINLINE static void mem_kernel_lat(void *vctx, uint64_t n) {
-    chase_ctx_t *ch = (chase_ctx_t *)vctx;
-    void **p = ch->cur[0];
-    for (uint64_t i = 0; i < n; ++i) {
-        p = (void **)*p;
-    }
-    ch->cur[0] = p;
-}
-
-// One unit = CHASE_WAYS independent dependent loads issued together.
-NOINLINE static void mem_kernel_mlp(void *vctx, uint64_t n) {
-    chase_ctx_t *ch = (chase_ctx_t *)vctx;
-    void **p0 = ch->cur[0], **p1 = ch->cur[1], **p2 = ch->cur[2], **p3 = ch->cur[3];
-    void **p4 = ch->cur[4], **p5 = ch->cur[5], **p6 = ch->cur[6], **p7 = ch->cur[7];
-    for (uint64_t i = 0; i < n; ++i) {
-        p0 = (void **)*p0; p1 = (void **)*p1;
-        p2 = (void **)*p2; p3 = (void **)*p3;
-        p4 = (void **)*p4; p5 = (void **)*p5;
-        p6 = (void **)*p6; p7 = (void **)*p7;
-    }
-    ch->cur[0] = p0; ch->cur[1] = p1; ch->cur[2] = p2; ch->cur[3] = p3;
-    ch->cur[4] = p4; ch->cur[5] = p5; ch->cur[6] = p6; ch->cur[7] = p7;
-}
-
-// Four tiny leaf operations reached only through a runtime function pointer.
-NOINLINE static uint64_t op_add(uint64_t v) { return v + UINT64_C(0x9E3779B9); }
-NOINLINE static uint64_t op_xor(uint64_t v) { return v ^ (v >> 7); }
-NOINLINE static uint64_t op_mul(uint64_t v) { return v * UINT64_C(2654435761); }
-NOINLINE static uint64_t op_rot(uint64_t v) { return (v << 13) | (v >> 51); }
-
-// Non-const and externally visible so the compiler cannot fold the indirect
-// call back into a direct one.
-op_fn g_op_table[4] = { op_add, op_xor, op_mul, op_rot };
-
-// One unit = one indirect call whose target is chosen by the selector stream.
-// The selector array is walked cyclically with `mask` = period-1, so the target
-// sequence repeats with period `mask + 1`.
-//
-// The result feeds the next call's argument. The *target* does not depend on
-// `acc`, so this chain does not stop the predictor from running ahead.
-NOINLINE static void disp_kernel(void *vctx, uint64_t n) {
-    disp_ctx_t *d = (disp_ctx_t *)vctx;
-    const uint8_t *idx = d->idx;
-    const size_t mask = d->mask;
-    size_t pos = d->pos;
-    uint64_t acc = d->acc;
-    for (uint64_t i = 0; i < n; ++i) {
-        acc = g_op_table[idx[pos] & 3u](acc);
-        pos = (pos + 1) & mask;
-    }
-    d->pos = pos;
-    d->acc = acc;
-}
-
-// Same call site and selector stream, but the result is folded into a side
-// accumulator instead of feeding the next argument, so consecutive calls are
-// data-independent. Shows whether the serial `acc` chain caps the measurement.
-NOINLINE static void disp_kernel_free(void *vctx, uint64_t n) {
-    disp_ctx_t *d = (disp_ctx_t *)vctx;
-    const uint8_t *idx = d->idx;
-    const size_t mask = d->mask;
-    size_t pos = d->pos;
-    const uint64_t arg = d->acc | 1u;
-    uint64_t sum = 0;
-    for (uint64_t i = 0; i < n; ++i) {
-        sum ^= g_op_table[idx[pos] & 3u](arg);
-        pos = (pos + 1) & mask;
-    }
-    d->pos = pos;
-    d->acc = sum;
-}
-
 // ---------------------------------------------------------------------------
 // Timed driver
 // ---------------------------------------------------------------------------
@@ -420,16 +206,17 @@ static uint64_t run_timed(kernel_fn fn, void *ctx, double seconds,
 // Volatile so the compiler cannot delete a warm-up loop as dead code.
 static volatile uint64_t g_warmup_sink;
 
-// Wake the core from idle and ramp DVFS before measuring.
+// Wake the core from idle and ramp DVFS before measuring. Warms up with the
+// variant about to be measured, so the caches hold the code that is next to run.
 
-static void warmup_spin(double sec) {
+static void warmup_spin(const kernel_set_t *k, double sec) {
     if (sec <= 0.0) return;
     int_ctx_t c;
     for (int i = 0; i < LANES; ++i) c.l[i] = (uint64_t)i + 1u;
     c.k[0] = UINT64_C(0x9E3779B97F4A7C15); c.k[1] = UINT64_C(0xBF58476D1CE4E5B9);
     const double t_end = now_sec() + sec;
     while (now_sec() < t_end) {
-        int_kernel_thr(&c, 20000);
+        k->int_thr(&c, 20000);
     }
     for (int i = 0; i < LANES; ++i) g_warmup_sink ^= c.l[i];
 }
@@ -525,6 +312,7 @@ typedef struct {
     int    reps;           // repetitions per phase; the best one is kept
     pthread_barrier_t *bar;
     uint64_t seed;
+    const kernel_set_t *ks;   // the build variant this run measures
 
     volatile uint64_t checksum;
 
@@ -555,7 +343,7 @@ static void wsync(worker_t *w) {
 // Every thread must call this the same number of times or the barrier deadlocks.
 static void phase_begin(worker_t *w, int rep) {
     wsync(w);
-    if (rep == 0) warmup_spin(w->warmup);
+    if (rep == 0) warmup_spin(w->ks, w->warmup);
     wsync(w);
 }
 
@@ -566,7 +354,8 @@ static void phase_begin(worker_t *w, int rep) {
 // `readonly` must be set once a pointer chase has been built into the buffer:
 // the read+write sweep would overwrite the chase links and the next chase would
 // dereference a wild pointer. A read-only sweep ramps the governor just as well.
-NOINLINE static void mem_warmup(void *buf, size_t nbytes, double sec, int readonly) {
+NOINLINE static void mem_warmup(const kernel_set_t *k, void *buf, size_t nbytes,
+                                double sec, int readonly) {
     if (!buf || nbytes < 4096 || sec <= 0.0) return;
     const double t_end = now_sec() + sec;
     if (readonly) {
@@ -584,7 +373,7 @@ NOINLINE static void mem_warmup(void *buf, size_t nbytes, double sec, int readon
                         .nqwords = nbytes / sizeof(uint64_t),
                         .acc = {0, 0, 0, 0} };
         while (now_sec() < t_end) {
-            mem_kernel_bw(&m, 1);
+            k->mem_bw(&m, 1);
         }
         for (int i = 0; i < 4; ++i) g_warmup_sink ^= m.acc[i];
     }
@@ -594,7 +383,7 @@ NOINLINE static void mem_warmup(void *buf, size_t nbytes, double sec, int readon
 static void phase_begin_mem(worker_t *w, int rep, void *buf, size_t nbytes,
                             int readonly) {
     wsync(w);
-    if (rep == 0) mem_warmup(buf, nbytes, w->warmup, readonly);
+    if (rep == 0) mem_warmup(w->ks, buf, nbytes, w->warmup, readonly);
     wsync(w);
 }
 
@@ -649,6 +438,7 @@ static int build_chases(void *buf, size_t nbytes, size_t stride, int ways,
 
 static void *worker(void *arg) {
     worker_t *w = (worker_t *)arg;
+    const kernel_set_t *ks = w->ks;
 
 #ifdef __linux__
     if (w->cpu >= 0) {
@@ -689,7 +479,7 @@ static void *worker(void *arg) {
             for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
             for (int i = 0; i < 2; ++i) c.k[i] = xs64(&seed) | 1u;
             phase_begin(w, rep);
-            const uint64_t it = run_timed(int_kernel_lat, &c, w->seconds, 1024, &elapsed);
+            const uint64_t it = run_timed(ks->int_lat, &c, w->seconds, 1024, &elapsed);
             keep_best_rate(&w->int_lat_mops,
                            (double)it * (double)INT_OPS_PER_STEP / 1e6 / elapsed);
             for (int i = 0; i < LANES; ++i) w->checksum ^= c.l[i];
@@ -708,7 +498,7 @@ static void *worker(void *arg) {
                 if (!idx) continue;
                 disp_ctx_t d = { .idx = idx, .mask = g_disp_periods[k] - 1,
                                  .pos = 0, .acc = 1 };
-                const uint64_t calls = run_timed(disp_kernel, &d, w->seconds, 1024, &elapsed);
+                const uint64_t calls = run_timed(ks->disp, &d, w->seconds, 1024, &elapsed);
                 keep_best_rate(&w->sweep_serial[k], (double)calls / 1e6 / elapsed);
                 w->checksum ^= d.acc;
             }
@@ -717,7 +507,7 @@ static void *worker(void *arg) {
                 if (!idx) continue;
                 disp_ctx_t d = { .idx = idx, .mask = g_disp_periods[k] - 1,
                                  .pos = 0, .acc = 1 };
-                const uint64_t calls = run_timed(disp_kernel_free, &d, w->seconds, 1024, &elapsed);
+                const uint64_t calls = run_timed(ks->disp_free, &d, w->seconds, 1024, &elapsed);
                 keep_best_rate(&w->sweep_free[k], (double)calls / 1e6 / elapsed);
                 w->checksum ^= d.acc;
             }
@@ -733,7 +523,7 @@ static void *worker(void *arg) {
         for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
         for (int i = 0; i < 2; ++i) c.k[i] = xs64(&seed) | 1u;
         phase_begin(w, rep);
-        const uint64_t it = run_timed(int_kernel_lat, &c, w->seconds, 1024, &elapsed);
+        const uint64_t it = run_timed(ks->int_lat, &c, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->int_lat_mops,
                        (double)it * (double)INT_OPS_PER_STEP / 1e6 / elapsed);
         for (int i = 0; i < LANES; ++i) w->checksum ^= c.l[i];
@@ -745,7 +535,7 @@ static void *worker(void *arg) {
         for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
         for (int i = 0; i < 2; ++i) c.k[i] = xs64(&seed) | 1u;
         phase_begin(w, rep);
-        const uint64_t it = run_timed(int_kernel_thr, &c, w->seconds, 1024, &elapsed);
+        const uint64_t it = run_timed(ks->int_thr, &c, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->int_thr_mops,
                        (double)it * (double)(INT_OPS_PER_STEP * LANES) / 1e6 / elapsed);
         for (int i = 0; i < LANES; ++i) w->checksum ^= c.l[i];
@@ -762,7 +552,7 @@ static void *worker(void *arg) {
         for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
         c.m = xs64(&seed) | 1u;
         phase_begin(w, rep);
-        const uint64_t it = run_timed(mul_kernel_thr, &c, w->seconds, 1024, &elapsed);
+        const uint64_t it = run_timed(ks->mul_thr, &c, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->mul_thr_mops,
                        (double)it * (double)(MUL_OPS_PER_STEP * LANES) / 1e6 / elapsed);
         for (int i = 0; i < LANES; ++i) w->checksum ^= c.l[i];
@@ -777,7 +567,7 @@ static void *worker(void *arg) {
         f.c = co;
         for (int i = 0; i < LANES; ++i) { f.x[i] = 1.0 + (double)i; f.b[i] = 1.0 + 0.25 * (double)i; }
         phase_begin(w, rep);
-        const uint64_t it = run_timed(fp_kernel_lat, &f, w->seconds, 1024, &elapsed);
+        const uint64_t it = run_timed(ks->fp_lat, &f, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->fp_lat_mflops,
                        (double)it * (double)FP_OPS_PER_STEP / 1e6 / elapsed);
         w->checksum ^= (uint64_t)(int64_t)(f.x[0] * 1e6);
@@ -789,7 +579,7 @@ static void *worker(void *arg) {
         f.c = co;
         for (int i = 0; i < LANES; ++i) { f.x[i] = 1.0 + (double)i; f.b[i] = 1.0 + 0.25 * (double)i; }
         phase_begin(w, rep);
-        const uint64_t it = run_timed(fp_kernel_thr, &f, w->seconds, 1024, &elapsed);
+        const uint64_t it = run_timed(ks->fp_thr, &f, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->fp_thr_mflops,
                        (double)it * (double)(FP_OPS_PER_STEP * LANES) / 1e6 / elapsed);
         for (int i = 0; i < LANES; ++i) {
@@ -814,7 +604,7 @@ static void *worker(void *arg) {
                 if (!idx) continue;
                 disp_ctx_t d = { .idx = idx, .mask = g_disp_ladder[k] - 1,
                                  .pos = 0, .acc = 1 };
-                const uint64_t calls = run_timed(disp_kernel, &d, t_pt, 1024, &elapsed);
+                const uint64_t calls = run_timed(ks->disp, &d, t_pt, 1024, &elapsed);
                 keep_best_rate(&w->disp_ladder[k], (double)calls / 1e6 / elapsed);
                 w->checksum ^= d.acc;
             }
@@ -831,7 +621,7 @@ static void *worker(void *arg) {
         mem_ctx_t m = { .buf = (uint64_t *)buf,
                         .nqwords = nbytes / sizeof(uint64_t),
                         .acc = {0, 0, 0, 0} };
-        const uint64_t passes = run_timed(mem_kernel_bw, &m, w->seconds, 1, &elapsed);
+        const uint64_t passes = run_timed(ks->mem_bw, &m, w->seconds, 1, &elapsed);
         const double bytes = (double)passes * (double)nbytes * 2.0; // read + write
         keep_best_rate(&w->mem_gbps, bytes / 1e9 / elapsed);
         const double dm = dram_mhz();
@@ -848,7 +638,7 @@ static void *worker(void *arg) {
         if (!chase_ok) continue;
         chase_ctx_t ch;
         ch.cur[0] = (void **)heads[0];
-        const uint64_t hops = run_timed(mem_kernel_lat, &ch, w->seconds, 4096, &elapsed);
+        const uint64_t hops = run_timed(ks->mem_lat, &ch, w->seconds, 4096, &elapsed);
         keep_best_lat(&w->mem_lat_ns, elapsed / (double)hops * 1e9);
         w->checksum ^= (uint64_t)(uintptr_t)ch.cur[0];
     }
@@ -862,7 +652,7 @@ static void *worker(void *arg) {
         if (!chase_ok) continue;
         chase_ctx_t ch;
         for (int i = 0; i < CHASE_WAYS; ++i) ch.cur[i] = (void **)heads[i];
-        const uint64_t hops = run_timed(mem_kernel_mlp, &ch, w->seconds, 1024, &elapsed);
+        const uint64_t hops = run_timed(ks->mem_mlp, &ch, w->seconds, 1024, &elapsed);
         keep_best_lat(&w->mem_mlp_ns,
                       elapsed / ((double)hops * (double)CHASE_WAYS) * 1e9);
         for (int i = 0; i < CHASE_WAYS; ++i) {
@@ -987,6 +777,10 @@ static const char *compiler_version(void) {
 // The driver and flags this binary was compiled with, baked in by the Makefile.
 // Without them a result cannot be checked for comparability: -march, -ffast-math
 // or a different -O level change the numbers and are invisible otherwise.
+//
+// These are the flags *every* variant shares. The two that differ come from the
+// kernel_set_t, so a result reports the build its kernels actually got rather
+// than the one the driver was compiled with.
 #ifndef BUILD_CC
 #define BUILD_CC "cc"
 #endif
@@ -994,16 +788,25 @@ static const char *compiler_version(void) {
 #define BUILD_FLAGS ""
 #endif
 
-#ifdef NO_TREE_VECTORIZE
-#define VECTORIZE_ON 0
-#else
-#define VECTORIZE_ON 1
-#endif
-#ifdef FFP_CONTRACT_OFF
-#define FMA_ON 0
-#else
-#define FMA_ON 1
-#endif
+// "<shared flags> <this variant's flags>", the complete command line the
+// measured code was built with. Not reentrant; the callers are single-threaded.
+static const char *variant_flags(const kernel_set_t *k) {
+    static char buf[1024];
+    snprintf(buf, sizeof(buf), "%s%s%s", BUILD_FLAGS, BUILD_FLAGS[0] ? " " : "",
+             k->flags);
+    return buf;
+}
+
+// The banner naming the variant about to run. Printed before every variant, so
+// a --variants run is readable as a sequence rather than as one long table.
+static void print_variant(const kernel_set_t *k, int idx, int n_sel) {
+    FILE *o = msg();
+    if (n_sel > 1) fprintf(o, "\n=== variant %d/%d: ", idx + 1, n_sel);
+    else           fprintf(o, "variant: ");
+    fprintf(o, "%s  vectorize=%s fma=%s  (%s)%s\n", k->name,
+            k->vectorize ? "on" : "off", k->fma ? "on" : "off", k->flags,
+            n_sel > 1 ? " ===" : "");
+}
 
 static void print_platform(void) {
     FILE *o = msg();
@@ -1013,8 +816,7 @@ static void print_platform(void) {
 #ifdef __STDC_VERSION__
     fprintf(o, ", C%ld", (long)__STDC_VERSION__);
 #endif
-    fprintf(o, ", target=%s, vectorize=%s, fma=%s\n", arch_string(),
-            VECTORIZE_ON ? "on" : "off", FMA_ON ? "on" : "off");
+    fprintf(o, ", target=%s\n", arch_string());
     if (BUILD_FLAGS[0]) fprintf(o, "flags: %s %s\n", BUILD_CC, BUILD_FLAGS);
 
     struct utsname u;
@@ -1037,6 +839,7 @@ typedef struct {
     int    reps;
     size_t mem_per_thread;
     uint64_t seed;
+    const kernel_set_t *kernels;   // build variant every worker measures
 } run_opts_t;
 
 // Best-of-N rejects most interference, but a loaded box depresses every rep.
@@ -1074,6 +877,7 @@ static int run_workers(worker_t *w, int n, const run_opts_t *o) {
         w[i].reps = o->reps;
         w[i].mem_bytes = o->mem_per_thread;
         w[i].bar = use_bar ? &bar : NULL;
+        w[i].ks = o->kernels;
         w[i].seed = o->seed + (uint64_t)i * UINT64_C(0x9E3779B97F4A7C15) + 1u;
         const int rc = pthread_create(&ths[i], NULL, worker, &w[i]);
         if (rc != 0) { errno = rc; perror("pthread_create"); free(ths); return -1; }
@@ -1088,6 +892,12 @@ static int run_workers(worker_t *w, int n, const run_opts_t *o) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
+        "  --variant NAME     build variant to measure: scalar-nofma (default),\n"
+        "                     vector-nofma, scalar-fma, vector-fma\n"
+        "  --variants         run every variant the toggles change on this\n"
+        "                     target, in turn, and compare them. --variants=all\n"
+        "                     forces all four, --variants=A,B picks a list\n"
+        "  --list-variants    show the variants this binary carries and exit\n"
         "  --threads N        threads to run (default: online CPUs)\n"
         "  --cpus LIST        pin to these CPUs, e.g. 0-3,6 (default: 0..threads-1)\n"
         "  --per-core         run the suite single-threaded on each CPU in turn\n"
@@ -1393,19 +1203,23 @@ static result_t summarize(const worker_t *w, int cpu) {
     return r;
 }
 
-// TSV: one header line, then one row per scope. Missing values are empty.
+// TSV: one header line, then one row per scope. Missing values are empty. The
+// leading `variant` column is what keeps a --variants run's rows apart, and is
+// present in a single-variant run too so the column set never depends on how
+// the binary was invoked.
 #define RESULT_COLUMNS \
-    "scope\tcpu\tmhz\tmhz_src\tint_lat_mops\tint_thr_mops\tilp\tmul_thr_mmul_s" \
-    "\tfp_lat_mflops\tfp_thr_mflops\tfilp\tmem_gbps\tmem_lat_ns\tmem_lat8_ns" \
-    "\tmlp\tdisp_thr_mcall_s\tdisp_cap_calls\tdisp_gain\tdisp_span\tscore\n"
+    "variant\tscope\tcpu\tmhz\tmhz_src\tint_lat_mops\tint_thr_mops\tilp" \
+    "\tmul_thr_mmul_s\tfp_lat_mflops\tfp_thr_mflops\tfilp\tmem_gbps" \
+    "\tmem_lat_ns\tmem_lat8_ns\tmlp\tdisp_thr_mcall_s\tdisp_cap_calls" \
+    "\tdisp_gain\tdisp_span\tscore\n"
 
 static void tsv_num(double v, int ok) {
     if (ok && v > 0.0) printf("\t%.6g", v);
     else               printf("\t");
 }
 
-static void tsv_result(const char *scope, const result_t *r) {
-    printf("%s", scope);
+static void tsv_result(const char *variant, const char *scope, const result_t *r) {
+    printf("%s\t%s", variant, scope);
     if (r->cpu >= 0) printf("\t%d", r->cpu); else printf("\t");
     tsv_num(r->mhz, 1);
     printf("\t%s", r->mhz > 0.0 ? (r->mhz_estimated ? "estimated" : "measured")
@@ -1485,10 +1299,11 @@ static void json_open(const char *mode, const run_opts_t *o, int threads,
     printf(",\n  \"build\": { \"compiler\": \"%s\"", cc);
     j_str("compiler_version", compiler_version());
     j_str("cc", BUILD_CC);
-    j_str("flags", BUILD_FLAGS);
+    j_str("flags", variant_flags(o->kernels));
     j_str("target", arch_string());
     printf(", \"vectorize\": %s, \"fma\": %s }",
-           VECTORIZE_ON ? "true" : "false", FMA_ON ? "true" : "false");
+           o->kernels->vectorize ? "true" : "false",
+           o->kernels->fma ? "true" : "false");
 
     struct utsname u;
     printf(",\n  \"system\": {");
@@ -1736,11 +1551,15 @@ static void text_per_core_footer(const suite_t *s) {
     }
 }
 
-static void emit_tsv(const suite_t *s) {
-    printf(RESULT_COLUMNS);
-    for (int i = 0; i < s->n_threads; ++i) tsv_result("thread", &s->threads[i]);
-    if (s->have_threads) tsv_result("total", &s->total);
-    for (int i = 0; i < s->n_cores; ++i) tsv_result("cpu", &s->cores[i]);
+// `first` prints the header; a --variants run emits one block per variant under
+// a single header, told apart by the leading column.
+static void emit_tsv(const suite_t *s, const char *variant, int first) {
+    if (first) printf(RESULT_COLUMNS);
+    for (int i = 0; i < s->n_threads; ++i) {
+        tsv_result(variant, "thread", &s->threads[i]);
+    }
+    if (s->have_threads) tsv_result(variant, "total", &s->total);
+    for (int i = 0; i < s->n_cores; ++i) tsv_result(variant, "cpu", &s->cores[i]);
     if (s->have_threads) {
         fprintf(msg(), "checksum: 0x%016llx\n", (unsigned long long)s->checksum);
     }
@@ -1776,6 +1595,192 @@ static void emit_json(const suite_t *s, const char *mode, const run_opts_t *o,
     json_close();
 }
 
+// ---------------------------------------------------------------------------
+// Variant selection
+// ---------------------------------------------------------------------------
+
+static const variant_t *find_variant(const char *name) {
+    for (int i = 0; i < N_VARIANTS; ++i) {
+        if (!strcmp(name, g_variants[i].k->name)) return &g_variants[i];
+    }
+    return NULL;
+}
+
+static void list_variants(FILE *o) {
+    fprintf(o, "build variants carried by this binary (--variant NAME):\n");
+    for (int i = 0; i < N_VARIANTS; ++i) {
+        const variant_t *v = &g_variants[i];
+        fprintf(o, "  %-14s %-38s %s\n", v->k->name, v->k->flags,
+                v->distinct ? "distinct on this target"
+                            : "same code as the baseline here");
+    }
+    if (!TARGET_HAS_SIMD) {
+        fprintf(o, "  (the -march this binary was built for has no vector unit,"
+                   " so -ftree-vectorize\n   has nothing to emit)\n");
+    }
+    if (!TARGET_HAS_FMA) {
+        fprintf(o, "  (the -march this binary was built for has no hardware"
+                   " fused multiply-add, so\n   -ffp-contract=fast has nothing"
+                   " to contract)\n");
+    }
+    fprintf(o, "--variants runs every distinct one in turn; --variants=all "
+               "runs all %d.\n", N_VARIANTS);
+}
+
+// Fill `sel` from a --variants list. NULL or "distinct" selects every variant
+// the toggles can actually change on this target; "all" selects all four;
+// otherwise a comma-separated list of names, in the order given. Returns the
+// count, or -1 on an unknown name.
+static int select_variants(const char *spec, const variant_t **sel) {
+    int n = 0;
+    if (!spec || !strcmp(spec, "distinct")) {
+        for (int i = 0; i < N_VARIANTS; ++i) {
+            if (g_variants[i].distinct) sel[n++] = &g_variants[i];
+        }
+        return n;
+    }
+    if (!strcmp(spec, "all")) {
+        for (int i = 0; i < N_VARIANTS; ++i) sel[n++] = &g_variants[i];
+        return n;
+    }
+    const char *p = spec;
+    while (*p) {
+        char name[32];
+        const char *comma = strchr(p, ',');
+        const size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len == 0 || len >= sizeof(name)) return -1;
+        memcpy(name, p, len);
+        name[len] = '\0';
+        const variant_t *v = find_variant(name);
+        if (!v || n >= N_VARIANTS) return -1;
+        sel[n++] = v;
+        p = comma ? comma + 1 : p + len;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// One measured pass
+// ---------------------------------------------------------------------------
+
+// Everything about the run that does not change between variants.
+typedef struct {
+    int    threads;
+    int    pin;
+    int    clock_raw;
+    const int *cpu_list;
+    int    n_cpus;
+    size_t mem_mt;          // per thread, multi-threaded phase
+    size_t mem_pc;          // per thread, per-core sweep
+    int    want_threads;
+    int    want_cores;
+    const char *mode;
+    double duration, warmup;
+    int    reps;
+} run_cfg_t;
+
+// Run the suite once with one variant and emit it. Text streams as it measures;
+// json and tsv write exactly what a single-variant invocation would, so a
+// --variants run produces the same documents as a sequence of separate runs
+// (wrapped in a JSON array, and told apart by the tsv `variant` column).
+//
+// `headline` receives the row the comparison table ranks: the whole-machine
+// total where there is one, otherwise the fastest core of the sweep.
+static int run_variant(const run_cfg_t *c, run_opts_t *opts, int idx, int n_sel,
+                       result_t *headline) {
+    suite_t s;
+    memset(&s, 0, sizeof(s));
+
+    print_variant(opts->kernels, idx, n_sel);
+
+    if (c->want_threads) {
+        fprintf(msg(), "config: threads=%d time=%.2fs/phase x%d reps warmup=%.2fs "
+                       "mem=%zu MiB/thread pin=%s\n\n",
+                c->threads, c->duration, c->reps, c->warmup, c->mem_mt >> 20,
+                c->pin ? "on" : "off");
+        opts->mem_per_thread = c->mem_mt;
+        if (collect_threads(&s, opts, c->threads, c->pin, c->cpu_list,
+                            c->n_cpus) != 0) {
+            suite_free(&s);
+            return -1;
+        }
+        if (g_format == FMT_TEXT) text_threads(&s, c->mem_mt);
+    }
+
+    if (c->want_cores) {
+        fprintf(msg(), "%smode: per-core sweep over %d CPUs, %.2fs/phase x %d reps "
+                       "(best kept),\n      warmup %.2fs, mem %zu MiB/thread\n\n",
+                c->want_threads ? "\n" : "", c->n_cpus, c->duration, c->reps,
+                c->warmup, c->mem_pc >> 20);
+        opts->mem_per_thread = c->mem_pc;
+        if (g_format == FMT_TEXT) text_per_core_header();
+        if (collect_per_core(&s, opts, c->cpu_list, c->n_cpus, c->pin,
+                             g_format == FMT_TEXT) != 0) {
+            suite_free(&s);
+            return -1;
+        }
+        if (g_format == FMT_TEXT) text_per_core_footer(&s);
+    }
+
+    if (g_format == FMT_TSV) {
+        emit_tsv(&s, opts->kernels->name, idx == 0);
+    } else if (g_format == FMT_JSON) {
+        if (n_sel > 1) printf(idx == 0 ? "[\n" : ",\n");
+        emit_json(&s, c->mode, opts, c->threads, c->pin, c->clock_raw);
+        if (n_sel > 1 && idx + 1 == n_sel) printf("]\n");
+    } else if (s.have_threads) {
+        printf("\nchecksum: 0x%016llx\n", (unsigned long long)s.checksum);
+    }
+
+    if (g_format != FMT_JSON) report_dram(s.dram_lo, s.dram_hi);
+
+    memset(headline, 0, sizeof(*headline));
+    if (s.have_threads) {
+        *headline = s.total;
+    } else {
+        for (int i = 0; i < s.n_cores; ++i) {
+            if (s.cores[i].score > headline->score) *headline = s.cores[i];
+        }
+    }
+
+    suite_free(&s);
+    return 0;
+}
+
+// What changed between the variants, side by side. Only the columns the two
+// toggles can move are worth a column: the integer and dispatch phases are here
+// because vectorization can reach the integer kernels too, and MEM because the
+// bandwidth sweep vectorizes on any target with a vector unit.
+static void text_variant_table(const variant_t **sel, const result_t *rows,
+                               int n, int whole_machine) {
+    printf("\n%s across variants  (%s)\n",
+           whole_machine ? "whole machine" : "fastest core",
+           whole_machine ? "the total row" : "best row of the per-core sweep");
+    printf("%-14s %9s %9s %9s %9s %8s %9s %7s\n", "variant",
+           "INT-thr", "MUL-thr", "FP-lat", "FP-thr", "MEM", "score", "vs base");
+    printf("%-14s %9s %9s %9s %9s %8s %9s %7s\n", "",
+           "Mops/s", "Mmul/s", "Mflop/s", "Mflop/s", "GB/s", "geomean", "x");
+    const double base = rows[0].score;
+    for (int i = 0; i < n; ++i) {
+        const result_t *r = &rows[i];
+        printf("%-14s %9.1f %9.1f %9.1f %9.1f %8.2f %9.1f", sel[i]->k->name,
+               r->int_thr, r->mul_thr, r->fp_lat, r->fp_thr, r->mem_gbps,
+               r->score);
+        if (base > 0.0 && r->score > 0.0) printf(" %7.3f\n", r->score / base);
+        else                              printf(" %7s\n", "-");
+    }
+    if (g_verbose) {
+        printf("\n  FP-lat is the column FMA contraction is meant to move: one\n"
+               "  multiply-add per iteration becomes one instruction, so the\n"
+               "  dependent chain shortens by a multiply's latency. Vectorization\n"
+               "  moves the throughput columns instead, and only where the ISA has\n"
+               "  a vector unit to move them with.\n"
+               "  Compare variants within one machine. Across machines, compare\n"
+               "  like with like: a vector-fma number against another vector-fma\n"
+               "  number, never against a baseline one.\n");
+    }
+}
+
 int main(int argc, char **argv) {
     int threads = get_cpu_count();
     int cpu_list[1024];
@@ -1792,10 +1797,33 @@ int main(int argc, char **argv) {
     size_t mem_total = 0;
     int mem_explicit = 0;
     uint64_t seed = 1;
+    const variant_t *sel[N_VARIANTS] = { &g_variants[VARIANT_DEFAULT] };
+    int n_sel = 1;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
-        if (!strcmp(a, "--threads") && i + 1 < argc) {
+        if (!strcmp(a, "--variant") && i + 1 < argc) {
+            const variant_t *v = find_variant(argv[++i]);
+            if (!v) {
+                fprintf(stderr, "unknown --variant '%s'\n\n", argv[i]);
+                list_variants(stderr);
+                return 2;
+            }
+            sel[0] = v;
+            n_sel = 1;
+        } else if (!strcmp(a, "--variants")) {
+            n_sel = select_variants(NULL, sel);
+        } else if (!strncmp(a, "--variants=", 11)) {
+            n_sel = select_variants(a + 11, sel);
+            if (n_sel <= 0) {
+                fprintf(stderr, "bad --variants list '%s'\n\n", a + 11);
+                list_variants(stderr);
+                return 2;
+            }
+        } else if (!strcmp(a, "--list-variants")) {
+            list_variants(stdout);
+            return 0;
+        } else if (!strcmp(a, "--threads") && i + 1 < argc) {
             threads = atoi(argv[++i]);
         } else if (!strcmp(a, "--cpus") && i + 1 < argc) {
             n_cpus = parse_cpu_list(argv[++i], cpu_list, ARRAY_LEN(cpu_list));
@@ -1858,6 +1886,13 @@ int main(int argc, char **argv) {
     if (threads < 1) threads = 1;
     if (reps < 1) reps = 1;
 
+    // --disp-sweep prints a curve per CPU, not a summary row, so there is
+    // nothing to stack variants into; ask for one explicitly instead.
+    if (disp_sweep && n_sel > 1) {
+        fprintf(stderr, "--disp-sweep measures one variant; use --variant NAME\n");
+        return 2;
+    }
+
     // Default CPU list: 0..threads-1, or every online CPU in --per-core mode.
     if (n_cpus == 0) {
         const int online = get_cpu_count();
@@ -1868,6 +1903,14 @@ int main(int argc, char **argv) {
     set_clock_mode(use_clock_raw);
     find_dram_devfreq();
     print_platform();
+    if (n_sel > 1) {
+        fprintf(msg(), "variants: %d in turn, so the run takes %dx as long:",
+                n_sel, n_sel);
+        for (int i = 0; i < n_sel; ++i) {
+            fprintf(msg(), "%s %s", i ? "," : "", sel[i]->k->name);
+        }
+        fprintf(msg(), "\n");
+    }
 
     // Size the default working set from the cache the machine actually has: a
     // fixed default silently measures cache rather than DRAM on anything with a
@@ -1901,6 +1944,7 @@ int main(int argc, char **argv) {
         .reps = reps,
         .mem_per_thread = mem_mt,
         .seed = seed,
+        .kernels = sel[0]->k,
     };
 
     warn_if_loaded(threads);
@@ -1913,6 +1957,7 @@ int main(int argc, char **argv) {
         opts.mem_per_thread = 0;
         worker_t *sw = (worker_t *)calloc((size_t)n_cpus, sizeof(*sw));
         if (!sw) { perror("calloc"); return 1; }
+        print_variant(opts.kernels, 0, 1);
         fprintf(msg(), "mode: indirect-dispatch selector-period sweep over %d "
                        "CPUs,\n      %.2fs/phase x %d reps (best kept), "
                        "warmup %.2fs\n\n", n_cpus, duration, reps, warmup);
@@ -1961,18 +2006,18 @@ int main(int argc, char **argv) {
             // Two tables: the dependent-accumulator kernel the suite uses, and
             // the independent-call variant, which shows whether that serial
             // chain caps the measurement.
-            for (int variant = 0; variant < 2; ++variant) {
+            for (int chain = 0; chain < 2; ++chain) {
                 printf("\n%s: calls per 1000 cycles (Mcall/s in parentheses)\n",
-                       variant == 0 ? "serial acc (disp_kernel)"
-                                    : "independent calls (disp_kernel_free)");
+                       chain == 0 ? "serial acc (disp_kernel)"
+                                  : "independent calls (disp_kernel_free)");
                 printf("%8s", "period");
                 for (int i = 0; i < n_cpus; ++i) printf("  %14s%d", "cpu", cpu_list[i]);
                 printf("\n");
                 for (int k = 0; k < DISP_SWEEP_N; ++k) {
                     printf("%8zu", g_disp_periods[k]);
                     for (int i = 0; i < n_cpus; ++i) {
-                        const double r = variant == 0 ? sw[i].sweep_serial[k]
-                                                      : sw[i].sweep_free[k];
+                        const double r = chain == 0 ? sw[i].sweep_serial[k]
+                                                    : sw[i].sweep_free[k];
                         const double kc = mhz[i] > 0.0 ? r * 1000.0 / mhz[i] : 0.0;
                         printf("  %7.2f (%6.1f)", kc, r);
                     }
@@ -1992,57 +2037,35 @@ int main(int argc, char **argv) {
     }
 
     // -----------------------------------------------------------------------
-    // Measured phases
+    // Measured phases, once per selected variant
     // -----------------------------------------------------------------------
-    suite_t s;
-    memset(&s, 0, sizeof(s));
-    const int want_threads = !per_core;     // --full implies both
-    const int want_cores   = per_core || full;
+    const run_cfg_t cfg = {
+        .threads      = threads,
+        .pin          = pin,
+        .clock_raw    = use_clock_raw,
+        .cpu_list     = cpu_list,
+        .n_cpus       = n_cpus,
+        .mem_mt       = mem_mt,
+        .mem_pc       = mem_pc,
+        .want_threads = !per_core,             // --full implies both
+        .want_cores   = per_core || full,
+        .mode         = full ? "full" : (per_core ? "per-core" : "threads"),
+        .duration     = duration,
+        .warmup       = warmup,
+        .reps         = reps,
+    };
 
-    if (want_threads) {
-        fprintf(msg(), "config: threads=%d time=%.2fs/phase x%d reps warmup=%.2fs "
-                       "mem=%zu MiB/thread pin=%s\n\n",
-                threads, duration, reps, warmup, mem_mt >> 20, pin ? "on" : "off");
-        opts.mem_per_thread = mem_mt;
-        if (collect_threads(&s, &opts, threads, pin, cpu_list, n_cpus) != 0) {
-            suite_free(&s);
-            return 1;
-        }
-        if (g_format == FMT_TEXT) text_threads(&s, mem_mt);
+    result_t headline[N_VARIANTS];
+    for (int i = 0; i < n_sel; ++i) {
+        opts.kernels = sel[i]->k;
+        if (run_variant(&cfg, &opts, i, n_sel, &headline[i]) != 0) return 1;
     }
 
-    if (want_cores) {
-        fprintf(msg(), "%smode: per-core sweep over %d CPUs, %.2fs/phase x %d reps "
-                       "(best kept),\n      warmup %.2fs, mem %zu MiB/thread\n\n",
-                want_threads ? "\n" : "", n_cpus, duration, reps, warmup,
-                mem_pc >> 20);
-        opts.mem_per_thread = mem_pc;
-        if (g_format == FMT_TEXT) text_per_core_header();
-        if (collect_per_core(&s, &opts, cpu_list, n_cpus, pin,
-                             g_format == FMT_TEXT) != 0) {
-            suite_free(&s);
-            return 1;
-        }
-        if (g_format == FMT_TEXT) text_per_core_footer(&s);
+    if (n_sel > 1 && g_format == FMT_TEXT) {
+        text_variant_table(sel, headline, n_sel, cfg.want_threads);
     }
+    if (cfg.want_cores) print_legend();
+    else                print_legend_ratios();
 
-    // -----------------------------------------------------------------------
-    // Results
-    // -----------------------------------------------------------------------
-    const char *mode = full ? "full" : (per_core ? "per-core" : "threads");
-
-    if (g_format == FMT_TSV) {
-        emit_tsv(&s);
-    } else if (g_format == FMT_JSON) {
-        emit_json(&s, mode, &opts, threads, pin, use_clock_raw);
-    } else if (s.have_threads) {
-        printf("\nchecksum: 0x%016llx\n", (unsigned long long)s.checksum);
-    }
-
-    if (g_format != FMT_JSON) report_dram(s.dram_lo, s.dram_hi);
-    if (want_cores) print_legend();
-    else            print_legend_ratios();
-
-    suite_free(&s);
     return 0;
 }

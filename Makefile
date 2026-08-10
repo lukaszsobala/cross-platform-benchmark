@@ -6,7 +6,11 @@
 #   make serve      run the hub on http://127.0.0.1:8080
 #
 # Build tuning lives in bench/Makefile and passes straight through:
-#   make native / make sg2000 / make MARCH=x86-64-v3 / make VECTORIZE=1
+#   make native / make sg2000 / make MARCH=x86-64-v3
+#
+# The vectorization and FMA toggles are no longer build-time: one binary carries
+# all four combinations. Pick one with `cpu-bench --variant NAME`, or run them
+# all with `cpu-bench --variants`.
 
 PYTHON ?= python3
 BENCH  := bench/cpu-bench
