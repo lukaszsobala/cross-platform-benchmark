@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cpu-bench results</title>
+<title>cpcpub results</title>
 <link rel="stylesheet" href="/style.css">
 <link rel="icon" href="data:,">
 </head>
 <body>
 <header>
   <div class="masthead">
-    <h1>cpu-bench results</h1>
+    <h1>cpcpub results</h1>
     <!-- Filled in by the page: who you are, or the way to become someone. -->
     <div class="whoami" id="whoami"></div>
   </div>
@@ -58,6 +58,14 @@
     <label class="check" title="show every metric, not just the headline ones">
       <input type="checkbox" name="detailed"> Detailed
     </label>
+    <label>Trust
+      <select name="verified">
+        <option value="">anything</option>
+        <option value="attested">signed runs only</option>
+        <option value="ci">CI-measured only</option>
+        <option value="release">claims a release build</option>
+      </select>
+    </label>
     <label class="grow">Search
       <input type="search" name="q" placeholder="CPU model, label or machine">
     </label>
@@ -70,6 +78,15 @@
   <p class="note">
     Results are only comparable between builds with the same <strong>vectorize</strong> and
     <strong>FMA</strong> flags.
+  </p>
+  <p class="note">
+    <span class="badge">verified</span> GitHub signed these exact numbers as
+    measured on its own runner — nothing in that chain belongs to the submitter.
+    <span class="badge weak">attested</span> the same signed workflow on the
+    submitter's own machine: not editable, but the hardware is theirs.
+    <span class="claim">v0.1.0 build</span> is only what the run says about
+    itself. Everything else is self-reported, which is the normal case and
+    ranks the same.
   </p>
 
 
@@ -101,12 +118,13 @@
         alone.
       </p>
       <div class="cmd"><pre id="cmd-run"></pre><button type="button" class="copy" data-copy="cmd-run">Copy</button></div>
+      <div id="verified-note"></div>
     </li>
 
     <li>
       <h2>Send it here</h2>
       <div class="drop" id="drop" tabindex="0" role="button"
-           aria-label="Choose or drop a cpu-bench result file">
+           aria-label="Choose or drop a cpcpub result file">
         <strong>Drop <code>run.json</code> here</strong>
         <span class="muted">or click to choose a file</span>
         <input type="file" id="file" accept=".json,application/json" multiple hidden>

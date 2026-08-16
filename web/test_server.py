@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the cpu-bench results hub.
+"""Tests for the cpcpub results hub.
 
     python3 web/test_server.py
 
@@ -7,17 +7,24 @@ Runs a real server on an ephemeral port against a temporary database, so the
 HTTP layer, the validation and the SQL are all exercised together.
 """
 
+import hashlib
 import http.client
 import http.cookiejar
 import json
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import server as srv
+# The token helpers live with the tests that exercise them; here they are only
+# a way to produce a signature the hub will accept.
+import test_attest as ta
 
 
 def core(scope="cpu", cpu: int | None = 0, **over):
@@ -326,7 +333,7 @@ class HubTest(unittest.TestCase):
     def test_static_files_are_served_and_confined(self):
         status, body = self.req("/", raw=True)
         self.assertEqual(status, 200)
-        self.assertIn(b"cpu-bench results", body)
+        self.assertIn(b"cpcpub results", body)
         code, _ = self.expect_error("/../server.py")
         self.assertEqual(code, 404)
 
@@ -374,6 +381,340 @@ class Browser:
                 return resp.status, json.loads(resp.read())
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
+
+
+DIGEST_A = "a" * 64
+DIGEST_B = "b" * 64
+
+
+def manifest(release: Any = "v1.0.0", digests: Sequence[str] = (DIGEST_A,),
+             **over: Any) -> dict:
+    """A builds manifest, valid unless a test asks for otherwise.
+
+    Typed loose on purpose: half the tests below hand it a `release` of None or
+    a `builds` of "no" to watch the manifest be refused, and a signature that
+    forbade that would be describing the wrong function.
+    """
+    doc: dict[str, Any] = {
+        "schema": "cpu-bench-builds/1",
+        "release": release,
+        "url": f"https://github.com/example/cpcpub/releases/tag/{release}",
+        "builds": [{"filename": f"cpcpub-linux-x86_64-{i}", "sha256": d,
+                    "target": "x86_64", "march": "x86-64"}
+                   for i, d in enumerate(digests)],
+    }
+    doc.update(over)
+    return doc
+
+
+class VerifiedTest(unittest.TestCase):
+    """Which runs count as produced by a published build, and which do not."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db = str(Path(cls.tmp.name) / "v.sqlite3")
+        cls.server = srv.build_server(cls.db, "127.0.0.1", 0, rate_limit=0)
+        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.store = srv.Store(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        with self.store.connect() as db:
+            db.execute("DELETE FROM verified_builds")
+
+    def upload(self, digest=None, **over):
+        build = dict(document()["build"])
+        if digest is not None:
+            build["binary_sha256"] = digest
+        b = Browser(self.base)
+        status, out = b.call("/api/runs", "POST", document(build=build, **over))
+        self.assertEqual(status, 201, out)
+        return b, out
+
+    # -- the digest itself --------------------------------------------------
+    def test_the_digest_round_trips(self):
+        _, out = self.upload(DIGEST_A)
+        b = Browser(self.base)
+        _, run = b.call(f"/api/runs/{out['id']}")
+        self.assertEqual(run["binary_sha256"], DIGEST_A)
+
+    def test_a_malformed_digest_is_refused(self):
+        for bad in ("nonsense", "A" * 63, "g" * 64, 12345, "  "):
+            with self.subTest(bad):
+                build = dict(document()["build"], binary_sha256=bad)
+                code, _ = Browser(self.base).call(
+                    "/api/runs", "POST", document(build=build))
+                self.assertEqual(code, 400)
+
+    def test_an_uppercase_digest_is_normalised(self):
+        """sha256sum(1) and the benchmark agree on lowercase; be kind anyway."""
+        build = dict(document()["build"], binary_sha256=DIGEST_A.upper())
+        b = Browser(self.base)
+        status, out = b.call("/api/runs", "POST", document(build=build))
+        self.assertEqual(status, 201)
+        _, run = b.call(f"/api/runs/{out['id']}")
+        self.assertEqual(run["binary_sha256"], DIGEST_A)
+
+    def test_a_run_without_a_digest_is_still_accepted(self):
+        _, out = self.upload(None)
+        _, run = Browser(self.base).call(f"/api/runs/{out['id']}")
+        self.assertIsNone(run["binary_sha256"])
+        self.assertIsNone(run["release_build"])
+
+    # -- matching -----------------------------------------------------------
+    def test_a_published_digest_marks_the_run_as_a_release_build(self):
+        self.store.add_verified_builds(manifest("v1.2.3", [DIGEST_A]))
+        _, out = self.upload(DIGEST_A)
+        b = Browser(self.base)
+        _, run = b.call(f"/api/runs/{out['id']}")
+        self.assertEqual(run["release_build"], "v1.2.3")
+        _, board = b.call(f"/api/cores?scope=cpu&verified=release")
+        self.assertIn(out["id"], [c["run_id"] for c in board["cores"]])
+
+    def test_an_unpublished_digest_does_not(self):
+        self.store.add_verified_builds(manifest("v1.2.3", [DIGEST_A]))
+        _, out = self.upload(DIGEST_B)
+        b = Browser(self.base)
+        self.assertIsNone(b.call(f"/api/runs/{out['id']}")[1]["release_build"])
+        _, board = b.call("/api/cores?scope=cpu&verified=release&limit=200")
+        self.assertNotIn(out["id"], [c["run_id"] for c in board["cores"]])
+
+    def test_loading_a_manifest_marks_runs_already_stored(self):
+        """The reason the match is a join and not a stamp at upload time."""
+        _, out = self.upload(DIGEST_A)
+        b = Browser(self.base)
+        self.assertIsNone(b.call(f"/api/runs/{out['id']}")[1]["release_build"])
+        self.store.add_verified_builds(manifest("v2.0.0", [DIGEST_A]))
+        self.assertEqual(b.call(f"/api/runs/{out['id']}")[1]["release_build"], "v2.0.0")
+
+    def test_forgetting_a_release_unmarks_its_runs(self):
+        self.store.add_verified_builds(manifest("v1.2.3", [DIGEST_A]))
+        _, out = self.upload(DIGEST_A)
+        b = Browser(self.base)
+        self.assertEqual(b.call(f"/api/runs/{out['id']}")[1]["release_build"], "v1.2.3")
+        self.store.forget_release("v1.2.3")
+        self.assertIsNone(b.call(f"/api/runs/{out['id']}")[1]["release_build"])
+
+    def test_reloading_a_release_replaces_what_it_published(self):
+        self.store.add_verified_builds(manifest("v1.2.3", [DIGEST_A, DIGEST_B]))
+        self.store.add_verified_builds(manifest("v1.2.3", [DIGEST_A]))
+        digests = {b["sha256"] for b in self.store.verified_builds()}
+        self.assertEqual(digests, {DIGEST_A})
+
+    def test_other_releases_survive_a_reload(self):
+        self.store.add_verified_builds(manifest("v1.0.0", [DIGEST_A]))
+        self.store.add_verified_builds(manifest("v2.0.0", [DIGEST_B]))
+        self.store.add_verified_builds(manifest("v2.0.0", [DIGEST_B]))
+        releases = {b["release"] for b in self.store.verified_builds()}
+        self.assertEqual(releases, {"v1.0.0", "v2.0.0"})
+
+    # -- the manifest -------------------------------------------------------
+    def test_manifest_must_carry_the_right_schema(self):
+        with self.assertRaises(srv.Invalid):
+            self.store.add_verified_builds(manifest(**{"schema": "something/9"}))
+
+    def test_manifest_needs_a_release_and_builds(self):
+        broken: tuple[dict[str, Any], ...] = (
+            {"release": None}, {"builds": []}, {"builds": "no"})
+        for bad in broken:
+            with self.subTest(bad):
+                with self.assertRaises(srv.Invalid):
+                    self.store.add_verified_builds(manifest(**bad))
+
+    def test_manifest_digests_are_checked(self):
+        with self.assertRaises(srv.Invalid):
+            self.store.add_verified_builds(
+                manifest(builds=[{"filename": "x", "sha256": "not-a-digest"}]))
+
+    def test_a_manifest_url_must_be_http(self):
+        """It becomes an href in the page, so `javascript:` is not a URL here."""
+        with self.assertRaises(srv.Invalid):
+            self.store.add_verified_builds(
+                manifest(url="javascript:alert(document.domain)"))
+
+    def test_the_hub_publishes_what_it_trusts(self):
+        self.store.add_verified_builds(manifest("v3.0.0", [DIGEST_A]))
+        _, out = Browser(self.base).call("/api/builds")
+        self.assertEqual([b["sha256"] for b in out["builds"]], [DIGEST_A])
+        self.assertEqual(out["builds"][0]["release"], "v3.0.0")
+        _, stats = Browser(self.base).call("/api/stats")
+        self.assertEqual(stats["release"]["release"], "v3.0.0")
+
+
+class AttestedUploadTest(unittest.TestCase):
+    """Attestations as an upload sees them: signed bytes, or no mark at all.
+
+    The token machinery is tested in test_attest.py; this is about the hub
+    refusing to store a mark it did not check, and refusing an upload whose
+    proof does not hold.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.server = srv.build_server(str(Path(cls.tmp.name) / "at.sqlite3"),
+                                      "127.0.0.1", 0, rate_limit=0)
+        # The issuer's keys, replaced with the test key. Nothing here touches
+        # the network.
+        store = ta.attest.KeyStore()
+        store.keys = {"test-key": (ta.N, ta.E)}
+        store.fetched = time.monotonic()
+        cls.server.attest = (store, [ta.WORKFLOW])
+        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def post(self, body: bytes, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers[srv.ATTEST_HEADER] = token
+        req = urllib.request.Request(self.base + "/api/runs", data=body,
+                                     method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def signed(self, body: bytes, **over):
+        """A token GitHub would have issued for exactly these bytes."""
+        aud = ta.attest.AUDIENCE_PREFIX + hashlib.sha256(body).hexdigest()
+        return ta.sign(ta.claims(aud=aud, **over))
+
+    def body(self, **over):
+        # Serialised once and posted verbatim: the signature is over bytes, so
+        # a test that re-serialises would be testing something else.
+        return json.dumps(document(**over)).encode()
+
+    def test_an_attested_upload_is_marked_ci(self):
+        body = self.body()
+        status, out = self.post(body, self.signed(body))
+        self.assertEqual(status, 201, out)
+        self.assertEqual(out["attested"], "ci")
+        _, run = Browser(self.base).call(f"/api/runs/{out['id']}")
+        self.assertEqual(run["attest_tier"], "ci")
+        self.assertEqual(run["attest_repo"], "someone/their-hardware")
+        self.assertIn("measure.yml", run["attest_workflow"])
+        self.assertTrue(run["attest_at"])
+
+    def test_a_self_hosted_run_is_marked_lower(self):
+        body = self.body(label="on my own machine")
+        status, out = self.post(body, self.signed(body,
+                                                  runner_environment="self-hosted"))
+        self.assertEqual(status, 201)
+        self.assertEqual(out["attested"], "attested")
+
+    def test_editing_the_result_invalidates_the_proof(self):
+        """The complaint this whole mechanism answers."""
+        honest = self.body()
+        token = self.signed(honest)
+        cheated = honest.replace(b"20000.0", b"99999.0")
+        self.assertNotEqual(honest, cheated)
+        code, err = self.post(cheated, token)
+        self.assertEqual(code, 403)
+        self.assertIn("different document", err["error"])
+
+    def test_a_token_cannot_be_reused_for_a_second_run(self):
+        first = self.body()
+        token = self.signed(first)
+        self.assertEqual(self.post(first, token)[0], 201)
+        second = self.body(label="a different machine entirely")
+        code, _ = self.post(second, token)
+        self.assertEqual(code, 403)
+
+    def test_a_forged_token_is_refused_and_nothing_is_stored(self):
+        body = self.body(label="forged")
+        head, claims_b64, sig = self.signed(body).split(".")
+        code, _ = self.post(body, f"{head}.{claims_b64}.{sig[:-4]}AAAA")
+        self.assertEqual(code, 403)
+        _, listing = Browser(self.base).call("/api/runs?limit=200")
+        self.assertNotIn("forged", [r["label"] for r in listing["runs"]])
+
+    def test_a_workflow_this_hub_does_not_know_is_refused(self):
+        body = self.body()
+        token = self.signed(
+            body, job_workflow_ref="someone/else/.github/workflows/x.yml@refs/heads/main")
+        code, err = self.post(body, token)
+        self.assertEqual(code, 403)
+        self.assertIn("does not measure with", err["error"])
+
+    def test_an_ordinary_upload_carries_no_mark(self):
+        status, out = self.post(self.body())
+        self.assertEqual(status, 201)
+        self.assertIsNone(out["attested"])
+        _, run = Browser(self.base).call(f"/api/runs/{out['id']}")
+        self.assertIsNone(run["attest_tier"])
+
+    def test_the_filters_keep_the_tiers_apart(self):
+        b1 = self.body(label="hosted")
+        self.post(b1, self.signed(b1))
+        b2 = self.body(label="self hosted")
+        self.post(b2, self.signed(b2, runner_environment="self-hosted"))
+        self.post(self.body(label="plain"))
+        b = Browser(self.base)
+
+        def labels(query):
+            _, out = b.call(f"/api/cores?scope=cpu&limit=200&{query}")
+            return {c["label"] for c in out["cores"]}
+
+        self.assertEqual(labels("verified=ci") & {"hosted", "self hosted", "plain"},
+                         {"hosted"})
+        self.assertEqual(labels("verified=attested") & {"hosted", "self hosted", "plain"},
+                         {"hosted", "self hosted"})
+        self.assertNotIn("plain", labels("verified=attested"))
+
+    def test_a_bad_filter_value_is_refused(self):
+        code, _ = Browser(self.base).call("/api/cores?verified=sort-of")
+        self.assertEqual(code, 400)
+
+    def test_stats_count_the_tiers_separately(self):
+        _, stats = Browser(self.base).call("/api/stats")
+        self.assertIn("ci", stats["attested"])
+        self.assertIn("attested", stats["attested"])
+        self.assertIn("release_builds", stats)
+
+
+class AttestationRefusedTest(unittest.TestCase):
+    """A hub told to accept no attestations must not quietly accept them."""
+
+    def test_a_hub_with_no_policy_refuses_tokens(self):
+        with tempfile.TemporaryDirectory() as d:
+            server = srv.build_server(str(Path(d) / "n.sqlite3"), "127.0.0.1", 0,
+                                      rate_limit=0, attest_workflows=[])
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                body = json.dumps(document()).encode()
+                aud = ta.attest.AUDIENCE_PREFIX + hashlib.sha256(body).hexdigest()
+                req = urllib.request.Request(
+                    base + "/api/runs", data=body, method="POST",
+                    headers={"Content-Type": "application/json",
+                             srv.ATTEST_HEADER: ta.sign(ta.claims(aud=aud))})
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(req)
+                self.assertEqual(cm.exception.code, 501)
+                # ...and an unattested upload still works.
+                self.assertEqual(urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/runs", data=body, method="POST",
+                    headers={"Content-Type": "application/json"})).status, 201)
+            finally:
+                server.shutdown()
+                server.server_close()
 
 
 class AccountTest(unittest.TestCase):

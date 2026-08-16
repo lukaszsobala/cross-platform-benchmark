@@ -1,6 +1,6 @@
 "use strict";
 
-// cpu-bench results hub, front end. No dependencies, no inline script (the
+// cpcpub results hub, front end. No dependencies, no inline script (the
 // server sends a CSP that forbids it). Every value that came from an upload is
 // written with textContent, never innerHTML.
 
@@ -20,6 +20,7 @@ const state = {
   user: null,           // the signed-in account, from /api/auth/me
   submitter: "",        // board narrowed to one account's uploads, by name
   files: [],            // result documents chosen but not yet uploaded
+  release: null,        // the newest release this hub verifies against, if any
 };
 
 // The page reads this one to prove a write came from the page rather than from
@@ -186,6 +187,7 @@ function filterParams() {
   // Set by clicking a submitter's name rather than by a control in the form,
   // and shown as a chip above the table so it is never a filter you cannot see.
   if (state.submitter) p.set("user", state.submitter);
+  if (form.elements.verified.value) p.set("verified", form.elements.verified.value);
   // Sorting is not a filter either -- it lives on the column headers.
   p.set("sort", state.sort);
   p.set("order", state.order);
@@ -283,6 +285,50 @@ function metricCells(tr, row) {
   for (const m of shownMetrics()) tr.append(el("td", "num", fmt(value(row, m))));
 }
 
+// Three different claims, and the display has to keep them apart or the
+// strongest one is worth nothing.
+//
+//   verified   GitHub signed a token over these exact result bytes, from a job
+//              on a GitHub-hosted runner running our pinned workflow. Nothing
+//              in that chain is the submitter's.
+//   attested   the same signed chain, on the submitter's own runner. It rules
+//              out editing the file; it does not rule out the machine's owner.
+//   release    the document says it came from a published binary. The document
+//              is the submitter's, so this is a claim, not a check -- which is
+//              why it is grey text rather than a mark.
+const TRUST = {
+  ci: {
+    label: "verified",
+    cls: "badge",
+    tip: (r) => `GitHub signed this result as measured on a GitHub-hosted ` +
+                `runner by ${r.attest_workflow || "the pinned workflow"}`,
+  },
+  attested: {
+    label: "attested",
+    cls: "badge weak",
+    tip: () => "signed by GitHub as a run of the pinned workflow, on a " +
+               "self-hosted runner — the chain holds, the machine belongs to " +
+               "the submitter",
+  },
+};
+
+function trustBadge(row) {
+  const kind = TRUST[row.attest_tier];
+  if (kind) {
+    const mark = el("span", kind.cls, kind.label);
+    mark.title = kind.tip(row);
+    return mark;
+  }
+  if (row.release_build) {
+    // Not a badge. It is the submitter's own word about which binary they ran.
+    const mark = el("span", "claim", `${row.release_build} build`);
+    mark.title = `this result says it came from the ${row.release_build} ` +
+                 `binaries — self-reported, not checked`;
+    return mark;
+  }
+  return null;
+}
+
 function filterBySubmitter(name) {
   state.submitter = name || "";
   showTab("board");
@@ -339,6 +385,8 @@ function renderBoard() {
     link.type = "button";
     link.addEventListener("click", () => showRun(row.run_id));
     head.append(link);
+    const mark = trustBadge(row);
+    if (mark) head.append(mark);
     name.append(head);
     if (row.label) name.append(el("span", "label", row.label));
     // Who uploaded it, when anyone signed in did. Clicking narrows the board to
@@ -561,7 +609,10 @@ async function showRun(id) {
   const box = $("#detail-body");
   box.replaceChildren();
 
-  box.append(el("h2", null, run.cpu_models || run.machine || `run ${run.id}`));
+  const title = el("h2", null, run.cpu_models || run.machine || `run ${run.id}`);
+  const mark = trustBadge(run);
+  if (mark) title.append(mark);
+  box.append(title);
   if (run.label) box.append(el("p", "label big", run.label));
   if (run.notes) box.append(el("p", "notes", run.notes));
 
@@ -580,6 +631,18 @@ async function showRun(id) {
     ["build", `${run.compiler || "?"}${run.compiler_version && run.compiler_version !== run.compiler ? ` (${run.compiler_version})` : ""}` +
               ` · ${run.vectorize ? "vectorize on" : "vectorize off"} · ${run.fma ? "FMA on" : "FMA off"}`],
     ["flags", run.build_flags ? `${run.cc || "cc"} ${run.build_flags}` : null],
+    // What the run says about itself, then what someone else signed about it.
+    // Kept as two lines because they are two different kinds of statement.
+    ["binary", run.binary_sha256
+      ? `sha256:${run.binary_sha256}` +
+        (run.release_build ? ` — claims the ${run.release_build} build`
+                           : " — no published build claimed")
+      : null],
+    ["attested", run.attest_tier
+      ? `${run.attest_tier === "ci" ? "GitHub-hosted runner" : "self-hosted runner"}` +
+        ` · ${run.attest_workflow || ""}` +
+        (run.attest_repo ? ` · called from ${run.attest_repo}` : "")
+      : null],
     ["config", `${run.threads ?? "?"} threads · ${run.seconds ?? "?"}s/phase × ${run.reps ?? "?"} reps · ` +
                 `${run.mem_bytes ? (run.mem_bytes / 1048576).toFixed(0) + " MiB/thread" : "no memory phases"} · ` +
                 `pin ${run.pin ? "on" : "off"}`],
@@ -646,9 +709,18 @@ async function showRun(id) {
 
   const dl = el("a", "linkish", "download the original JSON");
   dl.href = `/api/runs/${run.id}/raw`;
-  dl.setAttribute("download", `cpu-bench-run-${run.id}.json`);
+  dl.setAttribute("download", `cpcpub-run-${run.id}.json`);
   const dlp = el("p");
   dlp.append(dl);
+  // The public log of the job that produced it. The signature is the proof;
+  // this is how a reader goes and looks at what was signed.
+  if (run.attest_run_url) {
+    const job = el("a", "linkish", "the CI run that produced it");
+    job.href = run.attest_run_url;
+    job.rel = "noopener noreferrer";
+    job.target = "_blank";
+    dlp.append(el("span", "muted", " · "), job);
+  }
   box.append(dlp);
 
   $("#detail").hidden = false;
@@ -905,11 +977,58 @@ function renderAccount() {
 // The two shell blocks on the Submit tab. Both carry this hub's address, and
 // both carry the token when there is one to carry -- a command you have to
 // edit before it works is a command most people will get wrong once.
+// What a mark actually costs, said where someone is about to produce a result
+// rather than only where they read one. The honest version: uploading from here
+// cannot earn one, because nothing about a file you hand a web page is
+// checkable. Saying so is better than implying the badge is within reach.
+function renderVerifiedNote() {
+  const box = $("#verified-note");
+  box.replaceChildren();
+  const line = (...kids) => { const p = el("p", "note"); p.append(...kids); return p; };
+
+  box.append(line(
+    el("span", null, "Uploading a file — from here or from a shell — is "),
+    el("strong", null, "self-reported"),
+    el("span", null, ". That is the normal way to use this board and the " +
+                     "numbers rank the same. It simply cannot be checked: a " +
+                     "digest inside a document you wrote is a claim about " +
+                     "which binary you ran, not evidence of it.")));
+
+  const how = el("p", "note");
+  how.append(el("span", null, "For a "));
+  how.append(el("span", "badge", "verified"));
+  how.append(el("span", null, " or "));
+  how.append(el("span", "badge weak", "attested"));
+  how.append(el("span", null,
+    " mark, the measurement has to be signed by someone who is not you: run " +
+    "the measure workflow from your own repository and GitHub signs the exact " +
+    "result bytes it produced. On its own runners that is "));
+  how.append(el("span", "badge", "verified"));
+  how.append(el("span", null, "; on a self-hosted runner — your own hardware — " +
+    "it is "));
+  how.append(el("span", "badge weak", "attested"));
+  how.append(el("span", null, ", because the signatures hold but the machine is yours."));
+  box.append(how);
+
+  if (state.release) {
+    const p = el("p", "note");
+    p.append(el("span", null, "Published binaries and the workflow to call: "));
+    const link = el("a", "linkish", state.release.release);
+    if (state.release.url) {
+      link.href = state.release.url;
+      link.rel = "noopener noreferrer";
+      link.target = "_blank";
+    }
+    p.append(link, el("span", null, "."));
+    box.append(p);
+  }
+}
+
 function renderCommands() {
   const token = state.user && state.user.api_token;
   $("#cmd-run").textContent =
     "make\n" +
-    "bench/cpu-bench --full --json > run.json";
+    "bench/cpcpub --full --json > run.json";
 
   $("#shell-note").textContent = token
     ? "Saved once per machine, with your upload token, so later runs are one " +
@@ -922,10 +1041,10 @@ function renderCommands() {
   $("#cmd-setup").textContent =
     `web/submit.sh --save -u ${location.origin}` +
     (token ? ` -t ${token}` : "") + "\n" +
-    "bench/cpu-bench --full --json | web/submit.sh -l \"my box\"";
+    "bench/cpcpub --full --json | web/submit.sh -l \"my box\"";
 
   $("#cmd-curl").textContent =
-    "bench/cpu-bench --full --json \\\n" +
+    "bench/cpcpub --full --json \\\n" +
     `  | curl -fsS -X POST "${location.origin}/api/runs?label=my+box" \\\n` +
     (token ? `         -H "Authorization: Bearer ${token}" \\\n` : "") +
     "         -H 'Content-Type: application/json' --data-binary @-";
@@ -1104,7 +1223,7 @@ function uploadReceipt(job, res) {
 
 function myRuns() {
   try {
-    return JSON.parse(localStorage.getItem("cpu-bench-uploads") || "[]");
+    return JSON.parse(localStorage.getItem("cpcpub-uploads") || "[]");
   } catch {
     return [];
   }
@@ -1113,12 +1232,12 @@ function myRuns() {
 function rememberRun(entry) {
   const all = myRuns();
   all.unshift(entry);
-  localStorage.setItem("cpu-bench-uploads", JSON.stringify(all.slice(0, 100)));
+  localStorage.setItem("cpcpub-uploads", JSON.stringify(all.slice(0, 100)));
   renderMine();
 }
 
 function forgetRun(id) {
-  localStorage.setItem("cpu-bench-uploads",
+  localStorage.setItem("cpcpub-uploads",
     JSON.stringify(myRuns().filter((e) => e.id !== id)));
 }
 
@@ -1284,6 +1403,13 @@ async function boot() {
   const meta = await api("/api/metrics");
   state.metrics = meta.metrics;
 
+  // Which release this hub verifies against, if any. Not fatal if it fails:
+  // the board is readable without it.
+  api("/api/stats").then((s) => {
+    state.release = s.release || null;
+    renderVerifiedNote();
+  }).catch(() => {});
+
   $("#filters").addEventListener("submit", (e) => {
     e.preventDefault();
     // Submitting the form is the search: it is the one filter that waits to be
@@ -1293,7 +1419,7 @@ async function boot() {
   });
   // Picking from a dropdown is the whole gesture -- there is nothing to confirm
   // afterwards, so each one reloads the board itself.
-  for (const name of ["scope", "target", "vectorize", "fma"]) {
+  for (const name of ["scope", "target", "vectorize", "fma", "verified"]) {
     $("#filters").elements[name].addEventListener("change", () => {
       loadBoard().catch((err) => alert(err.message));
     });

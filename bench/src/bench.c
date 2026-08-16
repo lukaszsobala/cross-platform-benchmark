@@ -24,6 +24,7 @@
 #endif
 
 #include "kernels.h"
+#include "sha256.h"
 
 #ifndef ARRAY_LEN
 #define ARRAY_LEN(x) ((int)(sizeof(x) / sizeof((x)[0])))
@@ -788,6 +789,28 @@ static const char *compiler_version(void) {
 #define BUILD_FLAGS ""
 #endif
 
+// The SHA-256 of the running binary, or NULL where it cannot be taken.
+//
+// /proc/self/exe rather than argv[0]: it names the file that is actually
+// executing, whatever the shell called it and wherever $PATH found it. This is
+// what lets a results hub tell a run produced by a published build from one
+// produced by a local compile with flags nobody recorded -- see
+// `build.binary_sha256` in schema/cpu-bench-1.md. It proves nothing on its own,
+// being self-reported like every other field; what it buys is that two results
+// claiming the same digest were produced by the same machine code.
+//
+// Computed once, on first use, and not at all in a run that neither prints the
+// banner nor emits JSON. Not reentrant; the callers are single-threaded.
+static const char *binary_sha256(void) {
+    static char hex[65];
+    static int done = 0;
+    if (!done) {
+        done = 1;
+        if (sha256_file("/proc/self/exe", hex) != 0) hex[0] = '\0';
+    }
+    return hex[0] ? hex : NULL;
+}
+
 // "<shared flags> <this variant's flags>", the complete command line the
 // measured code was built with. Not reentrant; the callers are single-threaded.
 static const char *variant_flags(const kernel_set_t *k) {
@@ -818,6 +841,10 @@ static void print_platform(void) {
 #endif
     fprintf(o, ", target=%s\n", arch_string());
     if (BUILD_FLAGS[0]) fprintf(o, "flags: %s %s\n", BUILD_CC, BUILD_FLAGS);
+    // Printed so it can be checked against the SHA256SUMS of a release without
+    // hashing the binary by hand.
+    const char *digest = binary_sha256();
+    if (digest) fprintf(o, "binary: sha256:%s\n", digest);
 
     struct utsname u;
     if (uname(&u) == 0) {
@@ -1301,6 +1328,11 @@ static void json_open(const char *mode, const run_opts_t *o, int threads,
     j_str("cc", BUILD_CC);
     j_str("flags", variant_flags(o->kernels));
     j_str("target", arch_string());
+    // Omitted rather than null where /proc is not there to answer: a document
+    // that carries the key with no value invites a hub to store an empty
+    // digest and then match it against another empty one.
+    const char *digest = binary_sha256();
+    if (digest) j_str("binary_sha256", digest);
     printf(", \"vectorize\": %s, \"fma\": %s }",
            o->kernels->vectorize ? "true" : "false",
            o->kernels->fma ? "true" : "false");

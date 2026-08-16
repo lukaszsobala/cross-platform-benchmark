@@ -10,8 +10,8 @@
 // Everything a kernel touches is declared here, because the driver builds the
 // contexts and the kernels consume them across the TU boundary.
 
-#ifndef CPU_BENCH_KERNELS_H
-#define CPU_BENCH_KERNELS_H
+#ifndef CPCPUB_KERNELS_H
+#define CPCPUB_KERNELS_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -117,4 +117,4 @@ extern const kernel_set_t kernels_vector_fma;
 #define TARGET_HAS_FMA 0
 #endif
 
-#endif  // CPU_BENCH_KERNELS_H
+#endif  // CPCPUB_KERNELS_H

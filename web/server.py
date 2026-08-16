@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cpu-bench results hub: upload `cpu-bench --json` output and compare runs.
+"""cpcpub results hub: upload `cpcpub --json` output and compare runs.
 
 Standard library only (http.server + sqlite3), matching the benchmark's own
 no-dependencies policy.
@@ -39,6 +39,9 @@ from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast
+
+import attest
 
 HERE = Path(__file__).resolve().parent
 STATIC_DIR = HERE / "static"
@@ -47,6 +50,16 @@ SCHEMA_PATH = HERE / "schema.sql"
 SCHEMA_ID = "cpu-bench/1"
 MODES = {"threads", "per-core", "full"}
 SCOPES = {"cpu", "thread", "total"}
+
+# What the benchmark writes for build.binary_sha256, and what a release manifest
+# publishes for each binary it attached.
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+BUILDS_SCHEMA_ID = "cpu-bench-builds/1"
+
+# Where an upload carries its proof, when it has one. A header rather than a
+# field in the document, because the signature is over the document's exact
+# bytes and cannot be inside them.
+ATTEST_HEADER = "X-CPU-Bench-Attestation"
 
 MAX_BODY = 1 << 20          # 1 MiB: a --per-core dump of 256 CPUs is ~120 KiB
 MAX_AUTH_BODY = 4096        # a name and a password; anything larger is noise
@@ -149,8 +162,22 @@ CORE_COLUMNS = [col for _, col, _ in CORE_FIELDS]
 # back -- with no submitter, which is what it now is.
 SUBMITTER = "(SELECT u.name FROM users u WHERE u.id = r.user_id) AS user"
 
+# The release a run's binary *says* it came from, or NULL. Resolved at read
+# time rather than stamped on at upload: a hub that loads a release manifest
+# afterwards then marks the runs already sitting in it, instead of leaving them
+# unmarked for having arrived first.
+#
+# Deliberately not called "verified" any more. It rests on a digest the
+# submitter wrote into their own document, so it says which build a result
+# claims -- useful, and not a proof of anything. The proof, where there is one,
+# is in the attest_* columns, which only a signature can set.
+RELEASE_BUILD = ("(SELECT vb.release FROM verified_builds vb "
+                 "WHERE vb.sha256 = r.binary_sha256) AS release_build")
+
 RUN_COLUMNS = [
-    "id", "created_at", "label", "notes", "mode", "compiler",
+    "id", "created_at", "label", "notes", "mode", "binary_sha256",
+    "attest_tier", "attest_repo", "attest_workflow", "attest_run_url",
+    "attest_at", "compiler",
     "compiler_version", "cc", "build_flags", "target",
     "vectorize", "fma", "sysname", "os_release", "machine", "cpus",
     "cpu_models", "threads", "seconds", "reps", "warmup", "mem_bytes", "pin",
@@ -185,7 +212,7 @@ class Denied(HttpError):
 # ---------------------------------------------------------------------------
 #
 # Everything here runs on attacker-controlled input: the payload is whatever was
-# POSTed, not necessarily something cpu-bench produced.
+# POSTed, not necessarily something cpcpub produced.
 
 
 def _reject_constant(name: str):
@@ -249,6 +276,23 @@ def _bool(v, field):
     return int(v)
 
 
+def _hex64(v, field):
+    """A SHA-256 as the benchmark writes it, or None.
+
+    Strict about the shape because it is used as an identity: a value that is
+    not a digest can only ever match another value that is not a digest, and
+    doing that under the word "verified" is worse than not verifying at all.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise Invalid(f"{field} must be a string")
+    s = v.strip().lower()
+    if not SHA256_RE.match(s):
+        raise Invalid(f"{field} must be 64 hexadecimal characters")
+    return s
+
+
 def _obj(payload, key):
     v = payload.get(key)
     if v is None:
@@ -285,6 +329,7 @@ def validate(payload: object) -> tuple[dict, list[dict]]:
         # The exact flags matter for comparability and are long; keep them whole.
         "build_flags": _text(build.get("flags"), 1000, "build.flags"),
         "target": _text(build.get("target"), 32, "build.target"),
+        "binary_sha256": _hex64(build.get("binary_sha256"), "build.binary_sha256"),
         "vectorize": _bool(build.get("vectorize"), "build.vectorize"),
         "fma": _bool(build.get("fma"), "build.fma"),
         "sysname": _text(system.get("sysname"), 64, "system.sysname"),
@@ -411,6 +456,70 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _url(v, field):
+    """An http(s) URL, or None.
+
+    The scheme is checked because this value ends up as an href in the page:
+    `javascript:` in a link the hub itself renders is a script the CSP was
+    supposed to have made impossible.
+    """
+    s = _text(v, 300, field)
+    if s is None:
+        return None
+    if not s.startswith(("http://", "https://")):
+        raise Invalid(f"{field} must be an http:// or https:// URL")
+    return s
+
+
+def parse_builds_manifest(doc: object) -> tuple[str, str | None, list[dict]]:
+    """Validate a release build manifest into (release tag, url, builds).
+
+    The document the release workflow attaches next to the binaries:
+
+        {"schema": "cpu-bench-builds/1", "release": "v0.1.0",
+         "url": "https://github.com/…/releases/tag/v0.1.0",
+         "builds": [{"filename": …, "sha256": …, "target": …, "march": …}, …]}
+
+    Checked as strictly as an upload is. It arrives from a public URL over a
+    network the hub does not control, and everything in it becomes the meaning
+    of the word "verified" on the board.
+    """
+    if not isinstance(doc, dict):
+        raise Invalid("a build manifest must be a JSON object")
+    if doc.get("schema") != BUILDS_SCHEMA_ID:
+        raise Invalid(f"unsupported manifest schema {doc.get('schema')!r}; "
+                      f"expected {BUILDS_SCHEMA_ID}")
+    release = _text(doc.get("release"), 64, "release")
+    if not release:
+        raise Invalid("a build manifest must name the release it describes")
+    builds = doc.get("builds")
+    if not isinstance(builds, list) or not builds:
+        raise Invalid("'builds' must be a non-empty array")
+    if len(builds) > 100:
+        raise Invalid("too many builds in one manifest")
+
+    seen: set[str] = set()
+    out = []
+    for b in builds:
+        if not isinstance(b, dict):
+            raise Invalid("each build must be an object")
+        digest = _hex64(b.get("sha256"), "builds[].sha256")
+        if digest is None:
+            raise Invalid("each build must carry a sha256")
+        # Two names for one digest is one binary published twice; harmless, but
+        # it would make the count say something untrue.
+        if digest in seen:
+            continue
+        seen.add(digest)
+        out.append({
+            "sha256": digest,
+            "filename": _text(b.get("filename"), 128, "builds[].filename"),
+            "target": _text(b.get("target"), 32, "builds[].target"),
+            "march": _text(b.get("march"), 200, "builds[].march"),
+        })
+    return release, _url(doc.get("url"), "url"), out
+
+
 def public_user(user: dict, *, runs: int | None = None,
                 token: bool = False) -> dict:
     """An account as the API describes it.
@@ -437,7 +546,10 @@ def iso_now() -> str:
 
 class Store:
     ADDED_COLUMNS = (("compiler_version", "TEXT"), ("cc", "TEXT"),
-                     ("build_flags", "TEXT"), ("user_id", "INTEGER"))
+                     ("build_flags", "TEXT"), ("user_id", "INTEGER"),
+                     ("binary_sha256", "TEXT"), ("attest_tier", "TEXT"),
+                     ("attest_repo", "TEXT"), ("attest_workflow", "TEXT"),
+                     ("attest_run_url", "TEXT"), ("attest_at", "TEXT"))
 
     def __init__(self, path: str):
         self.path = path
@@ -449,10 +561,12 @@ class Store:
             for col, decl in self.ADDED_COLUMNS:
                 if col not in have:
                     db.execute(f"ALTER TABLE runs ADD COLUMN {col} {decl}")
-            # After the ALTER, not in schema.sql: an older database has no
-            # user_id column when the script runs, and an index over a column
-            # that does not exist yet is an error rather than a no-op.
+            # After the ALTER, not in schema.sql: an older database has neither
+            # column when the script runs, and an index over a column that does
+            # not exist yet is an error rather than a no-op.
             db.execute("CREATE INDEX IF NOT EXISTS runs_user ON runs(user_id, id)")
+            db.execute("CREATE INDEX IF NOT EXISTS runs_binary "
+                       "ON runs(binary_sha256)")
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10.0)
@@ -463,8 +577,18 @@ class Store:
 
     def insert(self, run: dict, cores: list[dict], raw: str,
                label: str | None, notes: str | None,
-               user_id: int | None = None) -> tuple[int, str]:
+               user_id: int | None = None,
+               attest: dict | None = None) -> tuple[int, str]:
         token = secrets.token_urlsafe(24)
+        # Stamped rather than joined, unlike release_build: this was checked
+        # against these exact bytes at this exact moment, and re-deriving it
+        # later is not possible -- the token is short-lived by design.
+        if attest:
+            run = dict(run, attest_tier=attest["tier"],
+                       attest_repo=attest["repository"],
+                       attest_workflow=attest["workflow_ref"],
+                       attest_run_url=attest["run_url"],
+                       attest_at=iso_now())
         # The delete token is issued whether or not an account owns the run:
         # signing in later must not be the only way back to something uploaded
         # from a shell, and an account holder loses nothing by also having one.
@@ -514,8 +638,8 @@ class Store:
     def run(self, run_id: int) -> dict | None:
         with self.connect() as db:
             row = db.execute(
-                f"SELECT {','.join(RUN_COLUMNS)}, {SUBMITTER} FROM runs r "
-                f"WHERE id = ?", (run_id,)).fetchone()
+                f"SELECT {','.join(RUN_COLUMNS)}, {SUBMITTER}, {RELEASE_BUILD} "
+                f"FROM runs r WHERE id = ?", (run_id,)).fetchone()
             if row is None:
                 return None
             cores = db.execute(
@@ -536,7 +660,7 @@ class Store:
         args: list[object] = [user_id] if user_id is not None else []
         with self.connect() as db:
             rows = db.execute(
-                f"SELECT r.{', r.'.join(RUN_COLUMNS)}, {SUBMITTER}, "
+                f"SELECT r.{', r.'.join(RUN_COLUMNS)}, {SUBMITTER}, {RELEASE_BUILD}, "
                 f"       (SELECT COUNT(*) FROM cores c WHERE c.run_id = r.id) AS records, "
                 f"       (SELECT MAX(c.score) FROM cores c "
                 f"          WHERE c.run_id = r.id AND c.scope != 'total') AS best_score "
@@ -548,7 +672,7 @@ class Store:
               vectorize: int | None = None, fma: int | None = None,
               search: str | None = None, ids: list[int] | None = None,
               run: int | None = None, user_id: int | None = None,
-              group_run: bool = True,
+              verified: str | None = None, group_run: bool = True,
               sort: str = "score", desc: bool = True, limit: int = 50) -> list[dict]:
         """Records matching the filters, best first.
 
@@ -569,6 +693,15 @@ class Store:
         if user_id is not None:
             where.append("r.user_id = ?")
             args.append(user_id)
+        # Three different questions, kept apart because conflating them is the
+        # whole complaint against a self-reported badge.
+        if verified == "ci":
+            where.append("r.attest_tier = 'ci'")
+        elif verified == "attested":
+            where.append("r.attest_tier IN ('ci', 'attested')")
+        elif verified == "release":
+            where.append("EXISTS (SELECT 1 FROM verified_builds vb "
+                         "WHERE vb.sha256 = r.binary_sha256)")
         if target:
             where.append("r.target = ?")
             args.append(target)
@@ -604,7 +737,8 @@ class Store:
             f"       c.{', c.'.join(CORE_COLUMNS[3:])}, "
             f"       r.target, r.vectorize, r.fma, r.cpu_models, r.label, "
             f"       r.created_at, r.mode, r.threads, r.compiler, r.machine, "
-            f"       {SUBMITTER}, m.peers AS records "
+            f"       {SUBMITTER}, {RELEASE_BUILD}, r.attest_tier, "
+            f"       m.peers AS records "
             f"FROM matched m "
             f"JOIN cores c ON c.id = m.core_id "
             f"JOIN runs r ON r.id = c.run_id "
@@ -662,11 +796,67 @@ class Store:
             runs = db.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
             cores = db.execute("SELECT COUNT(*) AS n FROM cores").fetchone()["n"]
             users = db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+            release_builds = db.execute(
+                "SELECT COUNT(*) AS n FROM runs r WHERE EXISTS "
+                "(SELECT 1 FROM verified_builds vb "
+                " WHERE vb.sha256 = r.binary_sha256)").fetchone()["n"]
+            attested = {r["tier"]: r["n"] for r in db.execute(
+                "SELECT attest_tier AS tier, COUNT(*) AS n FROM runs "
+                "WHERE attest_tier IS NOT NULL GROUP BY tier")}
             targets = db.execute(
                 "SELECT target, COUNT(*) AS n FROM runs WHERE target IS NOT NULL "
                 "GROUP BY target ORDER BY n DESC").fetchall()
+            # The most recently loaded release, for the page to point at when it
+            # explains what a verified run is. Newest by when it was loaded, not
+            # by tag: tags do not sort.
+            latest = db.execute(
+                "SELECT release, release_url, MAX(added_at) AS added_at "
+                "FROM verified_builds").fetchone()
+        release = None
+        if latest and latest["release"]:
+            release = {"release": latest["release"], "url": latest["release_url"]}
         return {"runs": runs, "records": cores, "users": users,
+                # Three separate numbers on purpose: how many results carry a
+                # signature nobody could have written (ci), how many went
+                # through the workflow on the submitter's own machine
+                # (attested), and how many merely claim a release binary.
+                "attested": {"ci": attested.get("ci", 0),
+                             "attested": attested.get("attested", 0)},
+                "release_builds": release_builds, "release": release,
                 "targets": [dict(t) for t in targets]}
+
+    # -- verified builds ---------------------------------------------------
+
+    def add_verified_builds(self, manifest: object) -> tuple[int, str]:
+        """Load a release manifest. Returns (builds stored, release tag).
+
+        Re-loading a release replaces what it published rather than adding to
+        it, so a corrected manifest is a re-run of the same command and not a
+        database to clean up by hand. Other releases are untouched: a hub keeps
+        verifying the runs of every version it has been told about.
+        """
+        release, url, builds = parse_builds_manifest(manifest)
+        now = iso_now()
+        rows = [(b["sha256"], release, url, b["filename"],
+                 b["target"], b["march"], now) for b in builds]
+        with self.connect() as db:
+            db.execute("DELETE FROM verified_builds WHERE release = ?", (release,))
+            db.executemany(
+                "INSERT OR REPLACE INTO verified_builds "
+                "(sha256, release, release_url, filename, target, march, added_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+        return len(rows), release
+
+    def verified_builds(self) -> list[dict]:
+        with self.connect() as db:
+            return [dict(r) for r in db.execute(
+                "SELECT * FROM verified_builds ORDER BY added_at DESC, filename")]
+
+    def forget_release(self, release: str) -> int:
+        with self.connect() as db:
+            cur = db.execute("DELETE FROM verified_builds WHERE release = ?",
+                             (release,))
+        return cur.rowcount
 
     # -- accounts ----------------------------------------------------------
 
@@ -832,24 +1022,34 @@ USER_RE = re.compile(r"^/api/users/([A-Za-z0-9._-]{3,32})$")
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "cpu-bench-hub/1.0"
+    server_version = "cpcpub-hub/1.0"
     protocol_version = "HTTP/1.1"       # every response below sets Content-Length
 
     # -- plumbing ----------------------------------------------------------
     @property
+    def hub(self) -> Server:
+        """`self.server`, which is always the Server below.
+
+        `BaseRequestHandler` declares that attribute as the base class, and it
+        is not ours to redeclare, so the narrowing happens here once instead of
+        at each of the half-dozen places that want what Server carries.
+        """
+        return cast("Server", self.server)
+
+    @property
     def store(self) -> Store:
-        return self.server.store            # type: ignore[attr-defined]
+        return self.hub.store
 
     @property
     def limiter(self) -> RateLimiter:
-        return self.server.limiter          # type: ignore[attr-defined]
+        return self.hub.limiter
 
     @property
     def auth_limiter(self) -> RateLimiter:
-        return self.server.auth_limiter     # type: ignore[attr-defined]
+        return self.hub.auth_limiter
 
     def client_key(self) -> str:
-        if getattr(self.server, "trust_proxy", False):
+        if self.hub.trust_proxy:
             fwd = self.headers.get("X-Forwarded-For", "")
             if fwd:
                 return fwd.split(",")[0].strip()[:64]
@@ -948,7 +1148,7 @@ class Handler(BaseHTTPRequestHandler):
         that took X-Forwarded-Proto from the request would let any client
         decide the cookie flags.
         """
-        if getattr(self.server, "trust_proxy", False):
+        if self.hub.trust_proxy:
             return self.headers.get("X-Forwarded-Proto", "").lower() == "https"
         return False
 
@@ -1048,6 +1248,13 @@ class Handler(BaseHTTPRequestHandler):
                                                   "scopes": sorted(SCOPES)})
         if path == "/api/stats" and method == "GET":
             return self.send_json(HTTPStatus.OK, self.store.stats())
+        if path == "/api/builds" and method == "GET":
+            # Public on purpose: what a hub calls verified is a claim about
+            # which binaries it trusts, and a claim nobody can read is not one
+            # anybody should believe. Every digest here is also in the release
+            # the manifest names, so the two can be checked against each other.
+            return self.send_json(HTTPStatus.OK,
+                                  {"builds": self.store.verified_builds()})
         if path == "/api/cores" and method == "GET":
             return self.send_json(HTTPStatus.OK, {"cores": self.query_cores(query)})
         if path == "/api/runs":
@@ -1263,10 +1470,20 @@ class Handler(BaseHTTPRequestHandler):
                 ids = [int(x) for x in raw_ids.split(",") if x][:64]
             except ValueError:
                 raise Invalid("ids must be a comma-separated list of integers")
+        # `1` used to mean "the digest matched a release". It now means the
+        # strongest thing on offer, because a filter that quietly kept its old,
+        # weaker meaning is exactly the confusion this rework is about.
+        verified = one("verified")
+        if verified in ("1", "true"):
+            verified = "attested"
+        if verified is not None and verified not in ("ci", "attested", "release"):
+            raise Invalid("verified must be 'ci', 'attested' or 'release'")
+
         flag = {"1": 1, "0": 0, "true": 1, "false": 0}
         return self.store.cores(
             scope=scope,
             user_id=self.who_filter(query),
+            verified=verified,
             target=_text(one("target"), 32, "target"),
             vectorize=flag.get(str(one("vectorize", "")).lower()),
             fma=flag.get(str(one("fma", "")).lower()),
@@ -1356,17 +1573,51 @@ class Handler(BaseHTTPRequestHandler):
             label = label or _text(payload.get("label"), MAX_TEXT, "label")
             notes = notes or _text(payload.get("notes"), MAX_NOTES, "notes")
 
+        # Checked over `raw` -- the bytes as received, before any parsing --
+        # because that is what the signature covers. Re-serialising the parsed
+        # document first would break every attestation, and quietly accepting
+        # one that no longer matched would be worse.
+        attestation = self.check_attestation(raw)
+
         run, cores = validate(payload)
         run_id, token = self.store.insert(
             run, cores, raw.decode("utf-8"), label, notes,
-            user_id=user["id"] if user else None)
+            user_id=user["id"] if user else None, attest=attestation)
         self.send_json(HTTPStatus.CREATED, {
             "id": run_id,
             "delete_token": token,
             "user": user["name"] if user else None,
+            "attested": attestation["tier"] if attestation else None,
             "url": f"/#run={run_id}",
             "records": len(cores),
         })
+
+    def check_attestation(self, raw: bytes) -> dict | None:
+        """Verify the attestation header, if one was sent.
+
+        A refusal fails the whole upload rather than storing the run without
+        the mark. Someone who went to the trouble of attesting a result needs
+        to hear that it did not take; silently downgrading them to an ordinary
+        row is how a hub ends up full of results nobody can explain.
+        """
+        token = self.headers.get(ATTEST_HEADER)
+        if not token:
+            return None
+        verifier = self.hub.attest
+        if verifier is None:
+            raise Denied("this hub does not accept attestations",
+                         HTTPStatus.NOT_IMPLEMENTED)
+        keys, workflows = verifier
+        try:
+            return attest.check(token.strip(), raw, keys, workflows)
+        except attest.AttestationError as e:
+            raise Denied(f"attestation rejected: {e}")
+        except OSError as e:
+            # The issuer's keys could not be fetched. Not the submitter's
+            # fault, and not something to record as a failed attestation.
+            self.log_message("JWKS fetch failed: %r", e)
+            raise HttpError(HTTPStatus.SERVICE_UNAVAILABLE,
+                            "cannot check attestations right now; try again")
 
     def static(self, path: str):
         if path in ("/", ""):
@@ -1390,21 +1641,51 @@ def clamp_int(v, lo: int, hi: int, default: int) -> int:
     return max(lo, min(hi, n))
 
 
+# What it takes to check an attestation: the issuer's keys, and the workflows
+# whose tokens this hub will act on. Both together or neither -- keys without a
+# workflow allowlist would verify a signature and learn nothing from it.
+Verifier = tuple[attest.KeyStore, list[str]]
+
+
 class Server(ThreadingHTTPServer):
+    """The listening socket, plus the five things a handler reaches for.
+
+    Declared here rather than only attached in `build_server`: a handler
+    touches them on every request, and there is otherwise nothing that says
+    they exist -- not for a reader, and not for a type checker. The three
+    without a default are required; a server built without them is broken, so
+    the AttributeError is the right outcome.
+    """
+
     daemon_threads = True
     allow_reuse_address = True
+
+    store: Store
+    limiter: RateLimiter
+    auth_limiter: RateLimiter
+    trust_proxy: bool = False
+    # The keys to check attestations against and the workflows to accept them
+    # from, or None for a hub that takes no attestations at all.
+    attest: Verifier | None = None
 
 
 def build_server(db_path: str, host: str, port: int, *, rate_limit: int = 30,
                  window: float = 3600.0, trust_proxy: bool = False,
-                 auth_limit: int = 20) -> Server:
+                 auth_limit: int = 20, attest_workflows: list[str] | None = None,
+                 jwks_file: str | None = None) -> Server:
     srv = Server((host, port), Handler)
-    srv.store = Store(db_path)              # type: ignore[attr-defined]
-    srv.limiter = RateLimiter(rate_limit, window)   # type: ignore[attr-defined]
+    srv.store = Store(db_path)
+    # An empty workflow list refuses attestations, spelled explicitly: a hub
+    # that trusts no workflow can verify nothing, and should say so rather than
+    # accept tokens it has no policy for.
+    workflows = [attest.DEFAULT_WORKFLOW] if attest_workflows is None \
+        else [w for w in attest_workflows if w]
+    srv.attest = (attest.KeyStore(path=jwks_file), workflows) if workflows else None
+    srv.limiter = RateLimiter(rate_limit, window)
     # Sign-ins are limited separately and much harder: uploading a lot is
     # enthusiasm, trying twenty passwords in a quarter of an hour is not.
-    srv.auth_limiter = RateLimiter(auth_limit, 900.0)   # type: ignore[attr-defined]
-    srv.trust_proxy = trust_proxy           # type: ignore[attr-defined]
+    srv.auth_limiter = RateLimiter(auth_limit, 900.0)
+    srv.trust_proxy = trust_proxy
     return srv
 
 
@@ -1422,6 +1703,16 @@ def main(argv=None) -> int:
     ap.add_argument("--auth-limit", type=int, default=20,
                     help="sign-in attempts per address per 15 minutes, "
                          "0 to disable")
+    ap.add_argument("--attest-workflow", action="append", metavar="REF",
+                    help="a job_workflow_ref whose GitHub OIDC attestations "
+                         "this hub accepts, without the @ref part (repeatable; "
+                         f"default {attest.DEFAULT_WORKFLOW})")
+    ap.add_argument("--no-attest", action="store_true",
+                    help="refuse attestations entirely")
+    ap.add_argument("--jwks-file", metavar="PATH",
+                    help="verify against a saved copy of the issuer's keys "
+                         "instead of fetching them (for a hub with no outbound "
+                         "network; refresh it when GitHub rotates keys)")
     ap.add_argument("--trust-proxy", action="store_true",
                     help="take the client address from X-Forwarded-For, and "
                          "the scheme from X-Forwarded-Proto so session cookies "
@@ -1430,9 +1721,11 @@ def main(argv=None) -> int:
 
     srv = build_server(args.db, args.host, args.port,
                        rate_limit=args.rate_limit, trust_proxy=args.trust_proxy,
-                       auth_limit=args.auth_limit)
+                       auth_limit=args.auth_limit,
+                       attest_workflows=[] if args.no_attest else args.attest_workflow,
+                       jwks_file=args.jwks_file)
     host, port = srv.server_address[:2]
-    print(f"cpu-bench hub on http://{host}:{port}  (db: {args.db})", file=sys.stderr)
+    print(f"cpcpub hub on http://{host}:{port}  (db: {args.db})", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

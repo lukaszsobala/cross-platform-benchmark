@@ -1,9 +1,9 @@
 #!/bin/sh
-# Upload a cpu-bench JSON result to a results hub.
+# Upload a cpcpub JSON result to a results hub.
 #
 #   web/submit.sh --save -u https://hub.example -t YOUR-TOKEN   # once per machine
 #   web/submit.sh -l "workstation, quiet"                       # runs the bench
-#   bench/cpu-bench --full --json | web/submit.sh -l "sbc"      # or feed it one
+#   bench/cpcpub --full --json | web/submit.sh -l "sbc"      # or feed it one
 #   web/submit.sh -u https://hub.example -l "sbc" < run.json
 #
 # With nothing on stdin it runs the benchmark itself, so submitting a result is
@@ -13,7 +13,7 @@
 # withdraw the run later.
 #
 # The hub URL and the account's upload token are remembered in
-# $XDG_CONFIG_HOME/cpu-bench/hub.conf (or ~/.config/cpu-bench/hub.conf) by
+# $XDG_CONFIG_HOME/cpcpub/hub.conf (or ~/.config/cpcpub/hub.conf) by
 # `--save`, so later runs need no flags at all. The token is what puts the run
 # on your account; without one the upload is anonymous, which the hub accepts
 # just the same. Get one from the hub's Account tab.
@@ -28,7 +28,7 @@ set -eu
 
 # shellcheck disable=SC1007  # `CDPATH= cd` is an assignment prefix, not a typo
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/cpu-bench
+config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/cpcpub
 config=$config_dir/hub.conf
 
 url=
@@ -40,17 +40,17 @@ save=0
 usage() {
     cat >&2 <<EOF
 usage: $0 [-u URL] [-t TOKEN] [-l LABEL] [-n NOTES] [--save] [< result.json]
-  -u URL    hub base URL (default: saved, then \$CPU_BENCH_HUB,
+  -u URL    hub base URL (default: saved, then \$CPCPUB_HUB,
             then http://127.0.0.1:8080)
   -t TOKEN  upload token, so the run lands on your account
-            (default: saved, then \$CPU_BENCH_TOKEN; without one it is anonymous)
+            (default: saved, then \$CPCPUB_TOKEN; without one it is anonymous)
   -l LABEL  short label for the run, e.g. the machine's name
   -n NOTES  longer notes: cooling, governor, anything explaining the numbers
   --save    write URL and token to $config and exit; a saved token is kept
             unless -t is given, so -t '' is how you go back to anonymous
   -h        this
 
-With no result on stdin, runs $here/../bench/cpu-bench --full --json itself.
+With no result on stdin, runs $here/../bench/cpcpub --full --json itself.
 EOF
     exit 2
 }
@@ -67,8 +67,8 @@ if [ -f "$config" ]; then
 fi
 
 # Environment beats the file, flags beat the environment.
-url=${CPU_BENCH_HUB:-$url}
-token=${CPU_BENCH_TOKEN:-$token}
+url=${CPCPUB_HUB:-$url}
+token=${CPCPUB_TOKEN:-$token}
 
 # --save is a long option; getopts does not do those, so it is lifted out of the
 # argument list before getopts sees it. Rotating the positional parameters one
@@ -140,13 +140,13 @@ post() {  # post FILE LABEL
 }
 
 # stdin is read once and kept, because deciding what it is means looking at it.
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/cpu-bench-submit.XXXXXX")
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/cpcpub-submit.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 if [ -t 0 ]; then
     # Nothing piped in: measure this machine rather than printing usage at
     # someone who has just told us where to send the result.
-    bench=$here/../bench/cpu-bench
+    bench=$here/../bench/cpcpub
     [ -x "$bench" ] || {
         echo "$0: nothing on stdin and no benchmark at $bench" >&2
         echo "     build it with 'make', or pipe a result document in" >&2
@@ -175,7 +175,7 @@ fi
 
 command -v python3 >/dev/null 2>&1 || {
     echo "$0: a --variants array needs python3 to split; upload one variant at" >&2
-    echo "     a time instead: cpu-bench --variant NAME --json | $0 ..." >&2
+    echo "     a time instead: cpcpub --variant NAME --json | $0 ..." >&2
     exit 1
 }
 

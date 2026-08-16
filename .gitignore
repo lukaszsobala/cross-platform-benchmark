@@ -1,8 +1,35 @@
-bench/cpu-bench
+# Build output: one binary, one stamp of the flags it was built with, and one
+# object per kernel variant.
+bench/cpcpub
 bench/.build-flags
 *.o
-.DS_Store
+
+# The hub's database, wherever it is put -- `make serve` writes
+# web/runs.sqlite3, `web/verified.py --db ...` writes whatever you name. The
+# -wal and -shm sidecars appear and vanish with it, and a copy of the .sqlite3
+# alone is a truncated database rather than a small one.
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# What the workflows produce. They run in a CI checkout, but these are the same
+# commands anyone reproducing a release runs by hand in this directory.
+/dist/
+/cpcpub-linux-*
+/buildinfo-*.json
+/SHA256SUMS
+/verified-builds.json
+
+# A measurement. `cpcpub --full --json > run.json` is the first half of
+# every upload, and the result is this machine on this day, not source.
+/run.json
+/upload.json
+
 __pycache__/
-web/*.sqlite3
-web/*.sqlite3-wal
-web/*.sqlite3-shm
+
+# .vscode/settings.json is committed on purpose: it tells the analyser that
+# tests/ import `server` from web/. Personal editor state is not.
+/.vscode/*
+!/.vscode/settings.json
+
+.DS_Store

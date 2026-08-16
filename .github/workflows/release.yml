@@ -1,0 +1,378 @@
+# Build cpcpub for every target and attach the binaries to a release.
+#
+# These binaries are what "verified" means on a results hub: the hub loads the
+# verified-builds.json produced here and marks a run whose build.binary_sha256
+# matches one of these digests. So this workflow is not a convenience -- it is
+# the definition of a comparable result, and everything it publishes has to be
+# checkable from the outside: the exact compiler, the exact flags, and a digest
+# of the exact file that was uploaded.
+#
+# Why the runner images are pinned to 24.04 and not to the newest thing going:
+# the build host sets the *glibc floor* of what it produces. A binary linked
+# against 26.04's glibc will not start on 24.04 or Debian 13 ("version
+# `GLIBC_2.4x' not found"), while one built here runs on both, 26.04 included.
+# Release artifacts want the oldest image still supported, and the jobs below
+# print the highest glibc symbol version they ended up needing so that floor is
+# a published fact rather than a hope.
+#
+# This is separate from what the binaries *target*. RVA23 comes from -march, not
+# from the host distribution -- but it does need a compiler new enough to know
+# the extension names, and 24.04's default riscv64 cross-gcc (13) predates
+# several of them. So the RISC-V jobs install the newest cross-gcc the image
+# offers, and the build is checked against the ELF arch attributes afterwards:
+# a toolchain that quietly produced less than RVA23 fails the job instead of
+# shipping.
+#
+# Secrets: none are used and none exist to leak. The only credential in play is
+# the automatic, per-run GITHUB_TOKEN, given to `gh` through the environment --
+# never on a command line, never echoed, never written to a file. Permissions
+# are empty by default and read-only on the build jobs; exactly one job may
+# write, and only to attach assets. The build jobs check out with
+# persist-credentials disabled, so the token is not left in .git/config while a
+# Makefile and a compiler run.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to build and upload to"
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # One source of truth for what is being built, so a run cannot publish to a
+  # tag it did not check out.
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86-64 baseline: runs on anything 64-bit Intel or AMD.
+          - name: x86_64
+            runs-on: ubuntu-24.04
+            vars: MARCH=x86-64 MTUNE=generic
+            target: x86_64
+          # x86-64-v3 (AVX2 + FMA): the x86 build where all four variants
+          # differ, so `--variants` has something to say on this ISA.
+          - name: x86_64-v3
+            runs-on: ubuntu-24.04
+            vars: MARCH=x86-64-v3 MTUNE=generic
+            target: x86_64
+          # Native arm64 runner, free for public repositories. If this repo
+          # ever goes private, cross-build it with gcc-aarch64-linux-gnu and a
+          # qemu-aarch64 smoke test, exactly as the riscv64 rows do.
+          - name: aarch64
+            runs-on: ubuntu-24.04-arm
+            vars: MARCH=armv8-a MTUNE=generic
+            target: aarch64
+          # rv64gc: the RISC-V build that runs everywhere, including the boards
+          # `make sg2000` exists for.
+          - name: riscv64
+            runs-on: ubuntu-24.04
+            cross: riscv64-linux-gnu
+            vars: MARCH=rv64gc
+            target: riscv64
+            qemu-cpu: rv64
+          # RVA23U64: the profile Ubuntu 26.04 takes as its riscv64 baseline.
+          # `make rva23` picks whichever -march spelling this toolchain knows,
+          # and the flags it settled on are recorded in the manifest below.
+          - name: riscv64-rva23
+            runs-on: ubuntu-24.04
+            cross: riscv64-linux-gnu
+            make-target: rva23
+            target: riscv64
+            qemu-cpu: rva23u64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Install the toolchain
+        env:
+          CROSS: ${{ matrix.cross }}
+        run: |
+          set -eux
+          if [ -z "$CROSS" ]; then
+            cc --version
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "libc6-dev-${{ matrix.target }}-cross" qemu-user
+          # Newest first: this image's *default* cross-gcc predates several
+          # RVA23 extension names, and a build that quietly targets less than
+          # the profile is the one failure mode worth spending a loop on.
+          found=""
+          for v in 15 14 13 ""; do
+            if sudo apt-get install -y --no-install-recommends "gcc${v:+-$v}-$CROSS"; then
+              found="$CROSS-gcc${v:+-$v}"
+              break
+            fi
+          done
+          [ -n "$found" ] || { echo "no $CROSS cross-compiler on this image" >&2; exit 1; }
+          "$found" --version
+          echo "CC=$found" >> "$GITHUB_ENV"
+
+      # CC comes from $GITHUB_ENV for a cross build and is unset for a native
+      # one, where the Makefile's own default is right.
+      - name: Build
+        run: |
+          set -eux
+          make -C bench ${{ matrix.make-target || 'all' }} ${{ matrix.vars }}
+          file bench/cpcpub
+
+      # What the binary requires of the machine that runs it, in both senses:
+      # the ISA it was compiled for, and the glibc it was linked against. Both
+      # are published facts about a release artifact, so both are printed -- and
+      # for the profile targets, asserted.
+      - name: Check what it requires
+        env:
+          CROSS: ${{ matrix.cross }}
+          NAME: ${{ matrix.name }}
+        run: |
+          set -eux
+          READELF="${CROSS:+$CROSS-}readelf"
+          OBJDUMP="${CROSS:+$CROSS-}objdump"
+          "$OBJDUMP" -T bench/cpcpub | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
+          if [ "${CROSS:-}" ]; then "$READELF" -A bench/cpcpub; fi
+          python3 - <<'PY'
+          import glob, os, re, subprocess, sys
+
+          name, cross = os.environ["NAME"], os.environ.get("CROSS", "")
+          if not name.startswith("riscv64"):
+              sys.exit(0)
+
+          def isa_of(path):
+              """The ISA an ELF file declares, as a set of bare extension names.
+
+              Versions are stripped (`v1p0` -> `v`) and Zba/Zbb/Zbs may arrive
+              folded into a single `b`, so both spellings are accepted below.
+              """
+              out = subprocess.run([f"{cross}-readelf", "-A", path],
+                                   capture_output=True, text=True).stdout
+              found = re.search(r'Tag_RISCV_arch: "([^"]+)"', out)
+              if not found:
+                  sys.exit(f"{path} declares no RISC-V arch attribute")
+              return {re.sub(r"\d+p\d+$", "", tok)
+                      for tok in found.group(1).split("_")}
+
+          # Our own objects, not the linked binary. A link merges the attributes
+          # of everything that went into it, including the distribution's crt
+          # objects -- and on a host whose riscv64 baseline is already RVA23
+          # those alone make any executable claim RVA23. The objects say what
+          # the compiler emitted for *this* source, which is the question.
+          ours = set()
+          for obj in sorted(glob.glob("bench/src/*.o")):
+              ours |= isa_of(obj)
+          print("compiled for:", " ".join(sorted(ours)))
+
+          if name == "riscv64-rva23":
+              # The RVA23U64 extensions that reach codegen.
+              want = {"v", "zicond", "zimop", "zcmop", "zcb", "zfa", "zawrs",
+                      "zfhmin", "zvbb", "zvfhmin", "zvkt", "zkt"}
+              missing = want - ours
+              if not ({"zba", "zbb", "zbs"} <= ours or "b" in ours):
+                  missing |= {"zba/zbb/zbs"}
+              if missing:
+                  sys.exit(f"not an RVA23 build -- missing {sorted(missing)}. "
+                           "The cross-compiler is probably too old to know these "
+                           "extension names; give this matrix row a newer image.")
+              print("RVA23U64 confirmed")
+              sys.exit(0)
+
+          # The portable build must not have picked up a vector unit, or it
+          # stops running on the very boards it exists for -- and here the
+          # *linked* binary is the thing to check, because a runtime built for a
+          # richer baseline drags the whole artifact up with it.
+          if {"v"} & ours or any(x.startswith("zve") for x in ours):
+              sys.exit(f"rv64gc build compiled vector instructions: {sorted(ours)}")
+          whole = isa_of("bench/cpcpub")
+          if {"v"} & whole or any(x.startswith("zve") for x in whole):
+              sys.exit(
+                  "this image's riscv64 runtime is not rv64gc: the linked binary "
+                  f"requires {sorted(x for x in whole if x == 'v' or x.startswith('zve'))} "
+                  "even though our objects do not. Ubuntu moved its riscv64 "
+                  "baseline to RVA23 in 26.04, so the portable artifact has to "
+                  "be built on an older image than that -- which is why this job "
+                  "pins one.")
+          print("rv64gc confirmed scalar, runtime included")
+          PY
+
+      # A binary nobody has run is not a release artifact. Native targets run
+      # directly; cross-built ones run under qemu with the CPU model the -march
+      # claims, which is what catches a build emitting instructions the ISA
+      # string does not promise.
+      - name: Smoke test
+        env:
+          CROSS: ${{ matrix.cross }}
+          QEMU_CPU: ${{ matrix.qemu-cpu }}
+        run: |
+          set -eux
+          RUN=""
+          if [ -n "$CROSS" ]; then
+            RUN="qemu-${{ matrix.target }} -cpu $QEMU_CPU -L /usr/$CROSS"
+          fi
+          $RUN ./bench/cpcpub --list-variants
+          $RUN ./bench/cpcpub --full --cpus 0 --threads 1 \
+              --time 0.05 --reps 1 --warmup 0.02 --json > run.json
+
+      # The verification chain in one step: what the binary says it is has to be
+      # what the file is. If these ever disagree, every digest published below
+      # names something that does not exist and nothing would verify.
+      - name: Check the binary identifies itself
+        env:
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eux
+          sha256sum bench/cpcpub
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re
+
+          doc = json.load(open("run.json"))
+          assert doc["schema"] == "cpu-bench/1", doc.get("schema")
+          claimed = doc["build"]["binary_sha256"]
+          actual = hashlib.sha256(pathlib.Path("bench/cpcpub").read_bytes()).hexdigest()
+          assert re.fullmatch(r"[0-9a-f]{64}", claimed), claimed
+          assert claimed == actual, f"binary says {claimed}, file is {actual}"
+
+          # What this build actually got, read out of its own output rather
+          # than repeated from the matrix -- `make rva23` chooses its -march at
+          # build time, so the matrix does not know it.
+          flags = doc["build"]["flags"]
+          march = re.search(r"-march=(\S+)", flags)
+          info = {"filename": f"cpcpub-linux-{os.environ['NAME']}",
+                  "target": os.environ["TARGET"],
+                  "march": march.group(1) if march else None,
+                  "flags": flags,
+                  "compiler": doc["build"]["compiler_version"]}
+          pathlib.Path("dist").mkdir(exist_ok=True)
+          json.dump(info, open(f"dist/buildinfo-{os.environ['NAME']}.json", "w"),
+                    indent=2)
+          print(json.dumps(info, indent=2))
+          PY
+          cp bench/cpcpub "dist/cpcpub-linux-$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write        # the only write in this workflow: attach assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
+
+      # Digests are taken here, over the exact bytes about to be uploaded --
+      # not carried over from the build jobs. The file being published is the
+      # only one whose digest is worth anything.
+      - name: Checksums and manifest
+        env:
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          set -eux
+          cd staged
+          chmod +x cpcpub-linux-*
+          sha256sum cpcpub-linux-* > SHA256SUMS
+          cat SHA256SUMS
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+
+          builds = []
+          for path in sorted(pathlib.Path(".").glob("cpcpub-linux-*")):
+              info = json.load(open(f"buildinfo-{path.name.removeprefix('cpcpub-linux-')}.json"))
+              assert info["filename"] == path.name, (info["filename"], path.name)
+              builds.append({
+                  "filename": path.name,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "target": info["target"],
+                  "march": info["march"],
+              })
+          assert builds, "nothing to publish"
+
+          tag = os.environ["TAG"]
+          manifest = {
+              "schema": "cpu-bench-builds/1",
+              "release": tag,
+              "url": f"{os.environ['SERVER']}/{os.environ['REPO']}/releases/tag/{tag}",
+              "builds": builds,
+          }
+          json.dump(manifest, open("verified-builds.json", "w"), indent=2)
+          print(json.dumps(manifest, indent=2))
+          PY
+          # The manifest must agree with the checksum file, or the two halves of
+          # the release contradict each other.
+          python3 - <<'PY'
+          import json
+          published = {b["sha256"]: b["filename"]
+                       for b in json.load(open("verified-builds.json"))["builds"]}
+          listed = {}
+          for line in open("SHA256SUMS"):
+              digest, name = line.split()
+              listed[digest] = name.lstrip("*")
+          assert published == listed, (published, listed)
+          print(f"{len(listed)} binaries agree between SHA256SUMS and the manifest")
+          PY
+
+      # `gh` reads the token from the environment, so it never reaches a process
+      # list or a log line. --clobber so re-running the workflow for a tag
+      # replaces the assets rather than failing on them.
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          cd staged
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "$TAG" --generate-notes
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            cpcpub-linux-* SHA256SUMS verified-builds.json
+
+      - name: Say how to trust these
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Verified builds for \`$TAG\`
+
+          Download a binary and check it against \`SHA256SUMS\`. A result
+          produced by one of them shows as **verified** on a hub whose operator
+          has run:
+
+          \`\`\`sh
+          python3 web/verified.py --db runs.sqlite3 \\
+            $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG/verified-builds.json
+          \`\`\`
+
+          The benchmark hashes its own binary and reports it as
+          \`build.binary_sha256\`, so the hub matches on its own without being
+          told anything by the submitter. It is not proof -- that field is
+          self-reported like every other one -- but two results carrying the
+          same digest were produced by the same machine code.
+          EOF

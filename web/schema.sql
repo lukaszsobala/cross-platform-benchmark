@@ -1,4 +1,4 @@
--- cpu-bench results hub.
+-- cpcpub results hub.
 --
 -- Four tables: one row per uploaded run, one row per core/thread record inside
 -- it, and the accounts a run may be attributed to with their live sessions. The
@@ -50,6 +50,23 @@ CREATE TABLE IF NOT EXISTS runs (
     notes         TEXT,
 
     mode          TEXT    NOT NULL,   -- threads | per-core | full
+    -- SHA-256 of the binary that produced the run, when it could take one.
+    -- Matched against verified_builds; see the note on that table.
+    binary_sha256 TEXT,
+
+    -- What a third party signed about this upload, if anything. Written at
+    -- upload time and only after checking GitHub's signature over these exact
+    -- bytes, so unlike binary_sha256 it is not something the submitter can
+    -- write. NULL for every ordinary upload, which stays the normal case.
+    --   ci        ran on a GitHub-hosted runner: nothing in the chain is the
+    --             submitter's
+    --   attested  same pinned workflow on the submitter's own runner: the
+    --             chain of signatures holds, the machine does not
+    attest_tier     TEXT,
+    attest_repo     TEXT,   -- the repository whose job ran it
+    attest_workflow TEXT,   -- job_workflow_ref, including the ref it was at
+    attest_run_url  TEXT,   -- the public log of the run that produced it
+    attest_at       TEXT,   -- when the hub checked it
     compiler      TEXT,               -- "gcc 15.2.0"
     compiler_version TEXT,            -- the toolchain's own version banner
     cc            TEXT,               -- driver invoked, e.g. riscv64-linux-gnu-gcc
@@ -106,6 +123,30 @@ CREATE TABLE IF NOT EXISTS cores (
     disp_gain       REAL,
     disp_span       REAL,
     score           REAL
+);
+
+-- The digests of the binaries a release published, loaded by web/verified.py
+-- from the manifest the release workflow attaches. A run whose binary_sha256 is
+-- in here is shown as *verified*: it was produced by a build whose compiler,
+-- flags and source everyone can see, rather than by a local compile with an
+-- -march nobody wrote down.
+--
+-- Matched by join rather than stamped onto the run at upload time, deliberately.
+-- A hub that loads a manifest after the fact then verifies the runs that were
+-- already waiting, instead of leaving them permanently unverified for having
+-- arrived first.
+--
+-- It is not proof and does not pretend to be: the digest is self-reported like
+-- every other field in an upload. What it establishes is sameness of code, not
+-- honesty of submitter.
+CREATE TABLE IF NOT EXISTS verified_builds (
+    sha256      TEXT PRIMARY KEY,
+    release     TEXT NOT NULL,     -- the tag it was published under
+    release_url TEXT,
+    filename    TEXT,              -- the asset name, e.g. cpcpub-riscv64-rva23
+    target      TEXT,              -- x86_64 | aarch64 | riscv64
+    march       TEXT,              -- the ISA baseline it was built for
+    added_at    TEXT    NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS cores_run   ON cores(run_id);

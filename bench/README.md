@@ -1,4 +1,4 @@
-# cpu-bench
+# cpcpub
 
 A small, portable CPU benchmark in C (C2x, GCC 13+) for 64-bit x86_64, AArch64
 and RISC-V. No dependencies beyond libc, libm and pthreads.
@@ -133,14 +133,14 @@ more than the mispredicting end of the curve, which compresses the two together
 and *inflates* the result. This is the one column that is biased, rather than
 just noised, by interference, so raising `--reps` does not fix it.
 
-`./cpu-bench --disp-sweep` prints the whole rate-vs-period curve for any target,
+`./cpcpub --disp-sweep` prints the whole rate-vs-period curve for any target,
 both for the dependent-accumulator kernel the suite uses and for one with
 independent calls.
 
 ## Build (GCC 13+)
 
 Run these in this directory, or from the repo root — the top-level `Makefile`
-forwards every target and variable here, and puts the binary at `bench/cpu-bench`
+forwards every target and variable here, and puts the binary at `bench/cpcpub`
 either way.
 
 ```sh
@@ -156,7 +156,7 @@ Auto-vectorization and FMA contraction are translation-unit flags — no pragma
 switches them per function — so a binary that can measure more than one of them
 has to compile the kernels more than once. `make` does exactly that:
 [src/kernels.c](src/kernels.c) is compiled four times, and all four objects are
-linked into the one `cpu-bench`.
+linked into the one `cpcpub`.
 
 | variant | flags |
 | --- | --- |
@@ -170,11 +170,11 @@ vectorization and no FMA contraction, so the kernel is the op sequence the
 source says it is on every target.
 
 ```sh
-./cpu-bench --list-variants           # what this binary carries, and why
-./cpu-bench --variant vector-fma      # measure one
-./cpu-bench --variants                # measure each distinct one, and compare
-./cpu-bench --variants=all            # all four, distinct or not
-./cpu-bench --variants=scalar-nofma,vector-fma
+./cpcpub --list-variants           # what this binary carries, and why
+./cpcpub --variant vector-fma      # measure one
+./cpcpub --variants                # measure each distinct one, and compare
+./cpcpub --variants=all            # all four, distinct or not
+./cpcpub --variants=scalar-nofma,vector-fma
 ```
 
 `--variants` runs the whole suite once per variant, so it takes as many times as
@@ -204,6 +204,9 @@ The canonical `-march` ISA string excludes privilege letters (`S`, `U`), so
 `rv64imafdcvsu` is invalid; pass CSR/fence split as named extensions instead.
 
 - Ratified RVV 1.0 hardware: `make riscv-v` (`-march=rv64gcv_zicsr_zifencei`).
+- RVA23 hardware: `make rva23`. **This is the profile Ubuntu 26.04 takes as its
+  riscv64 baseline**, so it is the build that matches a distribution-built
+  userland on such a machine. See below.
 - Sophgo SG2000 / T-Head C906: `make sg2000`
   (`-march=rv64imafdc_zicsr_zifencei`, with **no `v`**). The C906 implements the
   draft 0.7.1 vector extension, which is a different, incompatible encoding from
@@ -218,32 +221,60 @@ The canonical `-march` ISA string excludes privilege letters (`S`, `U`), so
   it (needs GCC 14+, and only tells you anything under `--variant vector-nofma`
   or `vector-fma`), use `make sg2000-xthead`.
 
+#### RVA23
+
+`make rva23` builds for **RVA23U64**, the profile ratified in October 2024 and
+the baseline Ubuntu 26.04 requires of a riscv64 CPU. It is a *floor*, not a
+tuning hint: everything in it is mandatory, so the compiler uses RVV 1.0,
+`Zba`/`Zbb`/`Zbs`, `Zcb`, `Zfa`, `Zicond` and the rest without asking, and the
+binary dies with `Illegal instruction` on anything that implements less — every
+board `make sg2000` exists for included. Plain `make` (`rv64gc`) remains the
+build that runs everywhere.
+
+Because RVA23 mandates `V`, all four build variants are distinct in an `rva23`
+binary, and `--variants` measures four rather than the two a plain `rv64gc`
+build can tell apart. The cross-ISA default is still `scalar-nofma`.
+
+Toolchains disagree about how to spell the profile. LLVM 19+ accepts
+`-march=rva23u64`; GCC 15 refuses profile names outright (*"ISA string must
+begin with rv32 or rv64"*) and wants the mandatory set written out. The target
+probes the compiler and uses whichever it understands, so:
+
+```sh
+make rva23                                        # native, on RVA23 hardware
+make rva23 CC=riscv64-linux-gnu-gcc               # cross, from anywhere
+qemu-riscv64 -cpu rva23u64 -L /usr/riscv64-linux-gnu ./cpcpub --variants
+```
+
+The `-march` it settled on is recorded verbatim in `build.flags`, and therefore
+in every uploaded result, so which spelling was used is never a guess.
+
 Object files are stamped with the flags they were built with (`.build-flags`), so
 switching `MARCH` forces a rebuild rather than silently keeping an object built
 for the previous ISA. If in doubt:
 
 ```sh
 make clean && make sg2000
-objdump -d cpu-bench | grep -c vsetvli    # 0 = no RVV in the binary
+objdump -d cpcpub | grep -c vsetvli    # 0 = no RVV in the binary
 ```
 
 ## Run
 
 ```sh
-./cpu-bench --help
-./cpu-bench                                  # all cores, all phases
-./cpu-bench --per-core                       # sweep each CPU single-threaded
-./cpu-bench --full                           # both of the above in one report
-./cpu-bench --full --variants                # ...once per build variant
-./cpu-bench --variant vector-fma             # one named variant
-./cpu-bench --disp-sweep                     # indirect-dispatch curve vs period
-./cpu-bench --cpus 4-7 --threads 4           # only the big cluster
-./cpu-bench --time 2.0 --reps 5              # longer and more repetitions
-./cpu-bench --mem-per-thread 33554432        # 32 MiB working set per thread
-./cpu-bench --no-mem                         # skip the memory phases
-./cpu-bench --no-pin                         # disable thread pinning
-./cpu-bench -v                               # explain every metric afterwards
-./cpu-bench --json > run.json                # machine-readable results
+./cpcpub --help
+./cpcpub                                  # all cores, all phases
+./cpcpub --per-core                       # sweep each CPU single-threaded
+./cpcpub --full                           # both of the above in one report
+./cpcpub --full --variants                # ...once per build variant
+./cpcpub --variant vector-fma             # one named variant
+./cpcpub --disp-sweep                     # indirect-dispatch curve vs period
+./cpcpub --cpus 4-7 --threads 4           # only the big cluster
+./cpcpub --time 2.0 --reps 5              # longer and more repetitions
+./cpcpub --mem-per-thread 33554432        # 32 MiB working set per thread
+./cpcpub --no-mem                         # skip the memory phases
+./cpcpub --no-pin                         # disable thread pinning
+./cpcpub -v                               # explain every metric afterwards
+./cpcpub --json > run.json                # machine-readable results
 ```
 
 Defaults: threads = online cores, `--time 0.5` per phase, `--reps 3`,
@@ -256,7 +287,7 @@ both. That is the form worth keeping and sharing: the first says what the machin
 does at once, the second what each core type does on its own, and neither is
 interpretable without knowing the other.
 
-`cpu-bench` warns if the load average suggests the machine is busy, if the
+`cpcpub` warns if the load average suggests the machine is busy, if the
 working set does not clear last-level cache, and reports the DRAM controller
 clock observed during the memory phases (if it moved mid-run, the memory numbers
 carry that spread; pin the devfreq governor to `performance`).
@@ -282,9 +313,9 @@ appends the prose: what every column means, how to read the ratios, and how
 verbose prose — to **stderr**, so the result stream can be piped directly:
 
 ```sh
-./cpu-bench --per-core --tsv > cores.tsv
-./cpu-bench --json | jq '.total.int_thr_mops'
-./cpu-bench --disp-sweep --tsv | ...
+./cpcpub --per-core --tsv > cores.tsv
+./cpcpub --json | jq '.total.int_thr_mops'
+./cpcpub --disp-sweep --tsv | ...
 ```
 
 TSV emits a header line and one row per `scope`: `cpu` per core in `--per-core`,
@@ -329,7 +360,7 @@ variants are separate uploads rather than one document with a new shape, and
 nothing about the schema changes. `submit.sh` posts each element in turn.
 
 ```sh
-./cpu-bench --full --variants --json | jq -r '.[] | "\(.build.flags) \(.total.score)"'
+./cpcpub --full --variants --json | jq -r '.[] | "\(.build.flags) \(.total.score)"'
 ```
 
 ## Stability of the numbers
@@ -348,8 +379,8 @@ it, each of its 14 points getting half a phase.
 comparing them with other machines: `make serve` from the repo root, then
 
 ```sh
-./cpu-bench --full --json | ../web/submit.sh -l "my box"
-./cpu-bench --full --variants --json | ../web/submit.sh -l "my box"
+./cpcpub --full --json | ../web/submit.sh -l "my box"
+./cpcpub --full --variants --json | ../web/submit.sh -l "my box"
 ```
 
 The second uploads one run per variant, each labelled with the variant's name.

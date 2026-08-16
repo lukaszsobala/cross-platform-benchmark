@@ -5,13 +5,13 @@
     python3 tests/test_contract.py      # against testdata/ alone
 
 The two halves of this repo share no code. They meet at exactly one place: the
-JSON document `cpu-bench --json` writes and the hub ingests. So nothing but this
+JSON document `cpcpub --json` writes and the hub ingests. So nothing but this
 test notices when one side grows a field the other never reads -- and the hub's
 own tests cannot notice, because their fixture is hand-written and would go on
 agreeing with itself forever.
 
 Runs against the committed sample in testdata/, and additionally against a live
-run of $CPU_BENCH_BIN when that is set (which is what `make check` does, so the
+run of $CPCPUB_BIN when that is set (which is what `make check` does, so the
 binary under test is the one just built rather than whatever produced the
 sample).
 
@@ -22,6 +22,7 @@ schema/cpu-bench-1.md, which is the moment to notice the other side needs it
 too.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -49,7 +50,7 @@ UNCONSUMED_TOP = {"core_spread"}
 # exposing a DRAM devfreq node.
 SECTION_KEYS = {
     "build":  {"compiler", "compiler_version", "cc", "flags", "target",
-               "vectorize", "fma"},
+               "binary_sha256", "vectorize", "fma"},
     "system": {"sysname", "release", "machine", "cpus", "cpu_models"},
     "config": {"threads", "seconds_per_phase", "reps", "warmup_seconds",
                "mem_bytes_per_thread", "pin", "clock", "seed"},
@@ -63,6 +64,7 @@ SECTION_COLUMNS = {
     ("build", "cc"):                  "cc",
     ("build", "flags"):               "build_flags",
     ("build", "target"):              "target",
+    ("build", "binary_sha256"):       "binary_sha256",
     ("build", "vectorize"):           "vectorize",
     ("build", "fma"):                 "fma",
     ("system", "sysname"):            "sysname",
@@ -90,11 +92,11 @@ LIVE_ARGS = ["--full", "--cpus", "0", "--threads", "1",
 
 
 def documents():
-    """Every cpu-bench document this run can test, as (name, doc)."""
+    """Every cpcpub document this run can test, as (name, doc)."""
     out = []
     if SAMPLE.exists():
         out.append(("testdata/full-run.json", json.loads(SAMPLE.read_text())))
-    binary = os.environ.get("CPU_BENCH_BIN")
+    binary = os.environ.get("CPCPUB_BIN")
     if binary:
         proc = subprocess.run([binary] + LIVE_ARGS, check=True,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -119,7 +121,7 @@ class ContractTest(unittest.TestCase):
 
     def setUp(self):
         if not DOCUMENTS:
-            self.skipTest("no testdata/full-run.json and no $CPU_BENCH_BIN; "
+            self.skipTest("no testdata/full-run.json and no $CPCPUB_BIN; "
                           "run `make testdata` or `make check`")
 
     def test_schema_id(self):
@@ -166,6 +168,34 @@ class ContractTest(unittest.TestCase):
             for i, (scope, rec) in enumerate(records_of(doc)):
                 with self.subTest(f"{name}: {scope}[{i}]"):
                     self.assertEqual(set(rec), expected)
+
+    def test_binary_digest_is_a_sha256_when_present(self):
+        """What the hub matches against the digests a release published.
+
+        Absent is allowed (no /proc to read); present-but-malformed is not,
+        since the hub stores it as an identity and would match one bad value
+        against another.
+        """
+        for name, doc in DOCUMENTS:
+            digest = (doc.get("build") or {}).get("binary_sha256")
+            with self.subTest(name):
+                if digest is None:
+                    continue
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_a_live_run_hashes_the_binary_that_produced_it(self):
+        """The benchmark's own SHA-256, checked against the library one.
+
+        This is the whole verification chain in one assertion: if these two
+        disagree, every digest the hub is holding names a file that does not
+        exist and nothing will ever be verified.
+        """
+        binary = os.environ.get("CPCPUB_BIN")
+        live = [d for n, d in DOCUMENTS if n.startswith("live:")]
+        if not binary or not live:
+            self.skipTest("no $CPCPUB_BIN; `make check` runs this")
+        want = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
+        self.assertEqual(live[0]["build"].get("binary_sha256"), want)
 
     def test_every_metric_has_a_column(self):
         """/api/metrics may only advertise metrics the leaderboard can sort on."""

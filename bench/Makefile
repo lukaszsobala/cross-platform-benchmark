@@ -1,5 +1,5 @@
 # Simple cross-arch CPU benchmark
-# Usage: make && ./cpu-bench --help
+# Usage: make && ./cpcpub --help
 
 CC ?= cc
 # Assume GCC 13+ with C2x support
@@ -22,7 +22,7 @@ endif
 # flags -- no pragma switches them per function -- so a binary that can measure
 # more than one of them has to compile the kernels more than once. src/kernels.c
 # is compiled once per row below and all four objects are linked into the one
-# binary; `./cpu-bench --variants` then runs them in turn.
+# binary; `./cpcpub --variants` then runs them in turn.
 #
 # The flags are named once, here, and reach the result document by being both
 # put on the command line and passed in as -DKV_FLAGS, so a run cannot report a
@@ -57,10 +57,11 @@ ifeq ($(HOST_ARCH),riscv64)
 	NATIVE_MTUNE :=
 endif
 
-TARGET := cpu-bench
-OBJS   := src/bench.o $(addprefix src/kernels-,$(addsuffix .o,$(VARIANTS)))
+TARGET := cpcpub
+OBJS   := src/bench.o src/sha256.o \
+          $(addprefix src/kernels-,$(addsuffix .o,$(VARIANTS)))
 
-.PHONY: all clean native sg2000 sg2000-xthead riscv-v FORCE
+.PHONY: all clean native sg2000 sg2000-xthead riscv-v rva23 FORCE
 
 all: $(TARGET)
 
@@ -103,6 +104,48 @@ sg2000:
 sg2000-xthead:
 	$(MAKE) MARCH=rv64imafdc_zicsr_zifencei_xtheadvector all
 
+# RVA23U64 -- the RISC-V profile Ubuntu 26.04 takes as its riscv64 baseline.
+#
+# A floor, not a tuning knob. Every extension below is *mandatory* in the
+# profile, so the compiler emits V 1.0, Zba/Zbb/Zbs, Zcb, Zfa, Zicond and the
+# rest freely, and the result is a binary that dies with SIGILL on anything
+# older -- including every board the sg2000 targets above exist for. Build it
+# for hardware that implements RVA23, not "just in case": rv64gc (the plain
+# default build) is what runs everywhere.
+#
+# Two spellings, because toolchains disagree about profile names. LLVM 19+
+# accepts `-march=rva23u64`; GCC 15 does not ("ISA string must begin with rv32
+# or rv64") and needs the profile written out. The probe below prefers the name
+# and falls back to the string, so one target covers both -- and the flags are
+# recorded in the result either way, so a reader can see which was used.
+#
+# The explicit string is RVA23U64's mandatory set. Extensions with no codegen
+# effect (Ziccif, Ziccrse, Za64rs and friends) are named anyway: -march is the
+# only written statement of what this binary requires of a CPU, and a partial
+# one invites a build that runs on less than the profile promises.
+# Assembled from named groups rather than written as one 230-character word:
+# a `\` continuation would not do it, since make joins those with a space and a
+# space is what separates an ISA string from a syntax error.
+RVA23_PROFILE := rva23u64
+# No trailing comments on these: make keeps the spaces in front of a `#`, and
+# they would end up inside the ISA string. RVA23_BASE is RV64GC plus vector 1.0.
+RVA23_BASE     := rv64imafdcv
+RVA23_CACHE    := _zic64b_zicbom_zicbop_zicboz_zicclsm_ziccamoa_ziccif_ziccrse
+RVA23_COUNTERS := _zicntr_zihpm
+RVA23_SCALAR   := _zicsr_zifencei_zicond_zimop_zcmop_zcb_zfa_zfhmin_zawrs_za64rs
+RVA23_HINTS    := _zihintntl_zihintpause_zkt
+RVA23_BITMANIP := _zba_zbb_zbs
+RVA23_VECTOR   := _zvbb_zvfhmin_zvkt
+RVA23_ISA := $(RVA23_BASE)$(RVA23_CACHE)$(RVA23_COUNTERS)$(RVA23_SCALAR)$(RVA23_HINTS)$(RVA23_BITMANIP)$(RVA23_VECTOR)
+
+# Deferred (`=`, not `:=`) so the compiler is only probed when this target is
+# the one being built -- every other build pays nothing for it.
+RVA23_MARCH = $(shell $(CC) -march=$(RVA23_PROFILE) -E -x c /dev/null \
+                  >/dev/null 2>&1 && echo $(RVA23_PROFILE) || echo $(RVA23_ISA))
+
+rva23:
+	$(MAKE) MARCH=$(RVA23_MARCH) all
+
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
 
@@ -111,9 +154,15 @@ $(TARGET): $(OBJS)
 # passing is otherwise invisible in the numbers. These are the flags every
 # variant shares; the per-variant pair is baked into each kernels object below
 # and the two are concatenated at report time.
-src/bench.o: src/bench.c src/kernels.h $(FLAGSTAMP)
+src/bench.o: src/bench.c src/kernels.h src/sha256.h $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DBUILD_CC='"$(CC)"' -DBUILD_FLAGS='"$(CFLAGS)"' -c -o $@ $<
+
+# Not measured code, so it gets the shared flags and none of the variant ones:
+# what it hashes is the binary, and how fast it does that is nobody's result.
+src/sha256.o: src/sha256.c src/sha256.h $(FLAGSTAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 # One object per variant, from the one source. KV_ID suffixes every symbol so
 # the four copies coexist and a disassembly says which is which.

@@ -316,6 +316,23 @@ details.more .meta { margin: 0.5rem 0 0.25rem; }
 }
 .authmsg { margin: 0.25rem 0 0; font-size: 0.85rem; min-height: 1.2em; }
 
+/* What someone other than the submitter signed. `.badge` is the strong tier,
+   `.weak` the one whose machine belongs to the submitter, and `.claim` is not a
+   badge at all -- it is the run's own word about itself, so it gets the muted
+   look of a label rather than the outline of a mark. */
+.badge {
+  display: inline-block; font-size: 0.68rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap;
+  color: var(--ok); border: 1px solid currentColor; border-radius: 999px;
+  padding: 0 0.4rem; margin-left: 0.4rem; vertical-align: 0.1em;
+}
+.badge.weak { color: var(--muted); font-weight: 500; }
+.claim {
+  display: inline-block; font-size: 0.7rem; color: var(--muted);
+  margin-left: 0.4rem; white-space: nowrap;
+}
+h2 > .badge, p > .badge { vertical-align: 0.15em; }
+
 /* who uploaded a row, under the machine name */
 .by {
   display: inline-block; background: none; border: 0; padding: 0; margin-top: 0.1rem;

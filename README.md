@@ -1,6 +1,6 @@
 # cross-platform-benchmark
 
-`cpu-bench` — a small, portable CPU benchmark in C, and a place to compare what
+`cpcpub` — a small, portable CPU benchmark in C, and a place to compare what
 it measures.
 
 It runs a set of tiny kernels for a fixed wall-clock slice each and reports the
@@ -12,10 +12,10 @@ the whole machine at once. Nothing beyond libc, libm and pthreads; C2x with
 GCC 13+ or Clang, on x86_64, AArch64 and RISC-V.
 
 ```sh
-make                                            # build -> bench/cpu-bench
-bench/cpu-bench --full                          # measure this machine
-bench/cpu-bench --full --variants               # ...once per build variant
-bench/cpu-bench --full --json | web/submit.sh -l "my box"
+make                                            # build -> bench/cpcpub
+bench/cpcpub --full                          # measure this machine
+bench/cpcpub --full --variants               # ...once per build variant
+bench/cpcpub --full --json | web/submit.sh -l "my box"
 ```
 
 One binary carries four compilations of the kernels — auto-vectorization off/on
@@ -29,13 +29,21 @@ Read it before reading a result — several of the metrics say something other
 than what their name suggests.
 
 The top-level `Makefile` forwards the benchmark's tuning targets and variables
-unchanged, so `make native`, `make sg2000` and `make MARCH=x86-64-v3` work from
-here as well as from [bench/](bench/).
+unchanged, so `make native`, `make sg2000`, `make rva23` and
+`make MARCH=x86-64-v3` work from here as well as from [bench/](bench/).
+
+`make rva23` builds for **RVA23U64**, the RISC-V profile Ubuntu 26.04 takes as
+its riscv64 baseline. It is a floor rather than a tuning hint — the binary uses
+RVV 1.0, `Zba`/`Zbb`/`Zbs`, `Zcb`, `Zfa` and `Zicond` freely and will not start
+on anything older, so plain `make` (`rv64gc`) remains the build that runs
+everywhere. GCC still refuses profile names in `-march`, so the target probes
+the compiler and writes the profile out when it has to; see
+[bench/README.md](bench/README.md#rva23).
 
 ## The results hub
 
 [web/](web/) is an optional addition: a Python-stdlib service that collects
-`cpu-bench --json` uploads and puts them side by side. It is not needed to run
+`cpcpub --json` uploads and puts them side by side. It is not needed to run
 the benchmark. See [web/README.md](web/README.md).
 
 ```sh
@@ -59,9 +67,42 @@ you upload, withdrawing them from any browser rather than only from the one
 holding a delete token, and the upload token that makes the line above work.
 Anonymous uploads are not second-class and are not going away.
 
+## Verified results
+
+[The release workflow](.github/workflows/release.yml) builds `cpcpub` for
+every target on GitHub's runners — x86-64, x86-64-v3, aarch64, rv64gc and
+RVA23 — smoke-tests each one (under qemu where it is cross-built), and attaches
+the binaries with a `SHA256SUMS` and a `verified-builds.json` manifest to the
+release.
+
+A benchmark cannot vouch for its own numbers. Any key inside a public binary can
+be read out of it, so nothing running on a machine its owner controls produces a
+figure that owner cannot forge. The digest the benchmark reports
+(`build.binary_sha256`) therefore says which binary a result *claims* — useful,
+self-reported, and shown as grey text rather than a badge.
+
+What is binding is [the measure workflow](.github/workflows/measure.yml). It
+runs a published binary with fixed arguments and asks GitHub for an OIDC token
+whose audience is the SHA-256 of the result it just produced, so GitHub signs
+those exact bytes. Change a digit and the signature no longer covers it; fork
+the workflow and the `job_workflow_ref` claim names your fork. On GitHub's own
+runners nothing in the chain belongs to the submitter, and the hub marks the run
+**verified**; on a self-hosted runner the signatures still hold but the machine
+does not, so it is marked **attested** and never confused with the first.
+
+```yaml
+  measure:
+    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.1.0
+    permissions: { id-token: write, contents: read }
+    with: { hub: https://hub.example, runner: self-hosted, label: "my box" }
+```
+
+Ordinary uploads need none of this, are not second-class, and rank the same.
+See [web/README.md](web/README.md#what-a-result-proves).
+
 ## Keeping the two halves in step
 
-The benchmark writes `cpu-bench --json`; the hub ingests it and nothing else.
+The benchmark writes `cpcpub --json`; the hub ingests it and nothing else.
 They share no code, so a field added on one side and forgotten on the other
 fails no compiler — the measurement is simply taken and dropped, or a column
 fills with `NULL` forever. [tests/test_contract.py](tests/test_contract.py)
