@@ -103,10 +103,15 @@ extern const kernel_set_t kernels_vector_fma;
 // In either case the two variants are the same machine code and running both
 // measures the same build twice. GCC defines __FP_FAST_FMA exactly when an FMA
 // is one instruction, which is the question being asked here.
+// __VSX__/__ALTIVEC__ is POWER's. __VX__ is the IBM Z vector facility, on by
+// default from z13; not __VEC__, which GCC defines only under -mzvector and
+// means the vector *language extension* rather than the hardware. A build for
+// a pre-z13 baseline defines neither and correctly reports no SIMD.
 #if defined(__SSE2__) || defined(__AVX__) || defined(__aarch64__) || \
     defined(__ARM_NEON) || defined(__riscv_vector) || \
     defined(__riscv_xtheadvector) || \
-    defined(__loongarch_sx) || defined(__loongarch_asx)
+    defined(__loongarch_sx) || defined(__loongarch_asx) || \
+    defined(__VSX__) || defined(__ALTIVEC__) || defined(__VX__)
 #define TARGET_HAS_SIMD 1
 #else
 #define TARGET_HAS_SIMD 0

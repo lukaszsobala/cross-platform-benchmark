@@ -719,6 +719,18 @@ static const char *arch_string(void) {
 #elif defined(__loongarch64) || \
       (defined(__loongarch__) && defined(__loongarch_grlen) && __loongarch_grlen == 64)
     return "loongarch64";
+// The two endiannesses of 64-bit POWER are not interchangeable binaries and do
+// not share an ABI, so they are separate targets rather than one with a note.
+// Every current distribution ships the little-endian one.
+#elif defined(__powerpc64__) || defined(__PPC64__)
+#if defined(__LITTLE_ENDIAN__) || \
+    (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    return "ppc64le";
+#else
+    return "ppc64";
+#endif
+#elif defined(__s390x__)
+    return "s390x";
 #else
     return "unknown";
 #endif
@@ -2015,7 +2027,11 @@ int main(int argc, char **argv) {
     // reader comparing a Mac against a pinned Linux box needs to see that
     // difference; a per-core sweep without pinning is measuring whichever core
     // the scheduler chose, repeatedly.
-    if (pin && !PLAT_HAS_AFFINITY) {
+    // #if rather than `if (pin && !PLAT_HAS_AFFINITY)`: the capability is a
+    // compile-time constant, and a compiler that says so (-Wconstant-logical-
+    // operand) is right to.
+#if !PLAT_HAS_AFFINITY
+    if (pin) {
         pin = 0;
         fprintf(msg(), "NOTE: this system does not support pinning a thread to "
                        "a CPU, so threads run wherever the scheduler puts "
@@ -2023,6 +2039,7 @@ int main(int argc, char **argv) {
                 (per_core || full) ? " -- per-core figures identify a request, "
                                      "not a core" : "");
     }
+#endif
 
     // --disp-sweep prints a curve per CPU, not a summary row, so there is
     // nothing to stack variants into; ask for one explicitly instead.

@@ -206,7 +206,12 @@ static inline int plat_pin_self(int cpu) {
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET((unsigned int)cpu, &set);
-    return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0 ? 0 : -1;
+    // sched_setaffinity(2) with a pid of 0, not pthread_setaffinity_np: on
+    // Linux this call has always been per-thread and 0 means the calling
+    // thread, so the two are the same system call -- but bionic does not
+    // declare the pthread spelling, and Android is a Linux the benchmark
+    // builds for.
+    return sched_setaffinity(0, sizeof(set), &set) == 0 ? 0 : -1;
 #elif defined(_WIN32)
     WORD group = 0;
     BYTE number = 0;

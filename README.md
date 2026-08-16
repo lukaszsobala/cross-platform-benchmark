@@ -8,66 +8,75 @@ rate achieved: integer and floating-point latency and throughput (and the
 instruction-level parallelism their ratio exposes), integer multiply, memory
 bandwidth and random-access latency, the memory-level parallelism behind it, and
 indirect-call throughput and branch-predictor capacity. One core, every core, or
-the whole machine at once. Nothing beyond libc, libm and pthreads; C2x with
-GCC 13+ or Clang, on x86_64, AArch64, RISC-V and LoongArch, on Linux, macOS
-(Apple Silicon) and Windows (x64 and Arm64, built with mingw-w64).
+the whole machine at once.
+
+## Get it
+
+Download a binary from [the latest release][rel] — each is self-contained and
+needs nothing installed:
+
+| | Linux | macOS | Windows | Android |
+| --- | --- | --- | --- | --- |
+| x86-64 | `linux-x86_64`, `linux-x86_64-v3` | `macos-x86_64` | `windows-x86_64.exe`, `windows-x86_64-v3.exe` | |
+| Arm64 | `linux-aarch64` | `macos-arm64` | `windows-arm64.exe` | `android-arm64` |
+| RISC-V | `linux-riscv64`, `linux-riscv64-rva23` | | | |
+| Other | `linux-loongarch64`, `linux-ppc64le`, `linux-s390x` | | | |
+
+Every asset name is prefixed `cpcpub-`. Check what you downloaded against the
+`SHA256SUMS` published beside it:
 
 ```sh
-make                                            # build -> bench/cpcpub
-bench/cpcpub --full                          # measure this machine
-bench/cpcpub --full --variants               # ...once per build variant
-bench/cpcpub --full --json | web/submit.sh -l "my box"
+base=https://github.com/lukaszsobala/cross-platform-benchmark/releases/latest/download
+curl -fLO $base/cpcpub-linux-x86_64
+curl -fLs $base/SHA256SUMS | sha256sum -c --ignore-missing
+chmod +x cpcpub-linux-x86_64
+```
+
+The `-v3` and `-rva23` builds need a newer ISA than the plain ones and will not
+start on older hardware; the unsuffixed build runs everywhere. On macOS a binary
+fetched by a browser is quarantined and needs
+`xattr -d com.apple.quarantine cpcpub-macos-arm64` before it will run — `curl`
+does not set that attribute.
+
+Or build it. Nothing beyond libc, libm and pthreads; C2x with GCC 13+ or Clang:
+
+```sh
+make                # -> bench/cpcpub
+make native         # tuned for this machine, and comparable with nothing else
+```
+
+`make rva23`, `make loongarch`, `make sg2000` and `make MARCH=x86-64-v3` select
+other targets; see [bench/README.md](bench/README.md).
+
+## Run it
+
+```sh
+bench/cpcpub --full                 # one core, every core, and the machine at once
+bench/cpcpub --full --variants      # ...once per build variant
+bench/cpcpub --full -v              # with every metric explained
+bench/cpcpub --help
 ```
 
 One binary carries four compilations of the kernels — auto-vectorization off/on
-crossed with FMA contraction off/on — and `--variants` runs each of them that
-the host ISA can tell apart, then compares them. The default is still the
-scalar, unfused build that cross-ISA comparisons need.
+crossed with FMA contraction off/on — and `--variants` runs each one the host
+ISA can tell apart, then compares them. The default is the scalar, unfused build
+that cross-ISA comparisons need.
 
 **[bench/README.md](bench/README.md) is the benchmark**: how each phase works,
-what every metric means, and what a number may and may not be compared against.
-Read it before reading a result — several of the metrics say something other
-than what their name suggests.
-
-The top-level `Makefile` forwards the benchmark's tuning targets and variables
-unchanged, so `make native`, `make sg2000`, `make rva23`, `make loongarch` and
-`make MARCH=x86-64-v3` work from here as well as from [bench/](bench/).
-
-**macOS builds and runs, with one caveat that changes a number rather than
-omitting it: nothing on macOS can bind a thread to a CPU.** `cpcpub` turns
-pinning off there and records `pin: false`, so `--per-core` sweeps requests
-rather than cores — which on an asymmetric Apple part is not the P-core versus
-E-core reading it looks like. Windows has no such gap: it pins, and reports
-where each thread ran. What each platform can and cannot answer is tabulated in
-[bench/README.md](bench/README.md#platforms).
-
-Building for Windows needs a mingw-w64 toolchain and nothing else — the
-Makefile notices the target and takes care of `.exe` and `-static` itself:
-
-```sh
-make -C bench CC=x86_64-w64-mingw32-gcc MARCH=x86-64 MTUNE=generic
-make -C bench CC=aarch64-w64-mingw32-clang MARCH=armv8-a MTUNE=generic  # llvm-mingw
-```
-
-`make rva23` builds for **RVA23U64**, the RISC-V profile Ubuntu 26.04 takes as
-its riscv64 baseline. It is a floor rather than a tuning hint — the binary uses
-RVV 1.0, `Zba`/`Zbb`/`Zbs`, `Zcb`, `Zfa` and `Zicond` freely and will not start
-on anything older, so plain `make` (`rv64gc`) remains the build that runs
-everywhere. GCC still refuses profile names in `-march`, so the target probes
-the compiler and writes the profile out when it has to; see
-[bench/README.md](bench/README.md#rva23).
+what every metric means, what each platform can and cannot report, and what a
+number may and may not be compared against. Read it before reading a result —
+several of the metrics say something other than what their name suggests.
+`--json` output is specified in [schema/cpu-bench-1.md](schema/cpu-bench-1.md).
 
 ## The results hub
 
 [web/](web/) is an optional addition: a Python-stdlib service that collects
-`cpcpub --json` uploads and puts them side by side. It is not needed to run
-the benchmark. See [web/README.md](web/README.md).
+`cpcpub --json` uploads and puts them side by side. It is not needed to run the
+benchmark. See [web/README.md](web/README.md).
 
 ```sh
 make serve          # the hub on http://127.0.0.1:8080
 make submit         # build, measure, upload -- one row on the board
-make check          # contract test + hub tests
-make testdata       # regenerate testdata/full-run.json on this machine
 ```
 
 Submitting is a drop target on the *Submit a result* tab — drag `run.json` onto
@@ -79,54 +88,31 @@ web/submit.sh --save -u https://hub.example -t YOUR-TOKEN   # once per machine
 make submit LABEL="workstation, quiet"                      # every time after
 ```
 
-An account on the hub is optional and adds three things: your name on the runs
-you upload, withdrawing them from any browser rather than only from the one
-holding a delete token, and the upload token that makes the line above work.
-Anonymous uploads are not second-class and are not going away.
+An account is optional and adds three things: your name on the runs you upload,
+withdrawing them from any browser rather than only from the one holding a delete
+token, and the upload token that makes the line above work. Anonymous uploads
+are not second-class and rank the same.
 
-## Verified results
+## What a result on the board means
 
-[The release workflow](.github/workflows/release.yml) builds `cpcpub` for
-every target on GitHub's runners — Linux x86-64, x86-64-v3, aarch64, rv64gc,
-RVA23 and loongarch64; macOS on Apple Silicon; Windows on x86-64, x86-64-v3 and
-Arm64 — smoke-tests each one (under qemu where it is cross-built), and attaches
-the binaries with a `SHA256SUMS` and a `verified-builds.json` manifest to the
-release.
+A run carries the SHA-256 of the binary that produced it, so a run made with a
+published release build is labelled with that release — in grey, as the run's
+own word about itself, because a benchmark cannot vouch for its own numbers.
 
-A benchmark cannot vouch for its own numbers. Any key inside a public binary can
-be read out of it, so nothing running on a machine its owner controls produces a
-figure that owner cannot forge. The digest the benchmark reports
-(`build.binary_sha256`) therefore says which binary a result *claims* — useful,
-self-reported, and shown as grey text rather than a badge.
-
-What is binding is [the measure workflow](.github/workflows/measure.yml). It
-runs a published binary with fixed arguments and asks GitHub for an OIDC token
-whose audience is the SHA-256 of the result it just produced, so GitHub signs
-those exact bytes. Change a digit and the signature no longer covers it; fork
-the workflow and the `job_workflow_ref` claim names your fork. On GitHub's own
-runners nothing in the chain belongs to the submitter, and the hub marks the run
-**verified**; on a self-hosted runner the signatures still hold but the machine
-does not, so it is marked **attested** and never confused with the first.
+Two stronger marks come from [the measure workflow](.github/workflows/measure.yml),
+which runs a published binary with fixed arguments and has GitHub sign the exact
+result bytes. Call it from your own repository to measure your own machine:
 
 ```yaml
   measure:
-    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.2.0
+    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.3.0
     permissions: { id-token: write, contents: read }
     with: { hub: https://hub.example, runner: self-hosted, label: "my box" }
 ```
 
-Ordinary uploads need none of this, are not second-class, and rank the same.
-See [web/README.md](web/README.md#what-a-result-proves).
+On GitHub's own runners nothing in the chain belongs to the submitter and the
+run is marked **verified**. On a self-hosted runner the signatures still hold
+but the machine does not, so it is marked **attested** and never confused with
+the first. Ordinary uploads need none of this and rank the same.
 
-## Keeping the two halves in step
-
-The benchmark writes `cpcpub --json`; the hub ingests it and nothing else.
-They share no code, so a field added on one side and forgotten on the other
-fails no compiler — the measurement is simply taken and dropped, or a column
-fills with `NULL` forever. [tests/test_contract.py](tests/test_contract.py)
-catches that: it runs the binary just built, feeds its real output through the
-hub's validation and storage, and asserts the record fields match exactly in
-both directions. It falls back to [testdata/full-run.json](testdata/), a
-committed sample, so the check still means something without a compiler.
-[schema/cpu-bench-1.md](schema/cpu-bench-1.md) is the written half of the same
-contract — read it before changing anything `--json` prints.
+[rel]: https://github.com/lukaszsobala/cross-platform-benchmark/releases/latest

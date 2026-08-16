@@ -128,6 +128,7 @@ jobs:
             cross: riscv64-linux-gnu
             vars: MARCH=rv64gc
             target: riscv64
+            qemu: riscv64
             qemu-cpu: rv64
           # RVA23U64: the profile Ubuntu 26.04 takes as its riscv64 baseline.
           # `make rva23` picks whichever -march spelling this toolchain knows,
@@ -142,6 +143,7 @@ jobs:
             make-target: rva23
             min-gcc: 15
             target: riscv64
+            qemu: riscv64
             qemu-cpu: rva23u64
           # LoongArch: the base loongarch64 ISA (LA64 with the lp64d ABI), not
           # la464 or la664, so the artifact is not tied to one vendor's core.
@@ -158,6 +160,7 @@ jobs:
             # GNU triplet and qemu both call it loongarch64. Only the .deb
             # names use the short one, so it is named here rather than derived.
             libc-arch: loong64
+            qemu: loongarch64
             qemu-cpu: la464
           # Apple Silicon. A native arm64 macOS runner, because there is no
           # cross-toolchain for a Mach-O target here and nothing to emulate it
@@ -173,6 +176,16 @@ jobs:
             asset: cpcpub-macos-arm64
             target: aarch64
             deployment-target: "11.0"
+          # Intel Mac. The same -march as the two Linux x86 rows, so the three
+          # operating systems are comparable on one CPU. 10.15 is the floor
+          # worth publishing: Catalina is the first macOS that dropped 32-bit,
+          # so nothing older could run this anyway.
+          - name: macos-x86_64
+            runs-on: macos-15-intel
+            asset: cpcpub-macos-x86_64
+            vars: MARCH=x86-64 MTUNE=generic
+            target: x86_64
+            deployment-target: "10.15"
           # Windows, with the same -march pair as the two Linux x86 rows above
           # and for the same reasons: a portable baseline, and a v3 build where
           # the four variants differ. Keeping the flags identical is what makes
@@ -213,6 +226,51 @@ jobs:
             target: aarch64
             llvm-mingw: "20260616"
             llvm-mingw-sha256: 312593669435bd0bfc1a43ac3fba23c8b27e0610bade88b2738e5a01702a99ba
+          # 64-bit POWER, little-endian. -mcpu, not -march, because that is the
+          # spelling PowerPC GCC takes. power8 is the right floor and a step
+          # *down* from this image's default of power9: the little-endian ELFv2
+          # ABI begins at POWER8, so every ppc64le machine in existence runs it.
+          - name: ppc64le
+            runs-on: ubuntu-24.04
+            asset: cpcpub-linux-ppc64le
+            cross: powerpc64le-linux-gnu
+            libc-arch: ppc64el
+            vars: MCPU=power8
+            target: ppc64le
+            qemu: ppc64le
+            qemu-cpu: power9
+          # IBM Z, and the only big-endian artifact published here -- which is
+          # the interesting part, since nothing else in the matrix would notice
+          # a byte-order assumption. z13 is both this image's default and the
+          # first Z with the vector facility, so the four build variants have
+          # something to differ about.
+          #
+          # `-cpu max` rather than a named model: qemu-user refuses `-cpu z14`
+          # outright because TCG does not implement that model's crypto
+          # facilities, and a smoke test that cannot start is not one.
+          - name: s390x
+            runs-on: ubuntu-24.04
+            asset: cpcpub-linux-s390x
+            cross: s390x-linux-gnu
+            vars: MARCH=z13
+            target: s390x
+            qemu: s390x
+            qemu-cpu: max
+          # Android. Statically linked, for two reasons that happen to coincide:
+          # one artifact then runs across Android versions whose bionic differs,
+          # and a static aarch64 ELF is just an aarch64 ELF, so qemu can run it
+          # here without an Android userland to point at.
+          #
+          # The NDK is on the image already. API 29 is the floor because that is
+          # where bionic gained getloadavg(); everything else the benchmark asks
+          # of a libc has been there far longer.
+          - name: android-arm64
+            runs-on: ubuntu-24.04
+            asset: cpcpub-android-arm64
+            ndk-api: "29"
+            vars: MARCH=armv8-a MTUNE=generic LDFLAGS='-static -s'
+            target: aarch64
+            qemu: aarch64
 
     steps:
       - uses: actions/checkout@v7
@@ -226,8 +284,25 @@ jobs:
           MIN_GCC: ${{ matrix.min-gcc }}
           LLVM_MINGW: ${{ matrix.llvm-mingw }}
           LLVM_MINGW_SHA256: ${{ matrix.llvm-mingw-sha256 }}
+          NDK_API: ${{ matrix.ndk-api }}
         run: |
           set -eux
+          # Android's toolchain is on the image already, at whatever version
+          # ANDROID_NDK_ROOT points at -- which is why the compiler this row
+          # ended up with is read back out of the binary's own output later
+          # rather than asserted here. qemu is for the smoke test: the artifact
+          # is static, so an aarch64 emulator is all it needs.
+          if [ -n "$NDK_API" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends qemu-user
+            ndk="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            [ -d "$ndk" ] || { echo "no NDK at $ndk" >&2; exit 1; }
+            "$ndk/aarch64-linux-android$NDK_API-clang" --version
+            echo "$ndk" >> "$GITHUB_PATH"
+            echo "CC=aarch64-linux-android$NDK_API-clang" >> "$GITHUB_ENV"
+            echo "READELF=$ndk/llvm-readelf" >> "$GITHUB_ENV"
+            exit 0
+          fi
           if [ "$RUNNER_OS" = "Windows" ]; then
             # Neither compiler answers to `cc` here, so CC is always named. So
             # is OBJDUMP: the import-table check below is the same check on both
@@ -313,6 +388,8 @@ jobs:
         env:
           CROSS: ${{ matrix.cross }}
           NAME: ${{ matrix.name }}
+          NDK_API: ${{ matrix.ndk-api }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -eux
           # Mach-O has no glibc and no readelf. The equivalent published fact is
@@ -321,8 +398,15 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then
             otool -L "$BIN"
             vtool -show-build "$BIN" || otool -l "$BIN" | grep -A4 LC_BUILD_VERSION
+            # Apple's name for the architecture, not ours, and one of them per
+            # row: a fat binary or the wrong slice both show up here.
+            case "$TARGET" in
+              aarch64) want=arm64 ;;
+              x86_64)  want=x86_64 ;;
+              *) echo "no macOS arch known for target $TARGET" >&2; exit 1 ;;
+            esac
             archs=$(lipo -archs "$BIN")
-            [ "$archs" = "arm64" ] || { echo "expected arm64, got $archs" >&2; exit 1; }
+            [ "$archs" = "$want" ] || { echo "expected $want, got $archs" >&2; exit 1; }
             # arm64 macOS refuses to execute an unsigned binary at all. The
             # linker signs ad hoc; if that ever stops happening, the smoke test
             # below would fail with a signal rather than a message, so check here.
@@ -353,6 +437,20 @@ jobs:
             ! grep -q '^lib' dlls.txt || {
               echo "imports a toolchain DLL; the -static in bench/Makefile did " \
                    "not take effect" >&2; exit 1; }
+            exit 0
+          fi
+          # Android. There is no glibc floor here because there is no dynamic
+          # libc: the row links statically, which is what lets one artifact run
+          # across Android versions with different bionics and what lets it be
+          # smoke-tested under qemu at all. So the assertion is that it stayed
+          # that way -- a dynamically linked NDK build would pass every other
+          # check in this job and fail on a device.
+          if [ -n "$NDK_API" ]; then
+            if "$READELF" -d "$BIN" | grep -q NEEDED; then
+              echo "expected a static binary; it has shared-library deps" >&2
+              exit 1
+            fi
+            echo "statically linked, no shared-library dependencies"
             exit 0
           fi
           READELF="${CROSS:+$CROSS-}readelf"
@@ -429,12 +527,15 @@ jobs:
       - name: Smoke test
         env:
           CROSS: ${{ matrix.cross }}
+          QEMU: ${{ matrix.qemu }}
           QEMU_CPU: ${{ matrix.qemu-cpu }}
         run: |
           set -eux
+          # -L only where there is a cross sysroot to point at: the Android row
+          # is emulated too, but its binary is static and has nothing to look up.
           RUN=""
-          if [ -n "$CROSS" ]; then
-            RUN="qemu-${{ matrix.target }} -cpu $QEMU_CPU -L /usr/$CROSS"
+          if [ -n "$QEMU" ]; then
+            RUN="qemu-$QEMU ${QEMU_CPU:+-cpu $QEMU_CPU} ${CROSS:+-L /usr/$CROSS}"
           fi
           $RUN "./$BIN" --list-variants
           $RUN "./$BIN" --full --cpus 0 --threads 1 \
@@ -479,7 +580,9 @@ jobs:
           # than repeated from the matrix -- `make rva23` chooses its -march at
           # build time, so the matrix does not know it.
           flags = doc["build"]["flags"]
-          march = re.search(r"-march=(\S+)", flags)
+          # Either spelling: PowerPC GCC has no -march and takes -mcpu, and the
+          # manifest would otherwise publish a null where that row has a floor.
+          march = re.search(r"-m(?:arch|cpu)=(\S+)", flags)
           info = {"filename": os.environ["ASSET"],
                   "target": os.environ["TARGET"],
                   "march": march.group(1) if march else None,

@@ -1,10 +1,14 @@
 # cpcpub
 
 A small, portable CPU benchmark in C (C2x, GCC 13+ or Clang) for 64-bit x86_64,
-AArch64, RISC-V and LoongArch, on Linux, macOS and Windows. No dependencies
-beyond libc, libm and pthreads — which on Windows means a mingw-w64 toolchain
-(mingw-w64 GCC for x64, llvm-mingw for Arm64); MSVC has no pthreads and is not
-supported.
+AArch64, RISC-V, LoongArch, ppc64le and s390x, on Linux (Android included),
+macOS and Windows. No dependencies beyond libc, libm and pthreads — which on
+Windows means a mingw-w64 toolchain (mingw-w64 GCC for x64, llvm-mingw for
+Arm64); MSVC has no pthreads and is not supported.
+
+32-bit targets are out of scope by design, not by accident: the throughput
+kernels keep eight independent 64-bit chains live at once, which fits an ISA
+with sixteen 64-bit registers and spills to memory on one without.
 
 ## How it works
 
@@ -154,6 +158,18 @@ make loongarch                       # LA64, base ISA
 make CFLAGS="-O3 -march=native -mtune=native"
 ```
 
+Cross-building is a matter of naming the compiler; the Makefile works out the
+rest, including the `.exe` suffix and the static link a Windows binary needs.
+PowerPC has no `-march`, so it takes `MCPU` instead.
+
+```sh
+make CC=powerpc64le-linux-gnu-gcc MCPU=power8
+make CC=s390x-linux-gnu-gcc MARCH=z13
+make CC=x86_64-w64-mingw32-gcc MARCH=x86-64 MTUNE=generic       # -> cpcpub.exe
+make CC=aarch64-w64-mingw32-clang MARCH=armv8-a                 # llvm-mingw
+make CC=aarch64-linux-android29-clang MARCH=armv8-a LDFLAGS=-static
+```
+
 ### Platforms
 
 Linux is the reference. macOS and Windows build and run, each missing some of
@@ -187,6 +203,12 @@ Windows keeps pinning, through `SetThreadGroupAffinity`, so `--per-core` means
 there what it means on Linux — including on a machine with more than 64 logical
 CPUs, where Windows splits them into groups of 64 and `--cpus` numbers straight
 through the groups as if it had not.
+
+Android is Linux and behaves as such — real pinning, `/proc`, the lot — so it
+gets no column of its own. Its binary is statically linked, which is what lets
+one file work across Android versions whose bionic differs; `uname` there says
+`Linux`, so a run is told apart from a desktop one by its `build.binary_sha256`
+rather than by `system.sysname`.
 
 Two Windows details worth knowing. The binaries are `-static`, so nothing has to
 sit beside them, but they use the Universal CRT: that is part of Windows 10 and

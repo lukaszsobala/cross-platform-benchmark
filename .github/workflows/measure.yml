@@ -41,7 +41,7 @@
 #
 #   jobs:
 #     measure:
-#       uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.2.0
+#       uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.3.0
 #       permissions:
 #         id-token: write        # required: this is what mints the token
 #         contents: read
@@ -155,10 +155,17 @@ jobs:
           EXE=""
           case "$host" in
             Linux-x86_64)     assets="cpcpub-linux-x86_64" ;;
-            Linux-aarch64)    assets="cpcpub-linux-aarch64" ;;
+            # The Android build is static, so it is also the fallback for an
+            # aarch64 Linux with a libc the glibc build cannot load against --
+            # Termux, musl, an older distribution. The loop below tries each
+            # candidate in turn and keeps the first that actually runs.
+            Linux-aarch64)    assets="cpcpub-linux-aarch64 cpcpub-android-arm64" ;;
             Linux-riscv64)    assets="cpcpub-linux-riscv64-rva23 cpcpub-linux-riscv64" ;;
             Linux-loongarch64) assets="cpcpub-linux-loongarch64" ;;
+            Linux-ppc64le)    assets="cpcpub-linux-ppc64le" ;;
+            Linux-s390x)      assets="cpcpub-linux-s390x" ;;
             Darwin-arm64)     assets="cpcpub-macos-arm64" ;;
+            Darwin-x86_64)    assets="cpcpub-macos-x86_64" ;;
             # Git Bash names itself MINGW64_NT-10.0-<build> and reports the
             # machine of the build of git that is installed, which on an Arm
             # box may not be the machine it is running on. RUNNER_ARCH comes
