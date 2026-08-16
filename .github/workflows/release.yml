@@ -154,6 +154,10 @@ jobs:
             cross: loongarch64-linux-gnu
             vars: MARCH=loongarch64
             target: loongarch64
+            # Debian, and so Ubuntu, calls this architecture loong64 while the
+            # GNU triplet and qemu both call it loongarch64. Only the .deb
+            # names use the short one, so it is named here rather than derived.
+            libc-arch: loong64
             qemu-cpu: la464
           # Apple Silicon. A native arm64 macOS runner, because there is no
           # cross-toolchain for a Mach-O target here and nothing to emulate it
@@ -265,7 +269,7 @@ jobs:
           fi
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            "libc6-dev-${{ matrix.target }}-cross" qemu-user
+            "libc6-dev-${{ matrix.libc-arch || matrix.target }}-cross" qemu-user
           # Newest first: this image's *default* cross-gcc predates several
           # RVA23 extension names, and a build that quietly targets less than
           # the profile is the one failure mode worth spending a loop on.
