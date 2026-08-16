@@ -17,11 +17,17 @@
 #
 # This is separate from what the binaries *target*. RVA23 comes from -march, not
 # from the host distribution -- but it does need a compiler new enough to know
-# the extension names, and 24.04's default riscv64 cross-gcc (13) predates
-# several of them. So the RISC-V jobs install the newest cross-gcc the image
-# offers, and the build is checked against the ELF arch attributes afterwards:
-# a toolchain that quietly produced less than RVA23 fails the job instead of
-# shipping.
+# the extension names, and the newest riscv64 cross-gcc 24.04 has is 14, which
+# rejects Zimop and Zcmop outright ("unsupported standard extension"). GCC 15 is
+# the floor for the profile, so that one row builds on 26.04 and states the floor
+# it needs; the RISC-V jobs install the newest cross-gcc their image offers, and
+# the build is checked against the ELF arch attributes afterwards, so a toolchain
+# that quietly produced less than RVA23 fails the job instead of shipping.
+#
+# The cost of that row's newer image is a higher glibc floor for that one binary
+# -- which is the right trade: RVA23 silicon is newer than 24.04 anyway, and the
+# job prints the floor it ended up with. The portable rv64gc row must stay on
+# 24.04 for the opposite reason, spelled out at the arch check below.
 #
 # Secrets: none are used and none exist to leak. The only credential in play is
 # the automatic, per-run GITHUB_TOKEN, given to `gh` through the environment --
@@ -92,10 +98,14 @@ jobs:
           # RVA23U64: the profile Ubuntu 26.04 takes as its riscv64 baseline.
           # `make rva23` picks whichever -march spelling this toolchain knows,
           # and the flags it settled on are recorded in the manifest below.
+          # On 26.04 rather than 24.04 for two things 24.04 cannot supply: a
+          # cross-gcc that knows Zimop/Zcmop (15+, min-gcc below), and a
+          # qemu-user that knows `-cpu rva23u64` for the smoke test.
           - name: riscv64-rva23
-            runs-on: ubuntu-24.04
+            runs-on: ubuntu-26.04
             cross: riscv64-linux-gnu
             make-target: rva23
+            min-gcc: 15
             target: riscv64
             qemu-cpu: rva23u64
 
@@ -108,6 +118,7 @@ jobs:
       - name: Install the toolchain
         env:
           CROSS: ${{ matrix.cross }}
+          MIN_GCC: ${{ matrix.min-gcc }}
         run: |
           set -eux
           if [ -z "$CROSS" ]; then
@@ -121,7 +132,7 @@ jobs:
           # RVA23 extension names, and a build that quietly targets less than
           # the profile is the one failure mode worth spending a loop on.
           found=""
-          for v in 15 14 13 ""; do
+          for v in 16 15 14 13 ""; do
             if sudo apt-get install -y --no-install-recommends "gcc${v:+-$v}-$CROSS"; then
               found="$CROSS-gcc${v:+-$v}"
               break
@@ -129,6 +140,16 @@ jobs:
           done
           [ -n "$found" ] || { echo "no $CROSS cross-compiler on this image" >&2; exit 1; }
           "$found" --version
+          # A row that needs a profile the compiler cannot name says so here,
+          # rather than a hundred lines later as an -march parse error.
+          if [ -n "$MIN_GCC" ]; then
+            have=$("$found" -dumpversion | cut -d. -f1)
+            [ "$have" -ge "$MIN_GCC" ] || {
+              echo "$found is gcc $have; this target needs $MIN_GCC or newer." \
+                   "Move this matrix row to an image that ships one." >&2
+              exit 1
+            }
+          fi
           echo "CC=$found" >> "$GITHUB_ENV"
 
       # CC comes from $GITHUB_ENV for a cross build and is unset for a native
