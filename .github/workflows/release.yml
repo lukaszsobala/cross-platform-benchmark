@@ -407,10 +407,12 @@ jobs:
             esac
             archs=$(lipo -archs "$BIN")
             [ "$archs" = "$want" ] || { echo "expected $want, got $archs" >&2; exit 1; }
-            # arm64 macOS refuses to execute an unsigned binary at all. The
-            # linker signs ad hoc; if that ever stops happening, the smoke test
-            # below would fail with a signal rather than a message, so check here.
-            codesign -dv "$BIN"
+            # arm64 macOS refuses to execute an unsigned binary at all, so its
+            # linker signs ad hoc; if that ever stops happening the smoke test
+            # below would fail with a signal rather than a message, which is
+            # worth catching here. Intel macOS has no such rule and its linker
+            # signs nothing, so asking there only produces "not signed at all".
+            if [ "$TARGET" = aarch64 ]; then codesign -dv "$BIN"; fi
             exit 0
           fi
           # PE has no glibc floor either. What it has is an import table, which
@@ -528,14 +530,18 @@ jobs:
         env:
           CROSS: ${{ matrix.cross }}
           QEMU: ${{ matrix.qemu }}
-          QEMU_CPU: ${{ matrix.qemu-cpu }}
+          # Deliberately not named QEMU_CPU: that is qemu-user's own environment
+          # variable for the CPU model, and exporting it empty -- which is what
+          # a row with no model does -- makes qemu refuse to start at all
+          # ("-cpu option cannot be empty") before it has read the command line.
+          QCPU: ${{ matrix.qemu-cpu }}
         run: |
           set -eux
           # -L only where there is a cross sysroot to point at: the Android row
           # is emulated too, but its binary is static and has nothing to look up.
           RUN=""
           if [ -n "$QEMU" ]; then
-            RUN="qemu-$QEMU ${QEMU_CPU:+-cpu $QEMU_CPU} ${CROSS:+-L /usr/$CROSS}"
+            RUN="qemu-$QEMU ${QCPU:+-cpu $QCPU} ${CROSS:+-L /usr/$CROSS}"
           fi
           $RUN "./$BIN" --list-variants
           $RUN "./$BIN" --full --cpus 0 --threads 1 \
