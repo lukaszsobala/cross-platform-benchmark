@@ -147,6 +147,8 @@ if [ -t 0 ]; then
     # Nothing piped in: measure this machine rather than printing usage at
     # someone who has just told us where to send the result.
     bench=$here/../bench/cpcpub
+    # Git Bash: the same build, one suffix different.
+    [ -x "$bench" ] || [ ! -x "$bench.exe" ] || bench=$bench.exe
     [ -x "$bench" ] || {
         echo "$0: nothing on stdin and no benchmark at $bench" >&2
         echo "     build it with 'make', or pipe a result document in" >&2

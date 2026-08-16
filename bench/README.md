@@ -1,8 +1,10 @@
 # cpcpub
 
 A small, portable CPU benchmark in C (C2x, GCC 13+ or Clang) for 64-bit x86_64,
-AArch64, RISC-V and LoongArch, on Linux and macOS. No dependencies beyond libc,
-libm and pthreads.
+AArch64, RISC-V and LoongArch, on Linux, macOS and Windows. No dependencies
+beyond libc, libm and pthreads — which on Windows means a mingw-w64 toolchain
+(mingw-w64 GCC for x64, llvm-mingw for Arm64); MSVC has no pthreads and is not
+supported.
 
 ## How it works
 
@@ -154,22 +156,44 @@ make CFLAGS="-O3 -march=native -mtune=native"
 
 ### Platforms
 
-Linux is the reference. macOS builds and runs, with two capabilities the
-system does not offer and the benchmark therefore does not claim:
+Linux is the reference. macOS and Windows build and run, each missing some of
+what Linux exposes — and what is missing is reported as missing, never
+approximated:
 
-| | Linux | macOS |
-| --- | --- | --- |
-| pin a thread to a CPU | yes | **no** — the scheduler owns placement |
-| `sched_getcpu()` — where a thread ran | yes | no, reported as `null` |
-| `mhz` from cpufreq, DRAM controller clock | yes | absent, reported as `null` |
-| POSIX barriers | yes | absent; [platform.h](src/platform.h) shims them |
+| | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| pin a thread to a CPU | yes | **no** — the scheduler owns placement | yes |
+| where a thread actually ran | yes | no, reported as `null` | yes |
+| `mhz` from a governor node | yes | no | no |
+| DRAM controller clock | on SoCs with devfreq | absent | absent |
+| CPU model name | `/proc/cpuinfo` | `sysctl` | registry |
+| last-level cache size | sysfs | `sysctl` | `GetLogicalProcessorInformationEx` |
+| load-average warning | yes | yes | no such number exists |
+| POSIX barriers | yes | absent; [platform.h](src/platform.h) shims them | yes |
+| `--clock raw` | yes | yes | no; falls back to `mono` and records `mono` |
 
-The first row is the one that changes a number rather than omitting it.
-`cpcpub` turns pinning off on macOS and says so, and `config.pin` in the result
-records that it was off — so `--per-core` there sweeps *requests*, not cores,
+Where there is no governor node the `MHz` column is derived from `INT-lat`,
+which is one dependent single-cycle op per cycle by construction — the tables
+mark it `~` and `mhz_src` in the JSON reads `estimated` rather than `measured`.
+
+macOS's first row is the one that changes a number rather than omitting it.
+`cpcpub` turns pinning off there and says so, and `config.pin` in the result
+records that it was off — so `--per-core` on a Mac sweeps *requests*, not cores,
 and repeatedly measures whichever core the scheduler picked. On an asymmetric
 part (every Apple Silicon chip) that means the per-core spread is not a P-core
 versus E-core reading. Whole-machine and single-thread figures are unaffected.
+
+Windows keeps pinning, through `SetThreadGroupAffinity`, so `--per-core` means
+there what it means on Linux — including on a machine with more than 64 logical
+CPUs, where Windows splits them into groups of 64 and `--cpus` numbers straight
+through the groups as if it had not.
+
+Two Windows details worth knowing. The binaries are `-static`, so nothing has to
+sit beside them, but they use the Universal CRT: that is part of Windows 10 and
+newer, and on anything older needs Microsoft's UCRT update installed. And
+`config.clock` will read `mono` even when `--clock raw` was asked for, because
+mingw-w64's `clock_gettime` has no unadjusted monotonic clock; the field records
+what was used, not what was requested.
 
 A downloaded macOS binary is quarantined by the browser that fetched it and
 will be refused on first run:
@@ -195,6 +219,14 @@ linked into the one `cpcpub`.
 | `vector-nofma` | `-ftree-vectorize -ffp-contract=off` |
 | `scalar-fma` | `-fno-tree-vectorize -ffp-contract=fast` |
 | `vector-fma` | `-ftree-vectorize -ffp-contract=fast` |
+
+Under clang each row also carries `-f[no-]slp-vectorize`, and `build.flags` in
+the result says so. It is not decoration: clang's `-fno-tree-vectorize` is an
+alias for `-fno-vectorize`, which turns off the *loop* vectorizer and leaves the
+SLP one running at `-O3` — so without the extra flag a clang `scalar-nofma`
+build comes out with SIMD in it, under the name of the build that is supposed
+not to. GCC's one switch covers both of its vectorizers and needs no help. This
+matters most where there is no choice of compiler: macOS and Windows-on-Arm.
 
 `scalar-nofma` is the default and the one cross-ISA comparisons want: no
 vectorization and no FMA contraction, so the kernel is the op sequence the

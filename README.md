@@ -9,8 +9,8 @@ instruction-level parallelism their ratio exposes), integer multiply, memory
 bandwidth and random-access latency, the memory-level parallelism behind it, and
 indirect-call throughput and branch-predictor capacity. One core, every core, or
 the whole machine at once. Nothing beyond libc, libm and pthreads; C2x with
-GCC 13+ or Clang, on x86_64, AArch64, RISC-V and LoongArch, on Linux and
-macOS (Apple Silicon).
+GCC 13+ or Clang, on x86_64, AArch64, RISC-V and LoongArch, on Linux, macOS
+(Apple Silicon) and Windows (x64 and Arm64, built with mingw-w64).
 
 ```sh
 make                                            # build -> bench/cpcpub
@@ -37,8 +37,17 @@ unchanged, so `make native`, `make sg2000`, `make rva23`, `make loongarch` and
 omitting it: nothing on macOS can bind a thread to a CPU.** `cpcpub` turns
 pinning off there and records `pin: false`, so `--per-core` sweeps requests
 rather than cores — which on an asymmetric Apple part is not the P-core versus
-E-core reading it looks like. See
+E-core reading it looks like. Windows has no such gap: it pins, and reports
+where each thread ran. What each platform can and cannot answer is tabulated in
 [bench/README.md](bench/README.md#platforms).
+
+Building for Windows needs a mingw-w64 toolchain and nothing else — the
+Makefile notices the target and takes care of `.exe` and `-static` itself:
+
+```sh
+make -C bench CC=x86_64-w64-mingw32-gcc MARCH=x86-64 MTUNE=generic
+make -C bench CC=aarch64-w64-mingw32-clang MARCH=armv8-a MTUNE=generic  # llvm-mingw
+```
 
 `make rva23` builds for **RVA23U64**, the RISC-V profile Ubuntu 26.04 takes as
 its riscv64 baseline. It is a floor rather than a tuning hint — the binary uses
@@ -78,9 +87,9 @@ Anonymous uploads are not second-class and are not going away.
 ## Verified results
 
 [The release workflow](.github/workflows/release.yml) builds `cpcpub` for
-every target on GitHub's runners — x86-64, x86-64-v3, aarch64, rv64gc, RVA23,
-loongarch64 and macOS/Apple Silicon — smoke-tests each one (under qemu where it
-is cross-built), and attaches
+every target on GitHub's runners — Linux x86-64, x86-64-v3, aarch64, rv64gc,
+RVA23 and loongarch64; macOS on Apple Silicon; Windows on x86-64, x86-64-v3 and
+Arm64 — smoke-tests each one (under qemu where it is cross-built), and attaches
 the binaries with a `SHA256SUMS` and a `verified-builds.json` manifest to the
 release.
 
@@ -101,7 +110,7 @@ does not, so it is marked **attested** and never confused with the first.
 
 ```yaml
   measure:
-    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.1.0
+    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.2.0
     permissions: { id-token: write, contents: read }
     with: { hub: https://hub.example, runner: self-hosted, label: "my box" }
 ```

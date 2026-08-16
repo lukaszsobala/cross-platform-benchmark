@@ -1,7 +1,8 @@
 // Portable CPU benchmark: integer, FP, memory and indirect-dispatch kernels for
-// 64-bit x86_64 / aarch64 / riscv64 / loongarch64, on Linux and macOS. libc and
-// pthreads only, no intrinsics. What differs between the two systems is behind
-// the capability macros in platform.h.
+// 64-bit x86_64 / aarch64 / riscv64 / loongarch64, on Linux, macOS and Windows.
+// libc and pthreads only, no intrinsics; on Windows that means a mingw-w64
+// runtime, not a POSIX layer. What differs between the systems is behind the
+// capability macros and shims in platform.h.
 //
 // This file is the driver: it selects CPUs, times batches, aggregates and
 // reports. The kernels it times live in kernels.c, which is compiled once per
@@ -19,9 +20,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
-#include <sys/utsname.h>
 #include <dirent.h>
 
+// <sys/utsname.h> used to be listed above and is now included from here: there
+// is no such header on Windows, and what stands in for it is <windows.h>, which
+// platform.h pulls in with the version guards it needs.
 #include "platform.h"
 #include "kernels.h"
 #include "sha256.h"
@@ -50,12 +53,22 @@ static FILE *msg(void) { return g_format == FMT_TEXT ? stdout : stderr; }
 // ---------------------------------------------------------------------------
 
 static clockid_t g_clock_id = CLOCK_MONOTONIC;
+// What --clock actually got, which is not always what it asked for. Reported
+// in place of the request: a result that says it used the raw clock on a system
+// with no raw clock is describing a run that did not happen.
+static int g_clock_raw = 0;
 
 static void set_clock_mode(int use_raw) {
 #ifdef CLOCK_MONOTONIC_RAW
+    g_clock_raw = use_raw ? 1 : 0;
     g_clock_id = use_raw ? CLOCK_MONOTONIC_RAW : CLOCK_MONOTONIC;
 #else
+    // No unadjusted monotonic clock here -- mingw-w64's clock_gettime offers
+    // CLOCK_MONOTONIC and nothing below it -- so --clock raw quietly gets the
+    // NTP-disciplined one. Quietly in the sense that nothing fails: the result
+    // document says "mono", because that is what was used.
     (void)use_raw;
+    g_clock_raw = 0;
     g_clock_id = CLOCK_MONOTONIC;
 #endif
 }
@@ -447,9 +460,9 @@ static void *worker(void *arg) {
     uint8_t *buf = NULL;
     const size_t nbytes = w->mem_bytes;
     if (nbytes > 0) {
-        if (posix_memalign((void **)&buf, 4096, nbytes) != 0 || !buf) {
-            perror("posix_memalign");
-            buf = NULL;
+        buf = (uint8_t *)plat_aligned_alloc(4096, nbytes);
+        if (!buf) {
+            perror("aligned alloc");
         } else {
             memset(buf, 1, nbytes);   // allocate and fault in every page
         }
@@ -652,7 +665,7 @@ static void *worker(void *arg) {
         }
     }
 
-    free(buf);
+    plat_aligned_free(buf);
     return NULL;
 }
 
@@ -661,10 +674,10 @@ static void *worker(void *arg) {
 // ---------------------------------------------------------------------------
 
 static int get_cpu_count(void) {
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    int n = plat_cpu_count();
     if (n < 1) n = 1;
     if (n > 1024) n = 1024;
-    return (int)n;
+    return n;
 }
 
 // Parse "0-3,6,8-11" into a list of CPU ids. Returns count, or -1 on error.
@@ -697,7 +710,7 @@ static int parse_cpu_list(const char *spec, int *out, int max_out) {
 static const char *arch_string(void) {
 #if defined(__x86_64__) || defined(_M_X64)
     return "x86_64";
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
     return "aarch64";
 #elif defined(__riscv) && (__riscv_xlen == 64)
     return "riscv64";
@@ -715,7 +728,23 @@ static const char *arch_string(void) {
 static void detect_cpu_models(char *out, size_t outsz) {
     if (!out || outsz == 0) return;
     out[0] = '\0';
-#ifdef __APPLE__
+#if defined(_WIN32)
+    // The registry, because Win32 has no API that returns the brand string on
+    // both architectures: CPUID is x86-only and there is no Arm equivalent,
+    // while the kernel writes what it found for every CPU it enumerated here.
+    // Processor 0's entry, matching the /proc/cpuinfo scan below in spirit --
+    // Windows does describe each logical CPU separately, but it copies one
+    // package name to all of them, so walking the rest would only de-duplicate
+    // its way back to this string.
+    DWORD len = (DWORD)outsz;
+    if (RegGetValueA(HKEY_LOCAL_MACHINE,
+                     "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     "ProcessorNameString", RRF_RT_REG_SZ, NULL, out,
+                     &len) != ERROR_SUCCESS) {
+        out[0] = '\0';
+    }
+    return;
+#elif defined(__APPLE__)
     // One name per machine: macOS reports the package, not the cluster, so an
     // asymmetric Apple part reads as "Apple M4" rather than naming its P and E
     // cores separately. hw.model ("Mac16,3") is the fallback when the brand
@@ -801,10 +830,11 @@ static const char *compiler_version(void) {
 
 // The SHA-256 of the running binary, or NULL where it cannot be taken.
 //
-// /proc/self/exe rather than argv[0]: it names the file that is actually
-// executing, whatever the shell called it and wherever $PATH found it. This is
-// what lets a results hub tell a run produced by a published build from one
-// produced by a local compile with flags nobody recorded -- see
+// The path comes from plat_executable_path(), never from argv[0]: it names the
+// file that is actually executing, whatever the shell called it and wherever
+// $PATH found it. That is what lets a results hub tell a run produced by a
+// published build from one produced by a local compile with flags nobody
+// recorded -- see
 // `build.binary_sha256` in schema/cpu-bench-1.md. It proves nothing on its own,
 // being self-reported like every other field; what it buys is that two results
 // claiming the same digest were produced by the same machine code.
@@ -817,18 +847,9 @@ static const char *binary_sha256(void) {
     if (!done) {
         done = 1;
         hex[0] = '\0';
-#if defined(__APPLE__)
-        // macOS has no /proc. _NSGetExecutablePath is the supported way to ask
-        // the loader which file it mapped; the path it returns may contain
-        // symlinks or `..`, which does not matter here because what is hashed
-        // is the contents it opens to.
         char path[4096];
-        uint32_t sz = (uint32_t)sizeof(path);
-        if (_NSGetExecutablePath(path, &sz) == 0 &&
+        if (plat_executable_path(path, sizeof path) != 0 ||
             sha256_file(path, hex) != 0) hex[0] = '\0';
-#elif PLAT_HAS_PROC
-        if (sha256_file("/proc/self/exe", hex) != 0) hex[0] = '\0';
-#endif
     }
     return hex[0] ? hex : NULL;
 }
@@ -868,10 +889,10 @@ static void print_platform(void) {
     const char *digest = binary_sha256();
     if (digest) fprintf(o, "binary: sha256:%s\n", digest);
 
-    struct utsname u;
-    if (uname(&u) == 0) {
+    plat_sysinfo_t si;
+    if (plat_sysinfo(&si) == 0) {
         fprintf(o, "system: %s %s, machine=%s, cpus=%d\n",
-                u.sysname, u.release, u.machine, get_cpu_count());
+                si.sysname, si.release, si.machine, get_cpu_count());
     }
     char models[512];
     detect_cpu_models(models, sizeof(models));
@@ -894,9 +915,10 @@ typedef struct {
 // Best-of-N rejects most interference, but a loaded box depresses every rep.
 static void warn_if_loaded(int threads) {
     // getloadavg(3) rather than /proc/loadavg: same number on Linux, and the
-    // only way to ask on a system without /proc.
+    // only way to ask on a system without /proc. Windows keeps no such average
+    // at all, so there the warning is simply not available -- see plat_loadavg.
     double la = 0.0;
-    if (getloadavg(&la, 1) != 1) return;
+    if (plat_loadavg(&la) != 0) return;
     const int cpus = get_cpu_count();
     if (la > 0.5 && la > 0.15 * (double)cpus) {
         fprintf(msg(), "WARNING: load average %.2f on %d CPUs; results will be "
@@ -968,10 +990,41 @@ static void usage(const char *prog) {
         prog);
 }
 
-// Largest cache size reported by sysfs, in bytes (0 if unknown).
+// Largest cache size the system reports, in bytes (0 if unknown).
 static size_t detect_llc_bytes(void) {
     size_t best = 0;
-#ifdef __APPLE__
+#if defined(_WIN32)
+    // GetLogicalProcessorInformationEx(RelationCache) returns one record per
+    // cache instance, so the largest CacheSize is the last level -- the same
+    // "biggest cache named anywhere" the sysfs walk below takes, and wrong in
+    // the same safe direction if a level goes unreported.
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, NULL, &len);
+    if (len == 0) return 0;
+    unsigned char *buf = (unsigned char *)malloc(len);
+    if (!buf) return 0;
+    if (GetLogicalProcessorInformationEx(
+            RelationCache, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len)) {
+        // A variable-length record list: each entry says how long it is, so
+        // it is walked by byte offset rather than indexed as an array. The
+        // guard is the fixed header -- a relationship and a size -- which has
+        // to be readable before Size can be trusted to step to the next one.
+        const DWORD header = (DWORD)(sizeof(LOGICAL_PROCESSOR_RELATIONSHIP) +
+                                     sizeof(DWORD));
+        for (DWORD off = 0; off + header <= len;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e =
+                (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + off);
+            if (e->Size == 0) break;
+            if (e->Relationship == RelationCache &&
+                (size_t)e->Cache.CacheSize > best) {
+                best = (size_t)e->Cache.CacheSize;
+            }
+            off += e->Size;
+        }
+    }
+    free(buf);
+    return best;
+#elif defined(__APPLE__)
     // Apple Silicon exposes no L3 key; the per-performance-level L2 is the
     // largest cache it names, and on these parts the SLC below it is not
     // reported at all. An underestimate only makes the warning fire sooner,
@@ -1354,7 +1407,7 @@ static void json_result(const result_t *r, const char *scope, const char *indent
 // Opening half of the JSON document: schema, build, system and run config. The
 // caller adds the result arrays and calls json_close().
 static void json_open(const char *mode, const run_opts_t *o, int threads,
-                      int pin, int clock_raw) {
+                      int pin) {
     char cc[64], models[512];
     compiler_string(cc, sizeof(cc));
     detect_cpu_models(models, sizeof(models));
@@ -1375,12 +1428,12 @@ static void json_open(const char *mode, const run_opts_t *o, int threads,
            o->kernels->vectorize ? "true" : "false",
            o->kernels->fma ? "true" : "false");
 
-    struct utsname u;
+    plat_sysinfo_t si;
     printf(",\n  \"system\": {");
-    if (uname(&u) == 0) {
-        printf(" \"sysname\": \"%s\"", u.sysname);
-        j_str("release", u.release);
-        j_str("machine", u.machine);
+    if (plat_sysinfo(&si) == 0) {
+        printf(" \"sysname\": \"%s\"", si.sysname);
+        j_str("release", si.release);
+        j_str("machine", si.machine);
         printf(",");
     }
     printf(" \"cpus\": %d", get_cpu_count());
@@ -1391,7 +1444,7 @@ static void json_open(const char *mode, const run_opts_t *o, int threads,
            " \"reps\": %d, \"warmup_seconds\": %g, \"mem_bytes_per_thread\": %zu,"
            " \"pin\": %s, \"clock\": \"%s\", \"seed\": %llu }",
            threads, o->seconds, o->reps, o->warmup, o->mem_per_thread,
-           pin ? "true" : "false", clock_raw ? "raw" : "mono",
+           pin ? "true" : "false", g_clock_raw ? "raw" : "mono",
            (unsigned long long)o->seed);
 }
 
@@ -1636,8 +1689,8 @@ static void emit_tsv(const suite_t *s, const char *variant, int first) {
 }
 
 static void emit_json(const suite_t *s, const char *mode, const run_opts_t *o,
-                      int threads, int pin, int clock_raw) {
-    json_open(mode, o, threads, pin, clock_raw);
+                      int threads, int pin) {
+    json_open(mode, o, threads, pin);
     if (s->dram_hi > 0.0) {
         printf(",\n  \"dram\": { \"name\": \"%s\", \"mhz_min\": %.6g,"
                " \"mhz_max\": %.6g }", g_dram_name, s->dram_lo, s->dram_hi);
@@ -1737,7 +1790,6 @@ static int select_variants(const char *spec, const variant_t **sel) {
 typedef struct {
     int    threads;
     int    pin;
-    int    clock_raw;
     const int *cpu_list;
     int    n_cpus;
     size_t mem_mt;          // per thread, multi-threaded phase
@@ -1796,7 +1848,7 @@ static int run_variant(const run_cfg_t *c, run_opts_t *opts, int idx, int n_sel,
         emit_tsv(&s, opts->kernels->name, idx == 0);
     } else if (g_format == FMT_JSON) {
         if (n_sel > 1) printf(idx == 0 ? "[\n" : ",\n");
-        emit_json(&s, c->mode, opts, c->threads, c->pin, c->clock_raw);
+        emit_json(&s, c->mode, opts, c->threads, c->pin);
         if (n_sel > 1 && idx + 1 == n_sel) printf("]\n");
     } else if (s.have_threads) {
         printf("\nchecksum: 0x%016llx\n", (unsigned long long)s.checksum);
@@ -2072,7 +2124,7 @@ int main(int argc, char **argv) {
                 }
             }
         } else if (g_format == FMT_JSON) {
-            json_open("disp-sweep", &opts, 1, pin, use_clock_raw);
+            json_open("disp-sweep", &opts, 1, pin);
             printf(",\n  \"sweep\": [\n");
             for (int i = 0; i < n_cpus; ++i) {
                 printf("    { \"cpu\": %d, \"mhz\": %.6g, \"points\": [\n",
@@ -2128,7 +2180,6 @@ int main(int argc, char **argv) {
     const run_cfg_t cfg = {
         .threads      = threads,
         .pin          = pin,
-        .clock_raw    = use_clock_raw,
         .cpu_list     = cpu_list,
         .n_cpus       = n_cpus,
         .mem_mt       = mem_mt,

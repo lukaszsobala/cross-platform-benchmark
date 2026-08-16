@@ -35,8 +35,12 @@ Written by `json_open` / `json_result` / `emit_json` in
 
 `mode` is one of `threads`, `per-core`, `full`. `threads`/`total` are present
 for `threads` and `full`; `cores` for `per-core` and `full`. `dram` appears only
-on machines exposing a DRAM devfreq node; `system` is only as complete as
-`uname(2)` was.
+on machines exposing a DRAM devfreq node; `system` is only as complete as the
+host will say. Each system names its own hardware and the field passes that
+through unchanged, so the same silicon reads `aarch64` on Linux, `arm64` on
+macOS and `ARM64` on Windows — `build.target` is the normalised one to key on.
+`config.clock` records the clock that was *used*: asking for `raw` on a host
+with no unadjusted monotonic clock (Windows) yields `mono` here.
 
 A `--disp-sweep` dump carries the same `schema` and `mode: "disp-sweep"`. The
 hub **rejects** it: it is a diagnostic curve with no summary metrics to rank.
@@ -44,9 +48,11 @@ hub **rejects** it: it is a diagnostic curve with no summary metrics to rank.
 ## `build.binary_sha256`
 
 The SHA-256 of the binary that produced the document, in 64 lowercase hex
-digits — the benchmark hashing `/proc/self/exe` at report time. **Absent, never
-`null`**, where there is no `/proc` to read: a key carrying an empty digest
-would match the next empty digest and mean the opposite of what it says.
+digits — the benchmark hashing its own executable at report time, found through
+`/proc/self/exe`, `_NSGetExecutablePath` or `GetModuleFileName` depending on the
+host. **Absent, never `null`**, where none of those can answer: a key carrying an
+empty digest would match the next empty digest and mean the opposite of what it
+says.
 
 It exists so a hub can tell a run that says it came from a published build from
 one that says nothing. The hub holds the digests a release attached and marks a

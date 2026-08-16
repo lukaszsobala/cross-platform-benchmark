@@ -21,6 +21,21 @@
 # checked as far as a native runner can check it -- single-architecture arm64,
 # ad-hoc signed, self-digest verified, smoke-tested -- and no further.
 #
+# The Windows rows build natively too, and for a plainer reason: the runners
+# exist, so there is no argument for cross-building and then hoping. PE has no
+# glibc floor to print; what stands in its place is the import table, which the
+# check below reads and asserts against, because Windows has two ways to ship a
+# binary that starts on the build machine and fails on the user's. One is a
+# mingw runtime DLL the artifact expects to find beside it (hence -static in
+# bench/Makefile). The other is quieter: a mingw-w64 built against msvcrt rather
+# than the UCRT substitutes a pre-C99 printf, and "%zu" then prints as the
+# letters z and u inside a document meant to be machine-read.
+#
+# The Windows-on-Arm row carries its own toolchain. GCC has no aarch64 Windows
+# target, and the `gcc` on that image is an x86_64 one running under emulation
+# -- it builds, it runs, and it produces the wrong architecture -- so that row
+# fetches llvm-mingw at a pinned version and a pinned digest instead.
+#
 # This is separate from what the binaries *target*. RVA23 comes from -march, not
 # from the host distribution -- but it does need a compiler new enough to know
 # the extension names, and the newest riscv64 cross-gcc 24.04 has is 14, which
@@ -71,6 +86,15 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: read
+    defaults:
+      run:
+        # Windows runners default to PowerShell. One shell for every row keeps
+        # the steps below readable as the single script they are.
+        shell: bash
+    env:
+      # `make` produces cpcpub.exe on Windows and cpcpub everywhere else, so the
+      # steps name the binary through here rather than repeating that.
+      BIN: bench/cpcpub${{ matrix.exe }}
     strategy:
       fail-fast: false
       matrix:
@@ -145,6 +169,46 @@ jobs:
             asset: cpcpub-macos-arm64
             target: aarch64
             deployment-target: "11.0"
+          # Windows, with the same -march pair as the two Linux x86 rows above
+          # and for the same reasons: a portable baseline, and a v3 build where
+          # the four variants differ. Keeping the flags identical is what makes
+          # a Windows number and a Linux number from the same CPU a comparison
+          # of two operating systems rather than of two compilations.
+          #
+          # The image's mingw-w64 gcc is the compiler: it is GCC 15 against the
+          # UCRT, so these binaries are closer to their Linux counterparts than
+          # a clang build would be. Nothing installs, which is also why these
+          # rows are cheap.
+          - name: windows-x86_64
+            runs-on: windows-2025
+            asset: cpcpub-windows-x86_64.exe
+            exe: .exe
+            vars: MARCH=x86-64 MTUNE=generic
+            target: x86_64
+          - name: windows-x86_64-v3
+            runs-on: windows-2025
+            asset: cpcpub-windows-x86_64-v3.exe
+            exe: .exe
+            vars: MARCH=x86-64-v3 MTUNE=generic
+            target: x86_64
+          # Windows on Arm. armv8-a to match the Linux aarch64 row, not the
+          # ARMv8.1 that Windows itself requires of a machine: the artifact is
+          # for comparing against that row, and every Arm device Windows runs on
+          # is past both floors anyway.
+          #
+          # llvm-mingw because nothing else targets this: mingw-w64 gcc has no
+          # aarch64 Windows target at all. Pinned to a version *and* a digest --
+          # a release asset can be replaced in place, and a toolchain swapped
+          # under a build that publishes verified binaries is exactly the change
+          # that should stop the job rather than ship.
+          - name: windows-arm64
+            runs-on: windows-11-arm
+            asset: cpcpub-windows-arm64.exe
+            exe: .exe
+            vars: MARCH=armv8-a MTUNE=generic
+            target: aarch64
+            llvm-mingw: "20260616"
+            llvm-mingw-sha256: 312593669435bd0bfc1a43ac3fba23c8b27e0610bade88b2738e5a01702a99ba
 
     steps:
       - uses: actions/checkout@v7
@@ -156,8 +220,45 @@ jobs:
         env:
           CROSS: ${{ matrix.cross }}
           MIN_GCC: ${{ matrix.min-gcc }}
+          LLVM_MINGW: ${{ matrix.llvm-mingw }}
+          LLVM_MINGW_SHA256: ${{ matrix.llvm-mingw-sha256 }}
         run: |
           set -eux
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Neither compiler answers to `cc` here, so CC is always named. So
+            # is OBJDUMP: the import-table check below is the same check on both
+            # rows, run through whichever tool that row's toolchain brought.
+            #
+            # `make` is the mingw-w64 one the runner image installs, which on
+            # the Arm image is an x86_64 build under emulation -- fine for a
+            # build driver, and not the compiler, which is the part that has to
+            # be native.
+            command -v make >/dev/null || {
+              echo "no make on this image; the runner image is expected to " \
+                   "put the mingw-w64 one on PATH" >&2; exit 1; }
+            if [ -n "$LLVM_MINGW" ]; then
+              url="https://github.com/mstorsjo/llvm-mingw/releases/download"
+              zip="llvm-mingw-$LLVM_MINGW-ucrt-aarch64.zip"
+              curl -fsSL -o "$zip" "$url/$LLVM_MINGW/$zip"
+              echo "$LLVM_MINGW_SHA256  $zip" | sha256sum -c -
+              7z x -y "$zip" -o"$RUNNER_TEMP" > /dev/null
+              # Two spellings of one directory, because two things read it.
+              # GITHUB_PATH is consumed by the runner and wants a native path;
+              # the export is for this step only, where bash wants a POSIX one.
+              echo "$RUNNER_TEMP\\llvm-mingw-$LLVM_MINGW-ucrt-aarch64\\bin" \
+                >> "$GITHUB_PATH"
+              PATH="$(cygpath -u "$RUNNER_TEMP")/llvm-mingw-$LLVM_MINGW-ucrt-aarch64/bin:$PATH"
+              export PATH
+              aarch64-w64-mingw32-clang --version
+              echo "CC=aarch64-w64-mingw32-clang" >> "$GITHUB_ENV"
+              echo "OBJDUMP=llvm-objdump" >> "$GITHUB_ENV"
+            else
+              gcc --version
+              echo "CC=gcc" >> "$GITHUB_ENV"        # the image's mingw-w64 gcc
+              echo "OBJDUMP=objdump" >> "$GITHUB_ENV"
+            fi
+            exit 0
+          fi
           if [ -z "$CROSS" ]; then
             cc --version
             exit 0
@@ -197,7 +298,8 @@ jobs:
         run: |
           set -eux
           make -C bench ${{ matrix.make-target || 'all' }} ${{ matrix.vars }}
-          file bench/cpcpub
+          # No file(1) in Git Bash, and nothing here depends on its output.
+          command -v file >/dev/null && file "$BIN" || ls -l "$BIN"
 
       # What the binary requires of the machine that runs it, in both senses:
       # the ISA it was compiled for, and the glibc it was linked against. Both
@@ -213,20 +315,46 @@ jobs:
           # the minimum OS version stamped into LC_BUILD_VERSION, plus the fact
           # that this is a single-architecture arm64 file and not a fat binary.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            otool -L bench/cpcpub
-            vtool -show-build bench/cpcpub || otool -l bench/cpcpub | grep -A4 LC_BUILD_VERSION
-            archs=$(lipo -archs bench/cpcpub)
+            otool -L "$BIN"
+            vtool -show-build "$BIN" || otool -l "$BIN" | grep -A4 LC_BUILD_VERSION
+            archs=$(lipo -archs "$BIN")
             [ "$archs" = "arm64" ] || { echo "expected arm64, got $archs" >&2; exit 1; }
             # arm64 macOS refuses to execute an unsigned binary at all. The
             # linker signs ad hoc; if that ever stops happening, the smoke test
             # below would fail with a signal rather than a message, so check here.
-            codesign -dv bench/cpcpub
+            codesign -dv "$BIN"
+            exit 0
+          fi
+          # PE has no glibc floor either. What it has is an import table, which
+          # is the list of DLLs this binary will go looking for on a machine
+          # that has nothing but Windows on it. Both assertions below are about
+          # a binary that starts here and fails there; the architecture is not
+          # checked here because the identity step already asserts the target
+          # the binary compiled itself for.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            "$OBJDUMP" -p "$BIN" | sed -n 's/^[[:space:]]*DLL Name:[[:space:]]*//p' \
+              | tr 'A-Z' 'a-z' | sort -u > dlls.txt
+            cat dlls.txt
+            # The UCRT, not msvcrt. A mingw-w64 built against msvcrt substitutes
+            # a printf that predates C99, and %zu then prints as the letters
+            # rather than the number -- in a document meant to be machine-read,
+            # and without failing anything.
+            grep -qE '^(api-ms-win-crt-|ucrtbase\.dll)' dlls.txt || {
+              echo "not linked against the UCRT: $(cat dlls.txt)" >&2; exit 1; }
+            ! grep -qx 'msvcrt\.dll' dlls.txt || {
+              echo "linked against msvcrt, which has no C99 printf" >&2; exit 1; }
+            # No toolchain DLLs. mingw's runtime ships as libwinpthread-1.dll
+            # and friends unless -static says otherwise, and an artifact that
+            # needs them beside it is not one anybody can just download.
+            ! grep -q '^lib' dlls.txt || {
+              echo "imports a toolchain DLL; the -static in bench/Makefile did " \
+                   "not take effect" >&2; exit 1; }
             exit 0
           fi
           READELF="${CROSS:+$CROSS-}readelf"
           OBJDUMP="${CROSS:+$CROSS-}objdump"
-          "$OBJDUMP" -T bench/cpcpub | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
-          if [ "${CROSS:-}" ]; then "$READELF" -A bench/cpcpub; fi
+          "$OBJDUMP" -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
+          if [ "${CROSS:-}" ]; then "$READELF" -A "$BIN"; fi
           python3 - <<'PY'
           import glob, os, re, subprocess, sys
 
@@ -278,7 +406,7 @@ jobs:
           # richer baseline drags the whole artifact up with it.
           if {"v"} & ours or any(x.startswith("zve") for x in ours):
               sys.exit(f"rv64gc build compiled vector instructions: {sorted(ours)}")
-          whole = isa_of("bench/cpcpub")
+          whole = isa_of(os.environ["BIN"])
           if {"v"} & whole or any(x.startswith("zve") for x in whole):
               sys.exit(
                   "this image's riscv64 runtime is not rv64gc: the linked binary "
@@ -304,8 +432,8 @@ jobs:
           if [ -n "$CROSS" ]; then
             RUN="qemu-${{ matrix.target }} -cpu $QEMU_CPU -L /usr/$CROSS"
           fi
-          $RUN ./bench/cpcpub --list-variants
-          $RUN ./bench/cpcpub --full --cpus 0 --threads 1 \
+          $RUN "./$BIN" --list-variants
+          $RUN "./$BIN" --full --cpus 0 --threads 1 \
               --time 0.05 --reps 1 --warmup 0.02 --json > run.json
 
       # The verification chain in one step: what the binary says it is has to be
@@ -320,15 +448,15 @@ jobs:
           set -eux
           # macOS ships shasum, not sha256sum. The digest that counts is taken
           # in python below; this line is for the log.
-          command -v sha256sum >/dev/null && sha256sum bench/cpcpub \
-            || shasum -a 256 bench/cpcpub
+          command -v sha256sum >/dev/null && sha256sum "$BIN" \
+            || shasum -a 256 "$BIN"
           python3 - <<'PY'
           import hashlib, json, os, pathlib, re
 
           doc = json.load(open("run.json"))
           assert doc["schema"] == "cpu-bench/1", doc.get("schema")
           claimed = doc["build"]["binary_sha256"]
-          actual = hashlib.sha256(pathlib.Path("bench/cpcpub").read_bytes()).hexdigest()
+          actual = hashlib.sha256(pathlib.Path(os.environ["BIN"]).read_bytes()).hexdigest()
           assert re.fullmatch(r"[0-9a-f]{64}", claimed), claimed
           assert claimed == actual, f"binary says {claimed}, file is {actual}"
 
@@ -358,7 +486,7 @@ jobs:
                     indent=2)
           print(json.dumps(info, indent=2))
           PY
-          cp bench/cpcpub "dist/$ASSET"
+          cp "$BIN" "dist/$ASSET"
 
       - uses: actions/upload-artifact@v7
         with:

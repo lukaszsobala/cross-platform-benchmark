@@ -1,6 +1,8 @@
 # Build output: one binary, one stamp of the flags it was built with, and one
-# object per kernel variant.
+# object per kernel variant. Both names of the binary, because a Windows
+# cross-build in this tree produces the second one.
 bench/cpcpub
+bench/cpcpub.exe
 bench/.build-flags
 *.o
 

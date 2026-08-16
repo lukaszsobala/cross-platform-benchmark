@@ -118,7 +118,7 @@ Run it against your own machine from your own repository:
 ```yaml
 jobs:
   measure:
-    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.1.0
+    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.2.0
     permissions:
       id-token: write        # this is what mints the token
       contents: read

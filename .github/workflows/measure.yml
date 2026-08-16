@@ -32,11 +32,16 @@
 # on Node.js 24, which older runners do not ship. GitHub-hosted runners are
 # always new enough.
 #
+# Every step below runs under bash, Windows included, so one script covers all
+# of them. That is a real requirement on a self-hosted Windows runner and not
+# just a convenience: bash there means Git Bash, which ships with git, and the
+# workflow needs sha256sum, curl and a python.
+#
 # Call it from your own repository to measure your own machine:
 #
 #   jobs:
 #     measure:
-#       uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.1.0
+#       uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.2.0
 #       permissions:
 #         id-token: write        # required: this is what mints the token
 #         contents: read
@@ -127,6 +132,9 @@ jobs:
     permissions:
       id-token: write        # mint the OIDC token; nothing else is needed
       contents: read
+    defaults:
+      run:
+        shell: bash
     steps:
       # Fixed here, not taken from an input: the binary must come from the
       # upstream releases or the strong tier means nothing.
@@ -144,33 +152,52 @@ jobs:
           # Keyed on the OS as well as the machine, because `arm64` on Darwin
           # and `aarch64` on Linux are the same silicon and different binaries.
           host="$(uname -s)-$(uname -m)"
+          EXE=""
           case "$host" in
             Linux-x86_64)     assets="cpcpub-linux-x86_64" ;;
             Linux-aarch64)    assets="cpcpub-linux-aarch64" ;;
             Linux-riscv64)    assets="cpcpub-linux-riscv64-rva23 cpcpub-linux-riscv64" ;;
             Linux-loongarch64) assets="cpcpub-linux-loongarch64" ;;
             Darwin-arm64)     assets="cpcpub-macos-arm64" ;;
+            # Git Bash names itself MINGW64_NT-10.0-<build> and reports the
+            # machine of the build of git that is installed, which on an Arm
+            # box may not be the machine it is running on. RUNNER_ARCH comes
+            # from the runner itself and does not have that problem.
+            MINGW*|MSYS*|CYGWIN*)
+              EXE=".exe"
+              case "${RUNNER_ARCH:-X64}" in
+                ARM64) assets="cpcpub-windows-arm64.exe" ;;
+                *)     assets="cpcpub-windows-x86_64.exe" ;;
+              esac ;;
             *) echo "no published binary for $host" >&2; exit 1 ;;
           esac
 
-          # macOS has shasum, Linux has sha256sum, and this runs on both.
+          # macOS has shasum, Linux and Git Bash have sha256sum.
           digest_of() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
             else shasum -a 256 "$1" | cut -d' ' -f1; fi
           }
+
+          # Three later steps need a python. `python3` is what a GitHub-hosted
+          # image has on every platform; a self-hosted Windows box that only
+          # ever ran the python.org installer has `python` and nothing else.
+          PYTHON=$(command -v python3 || command -v python) || {
+            echo "this runner has no python3" >&2; exit 1; }
+          echo "PYTHON=$PYTHON" >> "$GITHUB_ENV"
+          echo "EXE=$EXE" >> "$GITHUB_ENV"
 
           curl -fsSL -o SHA256SUMS "$base/SHA256SUMS"
           # On RISC-V, prefer the RVA23 build and fall back to the portable one
           # when this CPU cannot run it. Every candidate is checked against the
           # release's own checksum file before it is executed.
           for name in $assets; do
-            curl -fsSL -o cpcpub "$base/$name" || continue
+            curl -fsSL -o "cpcpub$EXE" "$base/$name" || continue
             want=$(awk -v n="$name" '$2 == n || $2 == "*" n { print $1 }' SHA256SUMS)
-            got=$(digest_of cpcpub)
+            got=$(digest_of "cpcpub$EXE")
             [ -n "$want" ] && [ "$want" = "$got" ] || {
               echo "checksum mismatch for $name" >&2; exit 1; }
-            chmod +x cpcpub
-            if ./cpcpub --list-variants >/dev/null 2>&1; then
+            chmod +x "cpcpub$EXE"
+            if "./cpcpub$EXE" --list-variants >/dev/null 2>&1; then
               echo "using $name ($got)"
               echo "ASSET=$name" >> "$GITHUB_ENV"
               exit 0
@@ -187,8 +214,8 @@ jobs:
       - name: Measure
         run: |
           set -eu
-          ./cpcpub --full --json > run.json
-          python3 -c 'import json;d=json.load(open("run.json"));print(d["build"]["flags"])'
+          "./cpcpub${EXE:-}" --full --json > run.json
+          "$PYTHON" -c 'import json;d=json.load(open("run.json"));print(d["build"]["flags"])'
 
       # The binding step. The audience is the digest of the file, so GitHub
       # signs a statement about these bytes and no others. No `set -x` here:
@@ -196,7 +223,7 @@ jobs:
       - name: Ask GitHub to sign the result
         run: |
           set -eu
-          python3 - <<'PY'
+          "$PYTHON" - <<'PY'
           import hashlib, json, os, pathlib, urllib.parse, urllib.request
 
           # Hashed here rather than by sha256sum(1), which macOS does not ship
@@ -228,7 +255,7 @@ jobs:
           set -eu
           # Inputs reach curl through the environment and python's quoting, so
           # a label containing shell metacharacters is a label, not a command.
-          query=$(python3 -c '
+          query=$("$PYTHON" -c '
           import os, urllib.parse
           q = {k: v for k, v in (("label", os.environ["LABEL"]),
                                  ("notes", os.environ["NOTES"])) if v}

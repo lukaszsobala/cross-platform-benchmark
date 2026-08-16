@@ -14,7 +14,12 @@
 # all with `cpcpub --variants`.
 
 PYTHON ?= python3
-BENCH  := bench/cpcpub
+# .exe when this tree was built for Windows. Deferred (`=`, not `:=`) so it is
+# answered when a recipe runs rather than when this file is read -- the targets
+# below build the binary first, and on a tree that has never been built there
+# would be nothing to look at yet.
+BENCH   = $(shell [ -x bench/cpcpub.exe ] && echo bench/cpcpub.exe \
+                                          || echo bench/cpcpub)
 
 .PHONY: all bench check contract test testdata serve submit clean \
         native riscv-v rva23 loongarch sg2000 sg2000-xthead

@@ -34,10 +34,29 @@ endif
 # build it did not get. scalar-nofma is the cross-ISA fairness default.
 VARIANTS := scalar-nofma vector-nofma scalar-fma vector-fma
 
-KV_FLAGS_scalar-nofma := -fno-tree-vectorize -ffp-contract=off
-KV_FLAGS_vector-nofma := -ftree-vectorize -ffp-contract=off
-KV_FLAGS_scalar-fma   := -fno-tree-vectorize -ffp-contract=fast
-KV_FLAGS_vector-fma   := -ftree-vectorize -ffp-contract=fast
+# Clang and GCC do not mean the same thing by -f[no-]tree-vectorize, and the
+# difference is the whole point of the scalar variants. GCC's switch covers both
+# of its vectorizers. Clang's is an alias for -f[no-]vectorize, which is the
+# *loop* vectorizer alone: its SLP vectorizer stays on at -O3 regardless, and a
+# "scalar" build made with clang comes out with SIMD in it. So the SLP pass is
+# named explicitly wherever the compiler will take that spelling, and the four
+# variants then mean the same four things on every toolchain.
+#
+# This is not cosmetic on the platforms that have no choice of compiler: macOS
+# and Windows-on-Arm are clang-only, and without this their scalar-nofma
+# baseline -- the one cross-ISA comparisons are made against -- would be a
+# partly vectorized build wearing the name of a scalar one.
+KV_SLP_OFF := $(shell $(CC) -fno-slp-vectorize -E -x c /dev/null \
+                  >/dev/null 2>&1 && echo -fno-slp-vectorize)
+KV_SLP_ON  := $(if $(KV_SLP_OFF),-fslp-vectorize)
+
+# $(strip) so a GCC build, where the two variables above are empty, reports the
+# flags it always reported rather than the same string with a double space in
+# it -- these end up in build.flags, which readers compare between documents.
+KV_FLAGS_scalar-nofma := $(strip -fno-tree-vectorize $(KV_SLP_OFF) -ffp-contract=off)
+KV_FLAGS_vector-nofma := $(strip -ftree-vectorize $(KV_SLP_ON) -ffp-contract=off)
+KV_FLAGS_scalar-fma   := $(strip -fno-tree-vectorize $(KV_SLP_OFF) -ffp-contract=fast)
+KV_FLAGS_vector-fma   := $(strip -ftree-vectorize $(KV_SLP_ON) -ffp-contract=fast)
 
 KV_VEC_scalar-nofma := 0
 KV_VEC_vector-nofma := 1
@@ -74,7 +93,29 @@ ifeq ($(HOST_ARCH),riscv64)
 	NATIVE_MTUNE :=
 endif
 
-TARGET := cpcpub
+# Windows, when the compiler says so. The host is no guide -- these builds are
+# usually cross-compiles from Linux -- so the target triple decides. Two
+# spellings of it, because the toolchains disagree: mingw-w64 gcc dumps
+# x86_64-w64-mingw32, llvm-mingw's clang dumps x86_64-w64-windows-gnu. Matching
+# only one would leave the other building a binary called `cpcpub` while the
+# linker quietly wrote cpcpub.exe -- so make would relink on every invocation
+# and `make clean` would remove nothing.
+#
+# PLAT_LDFLAGS rather than LDFLAGS because a `make LDFLAGS=...` on the command
+# line cannot be appended to from inside a makefile, and -static is not optional
+# here: without it the artifact wants libwinpthread-1.dll (and, depending on the
+# toolchain, libgcc and libunwind) sitting next to it, and a published binary
+# has to run on a machine with no toolchain on it.
+TARGET_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null)
+TARGET_WIN    := $(findstring mingw,$(TARGET_TRIPLE))$(findstring windows,$(TARGET_TRIPLE))
+EXEEXT       :=
+PLAT_LDFLAGS :=
+ifneq (,$(TARGET_WIN))
+	EXEEXT       := .exe
+	PLAT_LDFLAGS := -static
+endif
+
+TARGET := cpcpub$(EXEEXT)
 OBJS   := src/bench.o src/sha256.o \
           $(addprefix src/kernels-,$(addsuffix .o,$(VARIANTS)))
 
@@ -88,7 +129,7 @@ all: $(TARGET)
 # switch appears to succeed while changing nothing, and a build that is
 # supposed to have been re-targeted still runs (or crashes) as the old one.
 FLAGSTAMP := .build-flags
-BUILDID   := $(CC) $(CFLAGS) $(LDFLAGS) $(LIBS)
+BUILDID   := $(CC) $(CFLAGS) $(LDFLAGS) $(PLAT_LDFLAGS) $(LIBS)
 
 $(FLAGSTAMP): FORCE
 	@[ -f $@ ] && [ "$$(cat $@)" = "$(BUILDID)" ] || printf '%s' "$(BUILDID)" > $@
@@ -170,7 +211,7 @@ rva23:
 	$(MAKE) MARCH=$(RVA23_MARCH) all
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(PLAT_LDFLAGS) -o $@ $(OBJS) $(LIBS)
 
 # BUILD_CC/BUILD_FLAGS are baked in so a result carries the exact toolchain and
 # flags it was produced with -- an -march or a -ffast-math nobody remembers
@@ -195,5 +236,9 @@ src/kernels-%.o: src/kernels.c src/kernels.h $(FLAGSTAMP)
 	    -DKV_FLAGS='"$(KV_FLAGS_$*)"' -DKV_VECTORIZE=$(KV_VEC_$*) \
 	    -DKV_FMA=$(KV_FMA_$*) -c -o $@ $<
 
+# Both spellings of the binary, not just this build's: a tree that has been
+# cross-built for Windows and then built natively holds cpcpub and cpcpub.exe
+# side by side, and a clean that left one of them behind would be a clean in
+# name only.
 clean:
-	rm -f $(TARGET) $(OBJS) $(FLAGSTAMP)
+	rm -f cpcpub cpcpub.exe $(OBJS) $(FLAGSTAMP)
