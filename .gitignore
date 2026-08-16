@@ -15,7 +15,7 @@ bench/.build-flags
 # What the workflows produce. They run in a CI checkout, but these are the same
 # commands anyone reproducing a release runs by hand in this directory.
 /dist/
-/cpcpub-linux-*
+/cpcpub-*
 /buildinfo-*.json
 /SHA256SUMS
 /verified-builds.json

@@ -1,5 +1,7 @@
 // Portable CPU benchmark: integer, FP, memory and indirect-dispatch kernels for
-// 64-bit x86_64 / aarch64 / riscv64. libc + pthreads only, no intrinsics.
+// 64-bit x86_64 / aarch64 / riscv64 / loongarch64, on Linux and macOS. libc and
+// pthreads only, no intrinsics. What differs between the two systems is behind
+// the capability macros in platform.h.
 //
 // This file is the driver: it selects CPUs, times batches, aggregates and
 // reports. The kernels it times live in kernels.c, which is compiled once per
@@ -19,10 +21,8 @@
 #include <time.h>
 #include <sys/utsname.h>
 #include <dirent.h>
-#ifdef __linux__
-#include <sched.h>
-#endif
 
+#include "platform.h"
 #include "kernels.h"
 #include "sha256.h"
 
@@ -311,7 +311,7 @@ typedef struct {
     double seconds;        // measured time per phase
     double warmup;         // warm-up seconds before each phase
     int    reps;           // repetitions per phase; the best one is kept
-    pthread_barrier_t *bar;
+    plat_barrier_t *bar;
     uint64_t seed;
     const kernel_set_t *ks;   // the build variant this run measures
 
@@ -332,11 +332,11 @@ typedef struct {
     double sweep_free[DISP_SWEEP_N];    // Mcall/s per period, independent calls
     double mhz_observed;   // sampled while the core was under load
     double dram_mhz_observed; // DRAM controller clock during the memory phases
-    int    cpu_observed;   // sched_getcpu() during the run
+    int    cpu_observed;   // where it actually ran, -1 where unknowable
 } worker_t;
 
 static void wsync(worker_t *w) {
-    if (w->bar) pthread_barrier_wait(w->bar);
+    if (w->bar) plat_barrier_wait(w->bar);
 }
 
 // Enter one repetition of a phase: line all threads up, warm up (first rep
@@ -441,17 +441,8 @@ static void *worker(void *arg) {
     worker_t *w = (worker_t *)arg;
     const kernel_set_t *ks = w->ks;
 
-#ifdef __linux__
-    if (w->cpu >= 0) {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET((unsigned int)w->cpu, &set);
-        (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-    }
-    w->cpu_observed = sched_getcpu();
-#else
-    w->cpu_observed = -1;
-#endif
+    (void)plat_pin_self(w->cpu);
+    w->cpu_observed = plat_current_cpu();
 
     uint8_t *buf = NULL;
     const size_t nbytes = w->mem_bytes;
@@ -710,6 +701,11 @@ static const char *arch_string(void) {
     return "aarch64";
 #elif defined(__riscv) && (__riscv_xlen == 64)
     return "riscv64";
+// Both spellings: __loongarch64 is the older predefine, __loongarch_grlen the
+// one the current toolchain convention documents.
+#elif defined(__loongarch64) || \
+      (defined(__loongarch__) && defined(__loongarch_grlen) && __loongarch_grlen == 64)
+    return "loongarch64";
 #else
     return "unknown";
 #endif
@@ -719,6 +715,19 @@ static const char *arch_string(void) {
 static void detect_cpu_models(char *out, size_t outsz) {
     if (!out || outsz == 0) return;
     out[0] = '\0';
+#ifdef __APPLE__
+    // One name per machine: macOS reports the package, not the cluster, so an
+    // asymmetric Apple part reads as "Apple M4" rather than naming its P and E
+    // cores separately. hw.model ("Mac16,3") is the fallback when the brand
+    // string is missing, which is better than an empty field.
+    static const char *const keys[] = { "machdep.cpu.brand_string", "hw.model" };
+    for (int k = 0; k < ARRAY_LEN(keys); ++k) {
+        size_t len = outsz;
+        if (sysctlbyname(keys[k], out, &len, NULL, 0) == 0 && out[0]) return;
+        out[0] = '\0';
+    }
+    return;
+#else
     FILE *f = fopen("/proc/cpuinfo", "r");
     if (!f) return;
 
@@ -750,6 +759,7 @@ static void detect_cpu_models(char *out, size_t outsz) {
         }
     }
     fclose(f);
+#endif
 }
 
 // Short compiler name and version, e.g. "gcc 15.2.0".
@@ -806,7 +816,19 @@ static const char *binary_sha256(void) {
     static int done = 0;
     if (!done) {
         done = 1;
+        hex[0] = '\0';
+#if defined(__APPLE__)
+        // macOS has no /proc. _NSGetExecutablePath is the supported way to ask
+        // the loader which file it mapped; the path it returns may contain
+        // symlinks or `..`, which does not matter here because what is hashed
+        // is the contents it opens to.
+        char path[4096];
+        uint32_t sz = (uint32_t)sizeof(path);
+        if (_NSGetExecutablePath(path, &sz) == 0 &&
+            sha256_file(path, hex) != 0) hex[0] = '\0';
+#elif PLAT_HAS_PROC
         if (sha256_file("/proc/self/exe", hex) != 0) hex[0] = '\0';
+#endif
     }
     return hex[0] ? hex : NULL;
 }
@@ -871,12 +893,10 @@ typedef struct {
 
 // Best-of-N rejects most interference, but a loaded box depresses every rep.
 static void warn_if_loaded(int threads) {
-    FILE *f = fopen("/proc/loadavg", "r");
-    if (!f) return;
+    // getloadavg(3) rather than /proc/loadavg: same number on Linux, and the
+    // only way to ask on a system without /proc.
     double la = 0.0;
-    const int got = fscanf(f, "%lf", &la);
-    fclose(f);
-    if (got != 1) return;
+    if (getloadavg(&la, 1) != 1) return;
     const int cpus = get_cpu_count();
     if (la > 0.5 && la > 0.15 * (double)cpus) {
         fprintf(msg(), "WARNING: load average %.2f on %d CPUs; results will be "
@@ -887,10 +907,10 @@ static void warn_if_loaded(int threads) {
 }
 
 static int run_workers(worker_t *w, int n, const run_opts_t *o) {
-    pthread_barrier_t bar;
+    plat_barrier_t bar;
     int use_bar = (n > 1);
-    if (use_bar && pthread_barrier_init(&bar, NULL, (unsigned)n) != 0) {
-        perror("pthread_barrier_init");
+    if (use_bar && plat_barrier_init(&bar, (unsigned)n) != 0) {
+        perror("barrier_init");
         return -1;
     }
 
@@ -912,7 +932,7 @@ static int run_workers(worker_t *w, int n, const run_opts_t *o) {
     for (int i = 0; i < n; ++i) pthread_join(ths[i], NULL);
 
     free(ths);
-    if (use_bar) pthread_barrier_destroy(&bar);
+    if (use_bar) plat_barrier_destroy(&bar);
     return 0;
 }
 
@@ -951,6 +971,23 @@ static void usage(const char *prog) {
 // Largest cache size reported by sysfs, in bytes (0 if unknown).
 static size_t detect_llc_bytes(void) {
     size_t best = 0;
+#ifdef __APPLE__
+    // Apple Silicon exposes no L3 key; the per-performance-level L2 is the
+    // largest cache it names, and on these parts the SLC below it is not
+    // reported at all. An underestimate only makes the warning fire sooner,
+    // which is the safe direction for a working-set check.
+    static const char *const keys[] = {
+        "hw.l3cachesize", "hw.l2cachesize",
+        "hw.perflevel0.l2cachesize", "hw.perflevel1.l2cachesize",
+    };
+    for (int k = 0; k < ARRAY_LEN(keys); ++k) {
+        uint64_t v = 0;
+        size_t len = sizeof(v);
+        if (sysctlbyname(keys[k], &v, &len, NULL, 0) == 0 && v > best)
+            best = (size_t)v;
+    }
+    return best;
+#else
     for (int i = 0; i < 16; ++i) {
         char path[160];
         snprintf(path, sizeof(path),
@@ -970,6 +1007,7 @@ static size_t detect_llc_bytes(void) {
         fclose(f);
     }
     return best;
+#endif
 }
 
 // A working set that fits in last-level cache turns MEMlat into a cache latency
@@ -1917,6 +1955,22 @@ int main(int argc, char **argv) {
     if (warmup < 0.0) warmup = 0.0;
     if (threads < 1) threads = 1;
     if (reps < 1) reps = 1;
+
+    // Pinning is not portable and is not optional to be honest about. macOS
+    // gives no way to bind a thread to a numbered CPU -- placement is the
+    // scheduler's -- so `pin` is turned off here rather than reported as on,
+    // and `config.pin` in the result document says what actually happened. A
+    // reader comparing a Mac against a pinned Linux box needs to see that
+    // difference; a per-core sweep without pinning is measuring whichever core
+    // the scheduler chose, repeatedly.
+    if (pin && !PLAT_HAS_AFFINITY) {
+        pin = 0;
+        fprintf(msg(), "NOTE: this system does not support pinning a thread to "
+                       "a CPU, so threads run wherever the scheduler puts "
+                       "them%s.\n",
+                (per_core || full) ? " -- per-core figures identify a request, "
+                                     "not a core" : "");
+    }
 
     // --disp-sweep prints a curve per CPU, not a summary row, so there is
     // nothing to stack variants into; ask for one explicitly instead.

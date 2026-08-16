@@ -9,7 +9,8 @@ instruction-level parallelism their ratio exposes), integer multiply, memory
 bandwidth and random-access latency, the memory-level parallelism behind it, and
 indirect-call throughput and branch-predictor capacity. One core, every core, or
 the whole machine at once. Nothing beyond libc, libm and pthreads; C2x with
-GCC 13+ or Clang, on x86_64, AArch64 and RISC-V.
+GCC 13+ or Clang, on x86_64, AArch64, RISC-V and LoongArch, on Linux and
+macOS (Apple Silicon).
 
 ```sh
 make                                            # build -> bench/cpcpub
@@ -29,8 +30,15 @@ Read it before reading a result — several of the metrics say something other
 than what their name suggests.
 
 The top-level `Makefile` forwards the benchmark's tuning targets and variables
-unchanged, so `make native`, `make sg2000`, `make rva23` and
+unchanged, so `make native`, `make sg2000`, `make rva23`, `make loongarch` and
 `make MARCH=x86-64-v3` work from here as well as from [bench/](bench/).
+
+**macOS builds and runs, with one caveat that changes a number rather than
+omitting it: nothing on macOS can bind a thread to a CPU.** `cpcpub` turns
+pinning off there and records `pin: false`, so `--per-core` sweeps requests
+rather than cores — which on an asymmetric Apple part is not the P-core versus
+E-core reading it looks like. See
+[bench/README.md](bench/README.md#platforms).
 
 `make rva23` builds for **RVA23U64**, the RISC-V profile Ubuntu 26.04 takes as
 its riscv64 baseline. It is a floor rather than a tuning hint — the binary uses
@@ -70,8 +78,9 @@ Anonymous uploads are not second-class and are not going away.
 ## Verified results
 
 [The release workflow](.github/workflows/release.yml) builds `cpcpub` for
-every target on GitHub's runners — x86-64, x86-64-v3, aarch64, rv64gc and
-RVA23 — smoke-tests each one (under qemu where it is cross-built), and attaches
+every target on GitHub's runners — x86-64, x86-64-v3, aarch64, rv64gc, RVA23,
+loongarch64 and macOS/Apple Silicon — smoke-tests each one (under qemu where it
+is cross-built), and attaches
 the binaries with a `SHA256SUMS` and a `verified-builds.json` manifest to the
 release.
 

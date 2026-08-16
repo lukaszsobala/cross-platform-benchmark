@@ -17,6 +17,11 @@ endif
 ifneq ($(strip $(MTUNE)),)
 	CFLAGS += -mtune=$(MTUNE)
 endif
+# -mcpu, because Apple's clang has no -march for arm64: the CPU family is the
+# only tuning knob there. Kept separate from MARCH so the two never collide.
+ifneq ($(strip $(MCPU)),)
+	CFLAGS += -mcpu=$(MCPU)
+endif
 
 # Build variants. Auto-vectorization and FMA contraction are translation-unit
 # flags -- no pragma switches them per function -- so a binary that can measure
@@ -46,8 +51,20 @@ KV_FMA_vector-fma   := 1
 
 # Host arch detection to make 'native' robust across platforms (esp. riscv64)
 HOST_ARCH := $(shell uname -m)
+HOST_OS   := $(shell uname -s)
 NATIVE_MARCH ?= native
 NATIVE_MTUNE ?= native
+NATIVE_MCPU  ?=
+ifeq ($(HOST_OS),Darwin)
+	# Apple's clang rejects -march on arm64 outright and its -mcpu=native
+	# support has come and gone between Xcode releases, so probe for it rather
+	# than guess. Falling back to no flag is not a loss: with a deployment
+	# target set, clang already tunes for the Apple core family it is on.
+	NATIVE_MARCH :=
+	NATIVE_MTUNE :=
+	NATIVE_MCPU  := $(shell $(CC) -mcpu=native -E -x c /dev/null \
+	                    >/dev/null 2>&1 && echo native)
+endif
 ifeq ($(HOST_ARCH),riscv64)
 	# On some RISC-V toolchains, -march=native produces an invalid ISA string.
 	# Fall back to a broadly compatible baseline (G = IMAFD).
@@ -61,7 +78,7 @@ TARGET := cpcpub
 OBJS   := src/bench.o src/sha256.o \
           $(addprefix src/kernels-,$(addsuffix .o,$(VARIANTS)))
 
-.PHONY: all clean native sg2000 sg2000-xthead riscv-v rva23 FORCE
+.PHONY: all clean native sg2000 sg2000-xthead riscv-v rva23 loongarch FORCE
 
 all: $(TARGET)
 
@@ -80,7 +97,13 @@ FORCE:
 
 # Convenience target for native tuning
 native:
-	$(MAKE) MARCH=$(NATIVE_MARCH) MTUNE=$(NATIVE_MTUNE) all
+	$(MAKE) MARCH=$(NATIVE_MARCH) MTUNE=$(NATIVE_MTUNE) MCPU=$(NATIVE_MCPU) all
+
+# LoongArch LA64 with the lp64d ABI. The base ISA rather than la464 or la664,
+# so the binary is not tied to one core generation -- `make MARCH=la464` for a
+# tuned build on hardware you know.
+loongarch:
+	$(MAKE) MARCH=loongarch64 all
 
 # RISC-V *ratified* vector (RVV 1.0). Only for hardware that implements 1.0 --
 # see the sg2000 note below before assuming a 'V' in a datasheet means this.
@@ -154,7 +177,7 @@ $(TARGET): $(OBJS)
 # passing is otherwise invisible in the numbers. These are the flags every
 # variant shares; the per-variant pair is baked into each kernels object below
 # and the two are concatenated at report time.
-src/bench.o: src/bench.c src/kernels.h src/sha256.h $(FLAGSTAMP)
+src/bench.o: src/bench.c src/platform.h src/kernels.h src/sha256.h $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DBUILD_CC='"$(CC)"' -DBUILD_FLAGS='"$(CFLAGS)"' -c -o $@ $<
 

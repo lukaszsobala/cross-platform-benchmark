@@ -1,7 +1,8 @@
 # cpcpub
 
-A small, portable CPU benchmark in C (C2x, GCC 13+) for 64-bit x86_64, AArch64
-and RISC-V. No dependencies beyond libc, libm and pthreads.
+A small, portable CPU benchmark in C (C2x, GCC 13+ or Clang) for 64-bit x86_64,
+AArch64, RISC-V and LoongArch, on Linux and macOS. No dependencies beyond libc,
+libm and pthreads.
 
 ## How it works
 
@@ -147,8 +148,38 @@ either way.
 make
 make native                          # -march/-mtune best-effort for the host
 make MARCH=x86-64-v3 MTUNE=generic
+make loongarch                       # LA64, base ISA
 make CFLAGS="-O3 -march=native -mtune=native"
 ```
+
+### Platforms
+
+Linux is the reference. macOS builds and runs, with two capabilities the
+system does not offer and the benchmark therefore does not claim:
+
+| | Linux | macOS |
+| --- | --- | --- |
+| pin a thread to a CPU | yes | **no** — the scheduler owns placement |
+| `sched_getcpu()` — where a thread ran | yes | no, reported as `null` |
+| `mhz` from cpufreq, DRAM controller clock | yes | absent, reported as `null` |
+| POSIX barriers | yes | absent; [platform.h](src/platform.h) shims them |
+
+The first row is the one that changes a number rather than omitting it.
+`cpcpub` turns pinning off on macOS and says so, and `config.pin` in the result
+records that it was off — so `--per-core` there sweeps *requests*, not cores,
+and repeatedly measures whichever core the scheduler picked. On an asymmetric
+part (every Apple Silicon chip) that means the per-core spread is not a P-core
+versus E-core reading. Whole-machine and single-thread figures are unaffected.
+
+A downloaded macOS binary is quarantined by the browser that fetched it and
+will be refused on first run:
+
+```sh
+xattr -d com.apple.quarantine cpcpub-macos-arm64     # or: right-click -> Open
+```
+
+`curl` does not set that attribute, so a `curl -fLO` download needs only
+`chmod +x`.
 
 ### Build variants
 

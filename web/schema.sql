@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS runs (
     compiler_version TEXT,            -- the toolchain's own version banner
     cc            TEXT,               -- driver invoked, e.g. riscv64-linux-gnu-gcc
     build_flags   TEXT,               -- the exact CFLAGS the binary was built with
-    target        TEXT,               -- x86_64 | aarch64 | riscv64
+    target        TEXT,               -- x86_64 | aarch64 | riscv64 | loongarch64
     vectorize     INTEGER,            -- build flags: results are only
     fma           INTEGER,            -- comparable when these two match
 
@@ -144,7 +144,7 @@ CREATE TABLE IF NOT EXISTS verified_builds (
     release     TEXT NOT NULL,     -- the tag it was published under
     release_url TEXT,
     filename    TEXT,              -- the asset name, e.g. cpcpub-riscv64-rva23
-    target      TEXT,              -- x86_64 | aarch64 | riscv64
+    target      TEXT,              -- x86_64 | aarch64 | riscv64 | loongarch64
     march       TEXT,              -- the ISA baseline it was built for
     added_at    TEXT    NOT NULL
 );

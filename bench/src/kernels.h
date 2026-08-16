@@ -105,7 +105,8 @@ extern const kernel_set_t kernels_vector_fma;
 // is one instruction, which is the question being asked here.
 #if defined(__SSE2__) || defined(__AVX__) || defined(__aarch64__) || \
     defined(__ARM_NEON) || defined(__riscv_vector) || \
-    defined(__riscv_xtheadvector)
+    defined(__riscv_xtheadvector) || \
+    defined(__loongarch_sx) || defined(__loongarch_asx)
 #define TARGET_HAS_SIMD 1
 #else
 #define TARGET_HAS_SIMD 0
