@@ -4,6 +4,7 @@
 #   make check      build it, then run the contract and hub tests
 #   make testdata   regenerate testdata/full-run.json on this machine
 #   make serve      run the hub on http://127.0.0.1:8080
+#   make submit     build, measure, and upload the result to a hub
 #
 # Build tuning lives in bench/Makefile and passes straight through:
 #   make native / make sg2000 / make MARCH=x86-64-v3
@@ -15,7 +16,7 @@
 PYTHON ?= python3
 BENCH  := bench/cpu-bench
 
-.PHONY: all bench check contract test testdata serve clean \
+.PHONY: all bench check contract test testdata serve submit clean \
         native riscv-v sg2000 sg2000-xthead
 
 all: bench
@@ -50,6 +51,17 @@ testdata: bench
 
 serve:
 	@$(PYTHON) web/server.py
+
+# Build, measure, upload -- the whole path to a row on the board in one command.
+# Where it goes and who it is from come from the hub config written by
+# `web/submit.sh --save`; HUB, TOKEN and LABEL override that for one run:
+#
+#   make submit LABEL="workstation, quiet"
+#   make submit HUB=https://hub.example TOKEN=... LABEL="sbc"
+submit: bench
+	@./$(BENCH) --full --json | web/submit.sh \
+	    $(if $(HUB),-u '$(HUB)') $(if $(TOKEN),-t '$(TOKEN)') \
+	    $(if $(LABEL),-l '$(LABEL)') $(if $(NOTES),-n '$(NOTES)')
 
 clean:
 	@$(MAKE) -C bench clean

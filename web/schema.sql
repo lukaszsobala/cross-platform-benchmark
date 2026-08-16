@@ -1,14 +1,51 @@
 -- cpu-bench results hub.
 --
--- Two tables: one row per uploaded run, one row per core/thread record inside
--- it. The records are flattened out of the JSON so the leaderboard can sort and
--- filter in SQL; the original document is kept verbatim in runs.raw so nothing
--- an upload contained is ever lost to the flattening.
+-- Four tables: one row per uploaded run, one row per core/thread record inside
+-- it, and the accounts a run may be attributed to with their live sessions. The
+-- records are flattened out of the JSON so the leaderboard can sort and filter
+-- in SQL; the original document is kept verbatim in runs.raw so nothing an
+-- upload contained is ever lost to the flattening.
+
+-- An account is a name, a password and an upload token. Nothing else is asked
+-- for: no email is collected, so there is no address to leak and no password
+-- reset to implement -- a forgotten password is a new account.
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY,
+    name          TEXT    NOT NULL,   -- as typed; unique case-insensitively
+    password_hash TEXT    NOT NULL,   -- scrypt$n$r$p$salt$hash, see server.py
+    -- Readable, because the account page has to be able to show it again --
+    -- it is what the submit command carries. It grants uploading and deleting
+    -- as this account and nothing else, and rotating it is one click.
+    api_token     TEXT    NOT NULL UNIQUE,
+    created_at    TEXT    NOT NULL
+);
+
+-- "someone@ThisBox" and "someone@thisbox" must not be two accounts: the board
+-- shows the name, and two spellings of one name is an impersonation.
+CREATE UNIQUE INDEX IF NOT EXISTS users_name ON users(lower(name));
+
+-- One row per signed-in browser. The cookie holds the token; this holds its
+-- SHA-256, so a copy of the database does not hand over live sessions.
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash  TEXT    PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at  TEXT    NOT NULL,
+    expires_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
 
 CREATE TABLE IF NOT EXISTS runs (
     id            INTEGER PRIMARY KEY,
     created_at    TEXT    NOT NULL,
     delete_token  TEXT    NOT NULL,
+    -- Who uploaded it, when anyone did. NULL is an anonymous upload: the board
+    -- keeps taking those, and the delete token stays the only way to withdraw
+    -- one. Plain column rather than a foreign key, because closing an account
+    -- takes its runs with it in one explicit transaction, and because an
+    -- existing database gains this column by ALTER TABLE, which cannot add a
+    -- reference in SQLite.
+    user_id       INTEGER,
     label         TEXT,
     notes         TEXT,
 

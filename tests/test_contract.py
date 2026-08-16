@@ -199,8 +199,10 @@ class ContractTest(unittest.TestCase):
                 cores = {r["name"] for r in db.execute("PRAGMA table_info(cores)")}
         self.assertEqual(set(srv.RUN_COLUMNS) - runs, set())
         self.assertEqual(set(srv.CORE_COLUMNS) - cores, set())
-        # Columns insert() writes that RUN_COLUMNS does not read back.
-        self.assertEqual({"delete_token", "raw"} - runs, set())
+        # Columns insert() writes that RUN_COLUMNS does not read back. The
+        # submitter is one of them: a run carries `user_id`, and everything
+        # that reads a run resolves it to a name instead.
+        self.assertEqual({"delete_token", "raw", "user_id"} - runs, set())
 
     def test_document_survives_a_round_trip(self):
         """Every value the benchmark measured comes back out of the database."""

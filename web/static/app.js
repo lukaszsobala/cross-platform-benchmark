@@ -17,7 +17,15 @@ const state = {
   norm: "abs",
   detailed: false,      // every metric, rather than the headline set
   scopeNote: "",        // what changing scope did to the selection, if anything
+  user: null,           // the signed-in account, from /api/auth/me
+  submitter: "",        // board narrowed to one account's uploads, by name
+  files: [],            // result documents chosen but not yet uploaded
 };
+
+// The page reads this one to prove a write came from the page rather than from
+// another site that merely knows the session cookie exists. The session cookie
+// itself is HttpOnly and unreadable here, which is the point.
+const CSRF_COOKIE = "cpb_csrf";
 
 // Which way a metric runs, in words and in one glyph. Every place a metric is
 // named says this: a bar is drawn from the measurement itself, so nothing in
@@ -46,11 +54,49 @@ const el = (tag, cls, text) => {
   return n;
 };
 
+function cookie(name) {
+  for (const part of document.cookie.split(";")) {
+    const [k, ...v] = part.trim().split("=");
+    if (k === name) return decodeURIComponent(v.join("="));
+  }
+  return "";
+}
+
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  const o = { ...(opts || {}) };
+  // Anything that changes something carries the CSRF token. Reads do not need
+  // it, and neither does a request with no session behind it.
+  if (o.method && o.method !== "GET") {
+    const csrf = cookie(CSRF_COOKIE);
+    if (csrf) o.headers = { ...(o.headers || {}), "X-CSRF-Token": csrf };
+  }
+  const r = await fetch(path, o);
   const body = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
   if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
   return body;
+}
+
+// A button that puts a block of shell on the clipboard, for the machine that
+// is not this one. Falls back to selecting the text when the clipboard is not
+// available (it is not, over plain http on some browsers), so the gesture is
+// never simply dead.
+function copyButton(btn) {
+  const pre = document.getElementById(btn.dataset.copy);
+  if (!pre) return;
+  const done = (msg) => {
+    btn.textContent = msg;
+    setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+  };
+  const select = () => {
+    const range = document.createRange();
+    range.selectNodeContents(pre);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    done("selected");
+  };
+  if (!navigator.clipboard) return select();
+  navigator.clipboard.writeText(pre.textContent).then(() => done("copied"), select);
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +183,9 @@ function filterParams() {
   // The search box does not: half-typed text is not a filter anyone asked for,
   // so it applies on submit and is held here until then.
   if (state.search) p.set("q", state.search);
+  // Set by clicking a submitter's name rather than by a control in the form,
+  // and shown as a chip above the table so it is never a filter you cannot see.
+  if (state.submitter) p.set("user", state.submitter);
   // Sorting is not a filter either -- it lives on the column headers.
   p.set("sort", state.sort);
   p.set("order", state.order);
@@ -234,7 +283,27 @@ function metricCells(tr, row) {
   for (const m of shownMetrics()) tr.append(el("td", "num", fmt(value(row, m))));
 }
 
+function filterBySubmitter(name) {
+  state.submitter = name || "";
+  showTab("board");
+  syncHash();
+  loadBoard().catch((e) => alert(e.message));
+}
+
+function renderSubmitterChip() {
+  const box = $("#board-chip");
+  box.replaceChildren();
+  box.hidden = !state.submitter;
+  if (!state.submitter) return;
+  box.append(el("span", null, `Showing uploads by ${state.submitter}`));
+  const clear = el("button", "linkish", "show everyone");
+  clear.type = "button";
+  clear.addEventListener("click", () => filterBySubmitter(""));
+  box.append(clear);
+}
+
 function renderBoard() {
+  renderSubmitterChip();
   const table = $("#board-table");
   const thead = table.tHead;
   const tbody = table.tBodies[0];
@@ -272,6 +341,16 @@ function renderBoard() {
     head.append(link);
     name.append(head);
     if (row.label) name.append(el("span", "label", row.label));
+    // Who uploaded it, when anyone signed in did. Clicking narrows the board to
+    // that account -- one machine's owner usually has several, and reading them
+    // together is the reason to have accounts at all.
+    if (row.user) {
+      const by = el("button", "by", `by ${row.user}`);
+      by.type = "button";
+      by.title = `show only ${row.user}'s uploads`;
+      by.addEventListener("click", () => filterBySubmitter(row.user));
+      name.append(by);
+    }
     tr.append(name);
 
     tr.append(el("td", "", row.target || "—"), el("td", "flags", flagsText(row)));
@@ -354,10 +433,14 @@ async function toggleSelect(row, on) {
   renderBoard();
 }
 
-// Keep the selection in the URL so a comparison can be shared as a link.
+// Keep what the page is showing in the URL, so a comparison or one
+// submitter's board can be shared as a link.
 function syncHash() {
+  const parts = [];
+  if (state.submitter) parts.push(`user=${state.submitter}`);
   const ids = [...state.selected.keys()];
-  const want = ids.length ? `#compare=${ids.join(",")}` : "";
+  if (ids.length) parts.push(`compare=${ids.join(",")}`);
+  const want = parts.length ? "#" + parts.join("&") : "";
   if (location.hash !== want) {
     history.replaceState(null, "", location.pathname + want);
   }
@@ -487,6 +570,7 @@ async function showRun(id) {
   // on the way in, so it starts folded.
   box.append(metaList([
     ["uploaded", run.created_at],
+    ["submitted by", run.user || "anonymous"],
     ["system", [run.sysname, run.os_release, run.machine].filter(Boolean).join(" ")],
   ]));
 
@@ -571,7 +655,451 @@ async function showRun(id) {
 }
 
 // ---------------------------------------------------------------------------
-// Upload
+// Accounts
+// ---------------------------------------------------------------------------
+//
+// An account does three things and claims nothing else: it puts a name on a
+// run, it lets that run be withdrawn from any browser rather than only from
+// the one holding a delete token, and it carries an upload token so the
+// machine that ran the benchmark can post its own result. Uploading without
+// one still works everywhere it did.
+
+async function loadUser() {
+  try {
+    const { user } = await api("/api/auth/me");
+    state.user = user;
+  } catch {
+    state.user = null;          // a hub that has not been signed into is fine
+  }
+  renderWhoami();
+  renderAccount();
+  renderCommands();
+  renderMine();
+}
+
+function renderWhoami() {
+  const box = $("#whoami");
+  box.replaceChildren();
+  if (state.user) {
+    const me = el("button", "linkish", state.user.name);
+    me.type = "button";
+    me.title = "your account";
+    me.addEventListener("click", () => showTab("account"));
+    box.append(el("span", "muted", "signed in as "), me);
+    const out = el("button", "linkish", "sign out");
+    out.type = "button";
+    out.addEventListener("click", () => signOut().catch((e) => alert(e.message)));
+    box.append(el("span", "muted", " · "), out);
+    return;
+  }
+  const go = el("button", "linkish", "Sign in or create an account");
+  go.type = "button";
+  go.addEventListener("click", () => showTab("account"));
+  box.append(go);
+  box.append(el("span", "muted", " — optional; uploading works without one"));
+}
+
+async function signOut() {
+  await api("/api/auth/logout", { method: "POST" });
+  await loadUser();
+  await loadBoard();
+}
+
+// One form for both doors. Registering and signing in ask for exactly the same
+// two things, so they are the same fields with a different button rather than
+// two forms side by side that a reader has to tell apart.
+function authForm() {
+  const wrap = el("div", "panel");
+  wrap.append(el("h2", null, "Sign in"));
+  wrap.append(el("p", "note",
+    "An account is a name and a password — no email is asked for, and so " +
+    "there is no password reset. It puts your name on the runs you upload, " +
+    "lets you withdraw them from any browser, and gives you an upload token " +
+    "for submitting straight from the machine you measured."));
+
+  const form = el("form", "authform");
+  const name = el("input");
+  name.type = "text";
+  name.id = "auth-name";
+  name.autocomplete = "username";
+  name.maxLength = 32;
+  name.placeholder = "3–32 characters: letters, digits, . _ -";
+  const nameLabel = el("label", null, "Name");
+  nameLabel.append(name);
+
+  const pw = el("input");
+  pw.type = "password";
+  pw.id = "auth-password";
+  pw.autocomplete = "current-password";
+  pw.placeholder = "at least 8 characters";
+  const pwLabel = el("label", null, "Password");
+  pwLabel.append(pw);
+
+  const row = el("div", "buttons");
+  const signin = el("button", null, "Sign in");
+  signin.type = "submit";
+  const register = el("button", "secondary", "Create account");
+  register.type = "button";
+  row.append(signin, register);
+
+  const msg = el("p", "authmsg");
+  const go = async (path) => {
+    msg.className = "authmsg";
+    msg.textContent = "";
+    try {
+      const out = await api(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name.value.trim(), password: pw.value }),
+      });
+      state.user = out.user;
+      pw.value = "";
+      renderWhoami();
+      renderAccount();
+      renderCommands();
+      renderMine();
+      await loadBoard();
+    } catch (e) {
+      msg.className = "authmsg warn";
+      msg.textContent = e.message;
+    }
+  };
+  form.addEventListener("submit", (e) => { e.preventDefault(); go("/api/auth/login"); });
+  register.addEventListener("click", () => go("/api/auth/register"));
+
+  form.append(nameLabel, pwLabel, row, msg);
+  wrap.append(form);
+  return wrap;
+}
+
+function accountPanel() {
+  const u = state.user;
+  const wrap = el("div", "panel");
+  wrap.append(el("h2", null, u.name));
+  wrap.append(el("p", "note",
+    `Account since ${(u.created_at || "").slice(0, 10)} · ` +
+    `${u.runs} run${u.runs === 1 ? "" : "s"} uploaded.`));
+
+  const seeMine = el("button", "linkish", "See them on the leaderboard");
+  seeMine.type = "button";
+  seeMine.addEventListener("click", () => filterBySubmitter(u.name));
+  const p = el("p");
+  p.append(seeMine);
+  wrap.append(p);
+
+  wrap.append(el("h3", null, "Upload token"));
+  wrap.append(el("p", "note",
+    "Send this from the machine that ran the benchmark and the result lands " +
+    "on this account with nothing to copy back. It grants uploading and " +
+    "withdrawing as you and nothing else — it cannot change your password or " +
+    "read anything the board does not already show."));
+  wrap.append(el("code", "token", u.api_token));
+
+  const rotate = el("button", "danger", "Issue a new token");
+  rotate.type = "button";
+  rotate.addEventListener("click", async () => {
+    if (!confirm("Issue a new token? Anything still using the old one will " +
+                 "start being refused.")) return;
+    try {
+      const out = await api("/api/auth/token", { method: "POST" });
+      state.user.api_token = out.api_token;
+      renderAccount();
+      renderCommands();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+  const rp = el("p");
+  rp.append(rotate);
+  wrap.append(rp);
+
+  wrap.append(el("h3", null, "Change password"));
+  const pwForm = el("form", "authform");
+  const cur = el("input");
+  cur.type = "password";
+  cur.autocomplete = "current-password";
+  const curLabel = el("label", null, "Current password");
+  curLabel.append(cur);
+  const next = el("input");
+  next.type = "password";
+  next.autocomplete = "new-password";
+  next.placeholder = "at least 8 characters";
+  const nextLabel = el("label", null, "New password");
+  nextLabel.append(next);
+  const pwMsg = el("p", "authmsg");
+  const pwGo = el("button", null, "Change password");
+  pwGo.type = "submit";
+  pwForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    pwMsg.className = "authmsg";
+    try {
+      await api("/api/auth/password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ current: cur.value, password: next.value }),
+      });
+      cur.value = next.value = "";
+      pwMsg.className = "authmsg ok";
+      pwMsg.textContent = "Password changed. Other browsers have been signed out.";
+    } catch (err) {
+      pwMsg.className = "authmsg warn";
+      pwMsg.textContent = err.message;
+    }
+  });
+  pwForm.append(curLabel, nextLabel, pwGo, pwMsg);
+  wrap.append(pwForm);
+
+  const danger = el("details", "more");
+  danger.append(el("summary", null, "Close this account"));
+  danger.append(el("p", "note",
+    "Closing the account deletes every run uploaded under it — they are not " +
+    "left on the board without a name, because a run nobody can withdraw is " +
+    "worse than no run. This cannot be undone."));
+  const closeForm = el("form", "authform");
+  const closePw = el("input");
+  closePw.type = "password";
+  closePw.autocomplete = "current-password";
+  const closeLabel = el("label", null, "Password");
+  closeLabel.append(closePw);
+  const closeGo = el("button", "danger", "Close account and delete my runs");
+  closeGo.type = "submit";
+  const closeMsg = el("p", "authmsg");
+  closeForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!confirm(`Delete the account "${u.name}" and all ${u.runs} of its runs?`)) return;
+    try {
+      const out = await api("/api/auth/close", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: closePw.value }),
+      });
+      state.user = null;
+      state.submitter = "";
+      renderWhoami();
+      renderAccount();
+      renderCommands();
+      renderMine();
+      await loadBoard();
+      alert(`Account closed. ${out.runs_deleted} run(s) removed.`);
+    } catch (err) {
+      closeMsg.className = "authmsg warn";
+      closeMsg.textContent = err.message;
+    }
+  });
+  closeForm.append(closeLabel, closeGo, closeMsg);
+  danger.append(closeForm);
+  wrap.append(danger);
+  return wrap;
+}
+
+function renderAccount() {
+  const box = $("#account-body");
+  box.replaceChildren();
+  box.append(state.user ? accountPanel() : authForm());
+}
+
+// ---------------------------------------------------------------------------
+// Submitting
+// ---------------------------------------------------------------------------
+
+// The two shell blocks on the Submit tab. Both carry this hub's address, and
+// both carry the token when there is one to carry -- a command you have to
+// edit before it works is a command most people will get wrong once.
+function renderCommands() {
+  const token = state.user && state.user.api_token;
+  $("#cmd-run").textContent =
+    "make\n" +
+    "bench/cpu-bench --full --json > run.json";
+
+  $("#shell-note").textContent = token
+    ? "Saved once per machine, with your upload token, so later runs are one " +
+      "pipe. The token identifies you: keep it out of shared shell history " +
+      "and out of scripts you publish."
+    : "Sign in first and these carry your upload token, so the result lands " +
+      "on your account. Without one they still work — the run goes up " +
+      "anonymously and the reply carries a delete token to keep.";
+
+  $("#cmd-setup").textContent =
+    `web/submit.sh --save -u ${location.origin}` +
+    (token ? ` -t ${token}` : "") + "\n" +
+    "bench/cpu-bench --full --json | web/submit.sh -l \"my box\"";
+
+  $("#cmd-curl").textContent =
+    "bench/cpu-bench --full --json \\\n" +
+    `  | curl -fsS -X POST "${location.origin}/api/runs?label=my+box" \\\n` +
+    (token ? `         -H "Authorization: Bearer ${token}" \\\n` : "") +
+    "         -H 'Content-Type: application/json' --data-binary @-";
+}
+
+// What was dropped or chosen, before anything is sent. Parsed here so a file
+// that is not a result says so immediately rather than after a round trip, and
+// so a --variants array can be seen for what it is: several runs in one file.
+function takeFiles(files) {
+  const out = $("#uploadresult");
+  out.replaceChildren();
+  state.files = [];
+  const jobs = [...files].map(async (f) => {
+    const text = await f.text();
+    let doc;
+    try {
+      doc = JSON.parse(text);
+    } catch (e) {
+      return { name: f.name, error: `not JSON: ${e.message}` };
+    }
+    return { name: f.name, docs: Array.isArray(doc) ? doc : [doc] };
+  });
+  return Promise.all(jobs).then((picked) => {
+    state.files = picked;
+    renderPicked();
+  });
+}
+
+// One document per upload, in the order they will be sent, each with the label
+// it will carry. A --variants run is an array of four builds; the hub keys a
+// run on the two build flags, so they go up as four runs -- which is what makes
+// them comparable with each other at all.
+function pending() {
+  const base = $("#label").value.trim();
+  const out = [];
+  for (const f of state.files) {
+    if (!f.docs) continue;
+    const many = f.docs.length > 1;
+    f.docs.forEach((doc, i) => {
+      const build = (doc && doc.build) || {};
+      const variant = `${build.vectorize ? "vector" : "scalar"}-${build.fma ? "fma" : "nofma"}`;
+      out.push({
+        doc,
+        source: f.name,
+        variant: many ? variant : null,
+        label: many ? `${base ? base + " " : ""}(${variant})` : base,
+        machine: (doc && doc.system && doc.system.cpu_models) || f.name,
+      });
+    });
+  }
+  return out;
+}
+
+function renderPicked() {
+  const box = $("#picked");
+  box.replaceChildren();
+  const errors = state.files.filter((f) => f.error);
+  const jobs = pending();
+  box.hidden = !state.files.length;
+  for (const e of errors) {
+    box.append(el("p", "warn", `${e.name}: ${e.error}`));
+  }
+  if (jobs.length) {
+    box.append(el("p", "ok", jobs.length === 1
+      ? `Ready: ${jobs[0].machine}`
+      : `Ready: ${jobs.length} runs, uploaded one after another.`));
+    const ul = el("ul", "picked-list");
+    for (const j of jobs) {
+      const li = el("li", null, j.machine);
+      if (j.variant) li.append(el("span", "muted", ` · ${j.variant}`));
+      ul.append(li);
+    }
+    box.append(ul);
+    if (jobs.length > 1) {
+      box.append(el("p", "note",
+        "That file holds one document per build variant. Each goes up as its " +
+        "own run, because results are only comparable between builds with " +
+        "matching vectorize and FMA flags."));
+    }
+  }
+  $("#uploadgo").textContent = jobs.length > 1 ? `Upload ${jobs.length} runs` : "Upload";
+}
+
+// Everything chosen, in order, reporting each as it lands. Sequential rather
+// than parallel: the rate limiter counts uploads, and a four-variant run that
+// half-succeeded because four requests raced is a confusing thing to explain.
+async function doUpload(ev) {
+  ev.preventDefault();
+  const out = $("#uploadresult");
+  out.replaceChildren();
+
+  let jobs = pending();
+  const pasted = $("#paste").value.trim();
+  if (!jobs.length && pasted) {
+    let doc;
+    try {
+      doc = JSON.parse(pasted);
+    } catch (e) {
+      out.append(el("p", "warn", `That is not JSON: ${e.message}`));
+      return;
+    }
+    state.files = [{ name: "pasted", docs: Array.isArray(doc) ? doc : [doc] }];
+    jobs = pending();
+  }
+  if (!jobs.length) {
+    out.append(el("p", "warn", "Drop a result file, choose one, or paste the JSON first."));
+    return;
+  }
+
+  const notes = $("#notes").value.trim();
+  const go = $("#uploadgo");
+  go.disabled = true;
+  let stored = 0;
+  for (const job of jobs) {
+    const p = new URLSearchParams();
+    if (job.label) p.set("label", job.label);
+    if (notes) p.set("notes", notes);
+    try {
+      const res = await api("/api/runs?" + p.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(job.doc),
+      });
+      stored++;
+      out.append(uploadReceipt(job, res));
+      if (!res.user) {
+        rememberRun({ id: res.id, token: res.delete_token, name: job.machine,
+                      at: new Date().toISOString().slice(0, 16).replace("T", " ") });
+      }
+    } catch (e) {
+      out.append(el("p", "warn", `${job.machine}: ${e.message}`));
+    }
+  }
+  go.disabled = false;
+  if (stored) {
+    state.files = [];
+    $("#paste").value = "";
+    $("#file").value = "";
+    renderPicked();
+    $("#picked").hidden = true;
+    if (state.user) await loadUser();
+    loadBoard().catch(() => {});
+  }
+}
+
+// What one stored run says back. On an account that is a link and nothing to
+// keep; anonymous it is a link and a token that is the only way back, so the
+// token is shown as prominently as the success.
+function uploadReceipt(job, res) {
+  const card = el("div", "receipt");
+  card.append(el("p", "ok",
+    `Stored run ${res.id}${job.variant ? ` (${job.variant})` : ""} — one ` +
+    `leaderboard row holding all ${res.records} records.`));
+  const line = el("p");
+  const link = el("button", "linkish", "See where it lands");
+  link.type = "button";
+  link.addEventListener("click", () => showRun(res.id));
+  line.append(link);
+  card.append(line);
+  if (res.user) {
+    card.append(el("p", "muted",
+      `On your account as ${res.user}. Withdraw it any time from My uploads, ` +
+      `in this browser or another.`));
+  } else {
+    card.append(el("p", "muted",
+      "Uploaded anonymously. This delete token is the only way to withdraw " +
+      "it — it is saved in this browser, under My uploads:"));
+    card.append(el("code", "token", res.delete_token));
+  }
+  return card;
+}
+
+// ---------------------------------------------------------------------------
+// My uploads
 // ---------------------------------------------------------------------------
 
 function myRuns() {
@@ -589,94 +1117,105 @@ function rememberRun(entry) {
   renderMine();
 }
 
+function forgetRun(id) {
+  localStorage.setItem("cpu-bench-uploads",
+    JSON.stringify(myRuns().filter((e) => e.id !== id)));
+}
+
+// After anything leaves the board: a withdrawn run may still be ticked into a
+// comparison, and a comparison of rows that no longer exist is worse than an
+// empty one.
+async function afterDelete() {
+  state.selected.clear();
+  state.scopeNote = "";
+  renderSelection();
+  renderMine();
+  if (state.user) await loadUser();
+  loadBoard().catch(() => {});
+}
+
+function runCard(title, at, { token, onDelete }) {
+  const card = el("div", "mine-card");
+  card.append(title);
+  card.append(el("span", "muted", at || ""));
+  if (token) card.append(el("code", "token", token));
+  const del = el("button", "danger", "Withdraw");
+  del.type = "button";
+  del.addEventListener("click", onDelete);
+  card.append(del);
+  return card;
+}
+
+async function renderAccountRuns() {
+  const box = $("#mine-account");
+  box.replaceChildren();
+  if (!state.user) {
+    box.append(el("p", "note",
+      "Sign in and your uploads are listed here on the account instead, " +
+      "withdrawable from any browser without a token."));
+    return;
+  }
+  box.append(el("h2", null, `On your account (${state.user.name})`));
+  let runs = [];
+  try {
+    ({ runs } = await api("/api/runs?user=me&limit=200"));
+  } catch (e) {
+    box.append(el("p", "warn", e.message));
+    return;
+  }
+  if (!runs.length) {
+    box.append(el("p", "empty", "Nothing uploaded to this account yet."));
+    return;
+  }
+  for (const run of runs) {
+    const title = el("button", "linkish",
+      run.cpu_models || run.machine || `run ${run.id}`);
+    title.type = "button";
+    title.addEventListener("click", () => showRun(run.id));
+    box.append(runCard(title, run.created_at, {
+      onDelete: async () => {
+        if (!confirm(`Withdraw run ${run.id} from the leaderboard?`)) return;
+        try {
+          await api(`/api/runs/${run.id}`, { method: "DELETE" });
+          forgetRun(run.id);
+          await afterDelete();
+        } catch (e) {
+          alert(e.message);
+        }
+      },
+    }));
+  }
+}
+
 function renderMine() {
+  renderAccountRuns().catch(() => {});
   const box = $("#minelist");
   box.replaceChildren();
   const all = myRuns();
   if (!all.length) {
-    box.append(el("p", "empty", "No uploads from this browser yet."));
+    box.append(el("p", "empty", "No anonymous uploads from this browser."));
     return;
   }
   for (const entry of all) {
-    const card = el("div", "mine-card");
     const title = el("button", "linkish", entry.name || `run ${entry.id}`);
     title.type = "button";
     title.addEventListener("click", () => showRun(entry.id));
-    card.append(title);
-    card.append(el("span", "muted", entry.at || ""));
-    const tok = el("code", "token", entry.token);
-    card.append(tok);
-    const del = el("button", "danger", "Delete");
-    del.type = "button";
-    del.addEventListener("click", async () => {
-      if (!confirm(`Delete run ${entry.id} from the leaderboard?`)) return;
-      try {
-        await api(`/api/runs/${entry.id}`, {
-          method: "DELETE",
-          headers: { "X-Delete-Token": entry.token },
-        });
-        localStorage.setItem("cpu-bench-uploads",
-          JSON.stringify(myRuns().filter((e) => e.id !== entry.id)));
-        state.selected.clear();
-        state.scopeNote = "";
-        renderSelection();
-        renderMine();
-        loadBoard().catch(() => {});
-      } catch (e) {
-        alert(e.message);
-      }
-    });
-    card.append(del);
-    box.append(card);
-  }
-}
-
-async function doUpload(ev) {
-  ev.preventDefault();
-  const out = $("#uploadresult");
-  out.replaceChildren();
-
-  let text = $("#paste").value.trim();
-  const file = $("#file").files[0];
-  if (file) text = (await file.text()).trim();
-  if (!text) {
-    out.append(el("p", "warn", "Choose a file or paste the JSON first."));
-    return;
-  }
-
-  const p = new URLSearchParams();
-  if ($("#label").value.trim()) p.set("label", $("#label").value.trim());
-  if ($("#notes").value.trim()) p.set("notes", $("#notes").value.trim());
-
-  try {
-    const res = await api("/api/runs?" + p.toString(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: text,
-    });
-    let name = `run ${res.id}`;
-    try {
-      const doc = JSON.parse(text);
-      name = (doc.system && doc.system.cpu_models) || name;
-    } catch { /* the server already validated it */ }
-    rememberRun({ id: res.id, token: res.delete_token, name,
-                  at: new Date().toISOString().slice(0, 16).replace("T", " ") });
-    out.append(el("p", "ok",
-      `Stored run ${res.id} — one leaderboard row, holding all ${res.records} ` +
-      `records. Expand it to see every core.`));
-    const p2 = el("p");
-    const link = el("button", "linkish", "See where it lands");
-    link.type = "button";
-    link.addEventListener("click", () => showRun(res.id));
-    p2.append(link);
-    out.append(p2);
-    out.append(el("p", "muted", "Delete token (keep it to withdraw this run):"));
-    out.append(el("code", "token", res.delete_token));
-    $("#paste").value = "";
-    $("#file").value = "";
-    loadBoard().catch(() => {});
-  } catch (e) {
-    out.append(el("p", "warn", e.message));
+    box.append(runCard(title, entry.at, {
+      token: entry.token,
+      onDelete: async () => {
+        if (!confirm(`Withdraw run ${entry.id} from the leaderboard?`)) return;
+        try {
+          await api(`/api/runs/${entry.id}`, {
+            method: "DELETE",
+            headers: { "X-Delete-Token": entry.token },
+          });
+          forgetRun(entry.id);
+          await afterDelete();
+        } catch (e) {
+          alert(e.message);
+        }
+      },
+    }));
   }
 }
 
@@ -690,12 +1229,57 @@ function setupTabs() {
   }
 }
 
+// The drop target is also a file picker and also keyboard-reachable: the same
+// step done by dragging, by clicking, or by tabbing to it and pressing enter.
+function setupDropzone() {
+  const zone = $("#drop");
+  const input = $("#file");
+  const take = (files) => {
+    if (files && files.length) takeFiles(files).catch((e) => alert(e.message));
+  };
+  zone.addEventListener("click", () => input.click());
+  zone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      input.click();
+    }
+  });
+  input.addEventListener("change", () => take(input.files));
+  for (const type of ["dragenter", "dragover"]) {
+    zone.addEventListener(type, (e) => {
+      e.preventDefault();
+      zone.classList.add("over");
+    });
+  }
+  for (const type of ["dragleave", "dragend"]) {
+    zone.addEventListener(type, () => zone.classList.remove("over"));
+  }
+  zone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    zone.classList.remove("over");
+    take(e.dataTransfer && e.dataTransfer.files);
+  });
+  // Dropping anywhere else must not make the browser navigate to the file,
+  // which looks exactly like the upload silently failing.
+  for (const type of ["dragover", "drop"]) {
+    window.addEventListener(type, (e) => {
+      if (!zone.contains(e.target)) e.preventDefault();
+    });
+  }
+  // The label is part of what each pending upload will be called, so the
+  // preview follows it as it is typed.
+  $("#label").addEventListener("input", () => {
+    if (state.files.length) renderPicked();
+  });
+}
+
 async function boot() {
   setupTabs();
-  $("#curl").textContent =
-    `./cpu-bench --per-core --json \\\n` +
-    `  | curl -fsS -X POST "${location.origin}/api/runs?label=my+box" \\\n` +
-    `         -H 'Content-Type: application/json' --data-binary @-`;
+  setupDropzone();
+  for (const b of document.querySelectorAll("button.copy")) {
+    b.addEventListener("click", () => copyButton(b));
+  }
+  renderCommands();
 
   const meta = await api("/api/metrics");
   state.metrics = meta.metrics;
@@ -741,8 +1325,15 @@ async function boot() {
     if (e.key === "Escape") $("#detail").hidden = true;
   });
 
-  renderMine();
+  // Who is signed in decides what the Account tab and the shell commands say,
+  // and whether My uploads has an account half. It never blocks the board.
+  await loadUser();
   renderSelection();
+
+  // #user=name is a link to one submitter's uploads, so it has to be read
+  // before the board is first loaded rather than reloading it afterwards.
+  const who = location.hash.match(/user=([A-Za-z0-9._-]{3,32})/);
+  if (who) state.submitter = who[1];
   await loadBoard();
 
   // Deep links: #run=N opens a run, #compare=1,2,3 restores a shared comparison.

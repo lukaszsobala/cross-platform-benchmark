@@ -9,14 +9,19 @@
 </head>
 <body>
 <header>
-  <h1>cpu-bench results</h1>
+  <div class="masthead">
+    <h1>cpu-bench results</h1>
+    <!-- Filled in by the page: who you are, or the way to become someone. -->
+    <div class="whoami" id="whoami"></div>
+  </div>
 </header>
 
 <nav class="tabs" id="tabs">
   <button type="button" data-tab="board" class="active">Leaderboard</button>
   <button type="button" data-tab="compare">Compare <span id="selcount"></span></button>
-  <button type="button" data-tab="upload">Upload</button>
+  <button type="button" data-tab="upload">Submit a result</button>
   <button type="button" data-tab="mine">My uploads</button>
+  <button type="button" data-tab="account">Account</button>
 </nav>
 
 <main>
@@ -59,6 +64,9 @@
     <button type="submit">Search</button>
   </form>
 
+  <!-- Only present while the board is narrowed to one submitter. -->
+  <div id="board-chip" hidden></div>
+
   <p class="note">
     Results are only comparable between builds with the same <strong>vectorize</strong> and
     <strong>FMA</strong> flags.
@@ -82,41 +90,69 @@
 </section>
 
 <section id="upload" class="tab">
-  <h2>From the shell</h2>
-  <pre id="curl"></pre>
-  <p class="note">
-    Use <code>--per-core</code> for a per-core sweep (the most comparable form on
-    a heterogeneous machine), or a plain run for whole-machine numbers. Quiesce
-    the machine first: background load depresses every result and biases
-    <code>DISPcap</code> upward.
-  </p>
+  <ol class="steps">
+    <li>
+      <h2>Run the benchmark</h2>
+      <p class="note">
+        On the machine you want on the board, with nothing else running:
+        background load depresses every result and biases <code>DISPcap</code>
+        upward. <code>--full</code> is the form worth uploading — the totals say
+        what the machine does at once, the per-core records what each core does
+        alone.
+      </p>
+      <div class="cmd"><pre id="cmd-run"></pre><button type="button" class="copy" data-copy="cmd-run">Copy</button></div>
+    </li>
 
-  <h2>From this page</h2>
-  <form id="uploadform">
-    <label>Result file
-      <input type="file" id="file" accept=".json,application/json">
-    </label>
-    <label>…or paste the JSON
-      <textarea id="paste" rows="6" spellcheck="false" placeholder='{ "schema": "cpu-bench/1", ... }'></textarea>
-    </label>
-    <label>Label (optional)
-      <input type="text" id="label" maxlength="200" placeholder="e.g. workstation, quiet, performance governor">
-    </label>
-    <label>Notes (optional)
-      <textarea id="notes" rows="2" maxlength="2000" placeholder="cooling, kernel, anything that explains the numbers"></textarea>
-    </label>
-    <button type="submit">Upload</button>
-  </form>
-  <div id="uploadresult"></div>
+    <li>
+      <h2>Send it here</h2>
+      <div class="drop" id="drop" tabindex="0" role="button"
+           aria-label="Choose or drop a cpu-bench result file">
+        <strong>Drop <code>run.json</code> here</strong>
+        <span class="muted">or click to choose a file</span>
+        <input type="file" id="file" accept=".json,application/json" multiple hidden>
+      </div>
+      <div id="picked" class="picked" hidden></div>
+
+      <form id="uploadform">
+        <label>Label (optional)
+          <input type="text" id="label" maxlength="200" placeholder="e.g. workstation, quiet, performance governor">
+        </label>
+        <label>Notes (optional)
+          <textarea id="notes" rows="2" maxlength="2000" placeholder="cooling, kernel, anything that explains the numbers"></textarea>
+        </label>
+        <details class="more">
+          <summary>…or paste the JSON instead</summary>
+          <textarea id="paste" rows="6" spellcheck="false" placeholder='{ "schema": "cpu-bench/1", ... }'></textarea>
+        </details>
+        <button type="submit" id="uploadgo">Upload</button>
+      </form>
+      <div id="uploadresult"></div>
+    </li>
+  </ol>
+
+  <details class="more shell">
+    <summary>Submit from the machine itself, without a browser</summary>
+    <p class="note" id="shell-note"></p>
+    <div class="cmd"><pre id="cmd-setup"></pre><button type="button" class="copy" data-copy="cmd-setup">Copy</button></div>
+    <p class="note">Or in one line, with no helper script:</p>
+    <div class="cmd"><pre id="cmd-curl"></pre><button type="button" class="copy" data-copy="cmd-curl">Copy</button></div>
+  </details>
 </section>
 
 <section id="mine" class="tab">
+  <div id="mine-account"></div>
+  <h2>Uploaded from this browser</h2>
   <p class="note">
-    Uploads made from this browser. The delete token is kept in this browser's
-    local storage only — it is the only way to withdraw a run, so save it if you
-    care about being able to.
+    Anonymous uploads made here. The delete token is kept in this browser's
+    local storage only — it is the only way to withdraw one, so save it if you
+    care about being able to. Uploads made while signed in need no token: they
+    are on the account and can be withdrawn from anywhere.
   </p>
   <div id="minelist"></div>
+</section>
+
+<section id="account" class="tab">
+  <div id="account-body"></div>
 </section>
 
 </main>

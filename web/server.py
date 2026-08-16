@@ -6,14 +6,23 @@ no-dependencies policy.
 
     python3 web/server.py --db runs.sqlite3 --port 8080
 
-Uploads are unauthenticated by design -- it is a scoreboard, not a user account
-system. Each upload gets a delete token so its submitter can withdraw it, and a
-per-IP rate limit keeps the obvious abuse out.
+An upload may be signed in or anonymous. An account is a name and a password;
+it owns the runs uploaded under it, so they can be withdrawn from any browser
+and carry a submitter on the board, and it carries an upload token that makes
+submitting from the machine that ran the benchmark one line with nothing to
+copy back. Anonymous uploads keep working exactly as before, delete token and
+all -- an account is a convenience, never a gate. A rate limit, per account
+where there is one and per address where there is not, keeps the obvious abuse
+out.
+
+Nothing here claims an uploaded number was produced by the machine it names:
+an account says the same person uploaded these runs, not that they are true.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import mimetypes
@@ -25,8 +34,9 @@ import threading
 import time
 import urllib.parse
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -39,12 +49,32 @@ MODES = {"threads", "per-core", "full"}
 SCOPES = {"cpu", "thread", "total"}
 
 MAX_BODY = 1 << 20          # 1 MiB: a --per-core dump of 256 CPUs is ~120 KiB
+MAX_AUTH_BODY = 4096        # a name and a password; anything larger is noise
 MAX_DRAIN = 8 << 20         # how much of a refused body to swallow before
                             # hanging up, so the client can read the 413
 MAX_CORES = 1024
 MAX_TEXT = 200
 MAX_NOTES = 2000
 MAX_VALUE = 1e12            # nothing this benchmark reports comes near this
+ACCOUNT_RATE_FACTOR = 4     # how much more room a signed-in submitter gets
+
+# Accounts -------------------------------------------------------------------
+#
+# A name has to be safe to print on the board and unambiguous between accounts:
+# letters, digits and the three joiners, starting on a letter or digit.
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$")
+MIN_PASSWORD = 8
+MAX_PASSWORD = 256          # scrypt costs the same either way; this bounds work
+SESSION_DAYS = 30
+SESSION_COOKIE = "cpb_session"
+CSRF_COOKIE = "cpb_csrf"    # readable by the page, unlike the session cookie
+CSRF_HEADER = "X-CSRF-Token"
+
+# scrypt parameters: ~16 MiB and a few tens of ms per attempt, which is a wall
+# to offline guessing and imperceptible on a login. maxmem has to be given
+# because OpenSSL's default is below what n=2^14 asks for on some builds.
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 1 << 14, 8, 1
+SCRYPT_MAXMEM = 64 << 20
 
 # The metric table is the single source of truth for the API and the UI.
 #   kind  rate  -> per-clock normalisation divides by GHz
@@ -114,6 +144,11 @@ CORE_FIELDS = [
 ]
 CORE_COLUMNS = [col for _, col, _ in CORE_FIELDS]
 
+# The submitter's name, resolved wherever a run is read. A correlated subquery
+# rather than a join, so a run whose account has since been closed still reads
+# back -- with no submitter, which is what it now is.
+SUBMITTER = "(SELECT u.name FROM users u WHERE u.id = r.user_id) AS user"
+
 RUN_COLUMNS = [
     "id", "created_at", "label", "notes", "mode", "compiler",
     "compiler_version", "cc", "build_flags", "target",
@@ -123,8 +158,26 @@ RUN_COLUMNS = [
 ]
 
 
-class Invalid(Exception):
+class HttpError(Exception):
+    """A refusal with the status it should be reported as."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+class Invalid(HttpError):
     """An upload that will not be stored, with a message the client can show."""
+
+    def __init__(self, message: str):
+        super().__init__(HTTPStatus.BAD_REQUEST, message)
+
+
+class Denied(HttpError):
+    """Refused for who is asking rather than for what was sent."""
+
+    def __init__(self, message: str, status: int = HTTPStatus.FORBIDDEN):
+        super().__init__(status, message)
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +352,81 @@ def validate(payload: object) -> tuple[dict, list[dict]]:
 
 
 # ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+#
+# Passwords are stored as scrypt digests, salted per account, and compared in
+# constant time. Session tokens are stored as SHA-256 -- they are random 256-bit
+# strings rather than guessable secrets, so a plain hash with no salt is the
+# right shape: it stops a leaked database being a list of live sessions without
+# pretending to slow down an attack nobody can mount.
+
+
+def check_name(v) -> str:
+    if not isinstance(v, str):
+        raise Invalid("name must be a string")
+    # Deliberately not _text(): that truncates to fit, and a name quietly cut
+    # to thirty-two characters is not the name anyone asked to register.
+    name = "".join(c for c in v if c >= " ").strip()
+    if not NAME_RE.match(name):
+        raise Invalid("a name is 3 to 32 characters of letters, digits, "
+                      "'.', '_' or '-', starting with a letter or digit")
+    return name
+
+
+def check_password(v) -> str:
+    if not isinstance(v, str):
+        raise Invalid("password must be a string")
+    if len(v) < MIN_PASSWORD:
+        raise Invalid(f"password must be at least {MIN_PASSWORD} characters")
+    if len(v) > MAX_PASSWORD:
+        raise Invalid(f"password must be at most {MAX_PASSWORD} characters")
+    return v
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=SCRYPT_N,
+                        r=SCRYPT_R, p=SCRYPT_P, maxmem=SCRYPT_MAXMEM, dklen=32)
+    return "$".join(["scrypt", str(SCRYPT_N), str(SCRYPT_R), str(SCRYPT_P),
+                     salt.hex(), dk.hex()])
+
+
+def password_matches(password: str, stored: str) -> bool:
+    """Whether `password` produces `stored`. Never raises on a malformed row."""
+    try:
+        algo, n, r, p, salt_hex, want_hex = stored.split("$")
+        if algo != "scrypt":
+            return False
+        want = bytes.fromhex(want_hex)
+        got = hashlib.scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt_hex),
+                             n=int(n), r=int(r), p=int(p),
+                             maxmem=SCRYPT_MAXMEM, dklen=len(want))
+    except (ValueError, TypeError):
+        return False
+    return secrets.compare_digest(got, want)
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def public_user(user: dict, *, runs: int | None = None,
+                token: bool = False) -> dict:
+    """An account as the API describes it.
+
+    The password hash never leaves here, and the upload token only when the
+    account itself is asking -- `/api/users/<name>` is a public page.
+    """
+    out = {"name": user["name"], "created_at": user["created_at"]}
+    if runs is not None:
+        out["runs"] = runs
+    if token:
+        out["api_token"] = user["api_token"]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
 
@@ -309,7 +437,7 @@ def iso_now() -> str:
 
 class Store:
     ADDED_COLUMNS = (("compiler_version", "TEXT"), ("cc", "TEXT"),
-                     ("build_flags", "TEXT"))
+                     ("build_flags", "TEXT"), ("user_id", "INTEGER"))
 
     def __init__(self, path: str):
         self.path = path
@@ -321,6 +449,10 @@ class Store:
             for col, decl in self.ADDED_COLUMNS:
                 if col not in have:
                     db.execute(f"ALTER TABLE runs ADD COLUMN {col} {decl}")
+            # After the ALTER, not in schema.sql: an older database has no
+            # user_id column when the script runs, and an index over a column
+            # that does not exist yet is an error rather than a no-op.
+            db.execute("CREATE INDEX IF NOT EXISTS runs_user ON runs(user_id, id)")
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10.0)
@@ -330,10 +462,14 @@ class Store:
         return db
 
     def insert(self, run: dict, cores: list[dict], raw: str,
-               label: str | None, notes: str | None) -> tuple[int, str]:
+               label: str | None, notes: str | None,
+               user_id: int | None = None) -> tuple[int, str]:
         token = secrets.token_urlsafe(24)
+        # The delete token is issued whether or not an account owns the run:
+        # signing in later must not be the only way back to something uploaded
+        # from a shell, and an account holder loses nothing by also having one.
         run = dict(run, created_at=iso_now(), delete_token=token,
-                   label=label, notes=notes, raw=raw)
+                   label=label, notes=notes, raw=raw, user_id=user_id)
         cols = list(run)
         with self.connect() as db:
             cur = db.execute(
@@ -351,11 +487,25 @@ class Store:
                 [[run_id] + [c.get(col) for col in ccols[1:]] for c in cores])
         return run_id, token
 
-    def delete(self, run_id: int, token: str) -> bool:
+    def delete(self, run_id: int, token: str | None = None,
+               user_id: int | None = None) -> bool:
+        """Withdraw a run, for whoever can show one of the two claims to it.
+
+        The delete token proves whoever holds the upload's reply, and the
+        account id proves the run was uploaded under it. Either is enough on
+        its own; neither is checked against the other.
+        """
         with self.connect() as db:
-            row = db.execute("SELECT delete_token FROM runs WHERE id = ?",
+            row = db.execute("SELECT delete_token, user_id FROM runs WHERE id = ?",
                              (run_id,)).fetchone()
-            if row is None or not secrets.compare_digest(row["delete_token"], token):
+            if row is None:
+                return False
+            owns = user_id is not None and row["user_id"] == user_id
+            # compare_digest even though a token mismatch is not timed against
+            # anything an attacker controls the length of; it costs nothing.
+            holds = token is not None and secrets.compare_digest(
+                row["delete_token"], token)
+            if not (owns or holds):
                 return False
             db.execute("DELETE FROM cores WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM runs WHERE id = ?", (run_id,))
@@ -364,8 +514,8 @@ class Store:
     def run(self, run_id: int) -> dict | None:
         with self.connect() as db:
             row = db.execute(
-                f"SELECT {','.join(RUN_COLUMNS)} FROM runs WHERE id = ?",
-                (run_id,)).fetchone()
+                f"SELECT {','.join(RUN_COLUMNS)}, {SUBMITTER} FROM runs r "
+                f"WHERE id = ?", (run_id,)).fetchone()
             if row is None:
                 return None
             cores = db.execute(
@@ -380,21 +530,25 @@ class Store:
             row = db.execute("SELECT raw FROM runs WHERE id = ?", (run_id,)).fetchone()
         return row["raw"] if row else None
 
-    def runs(self, limit: int = 50, offset: int = 0) -> list[dict]:
+    def runs(self, limit: int = 50, offset: int = 0,
+             user_id: int | None = None) -> list[dict]:
+        where = "WHERE r.user_id = ? " if user_id is not None else ""
+        args: list[object] = [user_id] if user_id is not None else []
         with self.connect() as db:
             rows = db.execute(
-                f"SELECT r.{', r.'.join(RUN_COLUMNS)}, "
+                f"SELECT r.{', r.'.join(RUN_COLUMNS)}, {SUBMITTER}, "
                 f"       (SELECT COUNT(*) FROM cores c WHERE c.run_id = r.id) AS records, "
                 f"       (SELECT MAX(c.score) FROM cores c "
                 f"          WHERE c.run_id = r.id AND c.scope != 'total') AS best_score "
-                f"FROM runs r ORDER BY r.id DESC LIMIT ? OFFSET ?",
-                (limit, offset)).fetchall()
+                f"FROM runs r {where}ORDER BY r.id DESC LIMIT ? OFFSET ?",
+                args + [limit, offset]).fetchall()
         return [dict(r) for r in rows]
 
     def cores(self, *, scope: str | None = "cpu", target: str | None = None,
               vectorize: int | None = None, fma: int | None = None,
               search: str | None = None, ids: list[int] | None = None,
-              run: int | None = None, group_run: bool = True,
+              run: int | None = None, user_id: int | None = None,
+              group_run: bool = True,
               sort: str = "score", desc: bool = True, limit: int = 50) -> list[dict]:
         """Records matching the filters, best first.
 
@@ -412,6 +566,9 @@ class Store:
         if run is not None:
             where.append("c.run_id = ?")
             args.append(run)
+        if user_id is not None:
+            where.append("r.user_id = ?")
+            args.append(user_id)
         if target:
             where.append("r.target = ?")
             args.append(target)
@@ -447,7 +604,7 @@ class Store:
             f"       c.{', c.'.join(CORE_COLUMNS[3:])}, "
             f"       r.target, r.vectorize, r.fma, r.cpu_models, r.label, "
             f"       r.created_at, r.mode, r.threads, r.compiler, r.machine, "
-            f"       m.peers AS records "
+            f"       {SUBMITTER}, m.peers AS records "
             f"FROM matched m "
             f"JOIN cores c ON c.id = m.core_id "
             f"JOIN runs r ON r.id = c.run_id "
@@ -504,11 +661,125 @@ class Store:
         with self.connect() as db:
             runs = db.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
             cores = db.execute("SELECT COUNT(*) AS n FROM cores").fetchone()["n"]
+            users = db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
             targets = db.execute(
                 "SELECT target, COUNT(*) AS n FROM runs WHERE target IS NOT NULL "
                 "GROUP BY target ORDER BY n DESC").fetchall()
-        return {"runs": runs, "records": cores,
+        return {"runs": runs, "records": cores, "users": users,
                 "targets": [dict(t) for t in targets]}
+
+    # -- accounts ----------------------------------------------------------
+
+    def create_user(self, name: str, password: str) -> dict:
+        row = {"name": name, "password_hash": hash_password(password),
+               "api_token": secrets.token_urlsafe(24), "created_at": iso_now()}
+        try:
+            with self.connect() as db:
+                cur = db.execute(
+                    "INSERT INTO users (name, password_hash, api_token, created_at) "
+                    "VALUES (:name, :password_hash, :api_token, :created_at)", row)
+        except sqlite3.IntegrityError:
+            # The unique index over lower(name) is the only constraint an
+            # ordinary registration can trip.
+            raise Denied("that name is taken", HTTPStatus.CONFLICT)
+        assert cur.lastrowid is not None
+        return dict(row, id=int(cur.lastrowid))
+
+    def user_by_name(self, name: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM users WHERE lower(name) = lower(?)",
+                             (name,)).fetchone()
+        return dict(row) if row else None
+
+    def user_by_id(self, user_id: int) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def user_by_api_token(self, token: str) -> dict | None:
+        """The account an `Authorization: Bearer` upload belongs to.
+
+        Looked up by equality: the token is a 192-bit random string, so there
+        is no prefix of it worth learning from how long the lookup took.
+        """
+        if not token:
+            return None
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM users WHERE api_token = ?",
+                             (token,)).fetchone()
+        return dict(row) if row else None
+
+    def set_password(self, user_id: int, password: str) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                       (hash_password(password), user_id))
+
+    def rotate_api_token(self, user_id: int) -> str:
+        token = secrets.token_urlsafe(24)
+        with self.connect() as db:
+            db.execute("UPDATE users SET api_token = ? WHERE id = ?",
+                       (token, user_id))
+        return token
+
+    def close_account(self, user_id: int) -> int:
+        """Delete an account and everything uploaded under it.
+
+        The runs go too, rather than being orphaned: an anonymous run nobody
+        holds the delete token for is a row that can never be withdrawn, and
+        leaving those behind is not what closing an account is understood to
+        mean. Returns how many runs went with it.
+        """
+        with self.connect() as db:
+            ids = [r["id"] for r in db.execute(
+                "SELECT id FROM runs WHERE user_id = ?", (user_id,))]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                db.execute(f"DELETE FROM cores WHERE run_id IN ({marks})", ids)
+                db.execute(f"DELETE FROM runs WHERE id IN ({marks})", ids)
+            db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return len(ids)
+
+    def run_count(self, user_id: int) -> int:
+        with self.connect() as db:
+            return db.execute("SELECT COUNT(*) AS n FROM runs WHERE user_id = ?",
+                              (user_id,)).fetchone()["n"]
+
+    # -- sessions ----------------------------------------------------------
+
+    def create_session(self, user_id: int) -> tuple[str, int]:
+        """A new session for one browser: (cookie value, lifetime in seconds)."""
+        token = secrets.token_urlsafe(32)
+        expires = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+        with self.connect() as db:
+            # Cheap enough to do on every sign-in, and it means an abandoned
+            # browser's row does not outlive the session it stands for.
+            db.execute("DELETE FROM sessions WHERE expires_at < ?", (iso_now(),))
+            db.execute("INSERT INTO sessions (token_hash, user_id, created_at, "
+                       "expires_at) VALUES (?, ?, ?, ?)",
+                       (token_hash(token), user_id, iso_now(),
+                        expires.isoformat(timespec="seconds").replace("+00:00", "Z")))
+        return token, SESSION_DAYS * 86400
+
+    def user_by_session(self, token: str) -> dict | None:
+        if not token:
+            return None
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id "
+                "WHERE s.token_hash = ? AND s.expires_at > ?",
+                (token_hash(token), iso_now())).fetchone()
+        return dict(row) if row else None
+
+    def end_session(self, token: str) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM sessions WHERE token_hash = ?",
+                       (token_hash(token),))
+
+    def end_all_sessions(self, user_id: int) -> None:
+        """Sign every browser out -- what a password change has to mean."""
+        with self.connect() as db:
+            db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -523,15 +794,19 @@ class RateLimiter:
         self.hits: dict[str, deque[float]] = defaultdict(deque)
         self.lock = threading.Lock()
 
-    def allow(self, key: str) -> bool:
-        if self.limit <= 0:
+    def allow(self, key: str, limit: int | None = None) -> bool:
+        """Whether `key` may act now. `limit` overrides the default for one
+        class of caller -- a signed-in account is a known submitter and gets
+        more room than a bare address."""
+        limit = self.limit if limit is None else limit
+        if self.limit <= 0:                 # 0 disables the limiter outright
             return True
         now = time.monotonic()
         with self.lock:
             q = self.hits[key]
             while q and now - q[0] > self.window:
                 q.popleft()
-            if len(q) >= self.limit:
+            if len(q) >= limit:
                 return False
             q.append(now)
             if len(self.hits) > 10000:          # bound memory on a busy host
@@ -553,6 +828,7 @@ SECURITY_HEADERS = {
 }
 
 ID_RE = re.compile(r"^/api/runs/(\d+)(/raw|/rank)?$")
+USER_RE = re.compile(r"^/api/users/([A-Za-z0-9._-]{3,32})$")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -568,6 +844,10 @@ class Handler(BaseHTTPRequestHandler):
     def limiter(self) -> RateLimiter:
         return self.server.limiter          # type: ignore[attr-defined]
 
+    @property
+    def auth_limiter(self) -> RateLimiter:
+        return self.server.auth_limiter     # type: ignore[attr-defined]
+
     def client_key(self) -> str:
         if getattr(self.server, "trust_proxy", False):
             fwd = self.headers.get("X-Forwarded-For", "")
@@ -580,6 +860,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
+        # A list rather than the dict `extra` is, because a response may carry
+        # two Set-Cookie headers and a dict holds one.
+        for k, v in getattr(self, "extra_headers", []):
             self.send_header(k, v)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
@@ -600,6 +884,116 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):   # one tidy line per request
         sys.stderr.write("%s - %s\n" % (self.client_key(), format % args))
 
+    # -- who is asking -----------------------------------------------------
+    #
+    # Two ways in, deliberately different. A browser holds a session cookie the
+    # page cannot read; a machine that ran the benchmark holds an upload token
+    # it sends in a header. The difference matters for CSRF: a cookie rides
+    # along on a cross-site request without the other site having to know it
+    # exists, so cookie-authenticated writes carry a token the page had to read
+    # to send. A header the other site would have to set itself needs no such
+    # proof, and neither do anonymous requests, which claim nothing.
+
+    def cookies(self) -> dict[str, str]:
+        jar = SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            return {}
+        return {k: m.value for k, m in jar.items()}
+
+    def identify(self) -> tuple[dict | None, str | None]:
+        """(account, how) for this request; (None, None) when anonymous.
+
+        An upload token that names no account is an error rather than an
+        anonymous request: a stale token in a submit script would otherwise
+        keep uploading successfully, off the account it was meant for, with
+        nothing to notice but the runs never appearing under the name. An
+        expired session cookie is the opposite -- a browser is entitled to
+        carry a dead one, and reading the board with it is not a mistake.
+        """
+        if not hasattr(self, "_who"):
+            self._who: tuple[dict | None, str | None] = (None, None)
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                user = self.store.user_by_api_token(auth[7:].strip()[:128])
+                if user is None:
+                    raise Denied("unknown upload token; the account page has "
+                                 "the current one", HTTPStatus.UNAUTHORIZED)
+                self._who = (user, "token")
+            elif SESSION_COOKIE in self.cookies():
+                user = self.store.user_by_session(self.cookies()[SESSION_COOKIE])
+                if user:
+                    self._who = (user, "cookie")
+        return self._who
+
+    def require_account(self) -> dict:
+        user, how = self.identify()
+        if user is None:
+            raise Denied("sign in first", HTTPStatus.UNAUTHORIZED)
+        if how == "cookie":
+            self.check_csrf()
+        return user
+
+    def check_csrf(self) -> None:
+        sent = self.headers.get(CSRF_HEADER, "")
+        held = self.cookies().get(CSRF_COOKIE, "")
+        if not sent or not held or not secrets.compare_digest(sent, held):
+            raise Denied("stale page: reload and try again")
+
+    def is_secure(self) -> bool:
+        """Whether the browser reached us over TLS, so `Secure` can be set.
+
+        Only believed behind a proxy we were told to trust: an unproxied server
+        that took X-Forwarded-Proto from the request would let any client
+        decide the cookie flags.
+        """
+        if getattr(self.server, "trust_proxy", False):
+            return self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+        return False
+
+    def set_cookie(self, name: str, value: str, max_age: int, *,
+                   http_only: bool = True) -> None:
+        parts = [f"{name}={value}", "Path=/", f"Max-Age={max_age}", "SameSite=Lax"]
+        if http_only:
+            parts.append("HttpOnly")
+        if self.is_secure():
+            parts.append("Secure")
+        self.extra_headers.append(("Set-Cookie", "; ".join(parts)))
+
+    def start_session(self, user: dict) -> str:
+        """Sign this browser in and hand the page its CSRF token."""
+        token, ttl = self.store.create_session(user["id"])
+        csrf = secrets.token_urlsafe(24)
+        self.set_cookie(SESSION_COOKIE, token, ttl)
+        self.set_cookie(CSRF_COOKIE, csrf, ttl, http_only=False)
+        return csrf
+
+    def end_session(self) -> None:
+        token = self.cookies().get(SESSION_COOKIE)
+        if token:
+            self.store.end_session(token)
+        self.set_cookie(SESSION_COOKIE, "", 0)
+        self.set_cookie(CSRF_COOKIE, "", 0, http_only=False)
+
+    def read_json(self, cap: int) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise Invalid("bad Content-Length")
+        if length <= 0:
+            raise Invalid("empty body")
+        if length > cap:
+            self.drain(length)
+            self.body_read = True
+            raise HttpError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            f"body larger than {cap} bytes")
+        self.body_read = True
+        payload = parse_json(self.rfile.read(length))
+        if not isinstance(payload, dict):
+            raise Invalid("body must be a JSON object")
+        return payload
+
     # -- routing -----------------------------------------------------------
     def do_GET(self):
         self.route("GET")
@@ -614,6 +1008,11 @@ class Handler(BaseHTTPRequestHandler):
         self.route("DELETE")
 
     def route(self, method: str):
+        # Per request: this handler instance serves every request on a
+        # keep-alive connection, so the response headers cannot accumulate.
+        self.extra_headers: list[tuple[str, str]] = []
+        self.body_read = False
+        self.__dict__.pop("_who", None)
         try:
             url = urllib.parse.urlsplit(self.path)
             path = urllib.parse.unquote(url.path)
@@ -625,8 +1024,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.static(path)
             else:
                 self.fail(HTTPStatus.METHOD_NOT_ALLOWED, "method not allowed")
-        except Invalid as e:
-            self.fail(HTTPStatus.BAD_REQUEST, str(e))
+        except HttpError as e:
+            # A refusal decided before the body was read -- a failed CSRF check,
+            # say -- would otherwise leave those bytes in front of the next
+            # request on a keep-alive connection, which then reads a JSON
+            # document where a request line should be.
+            self.drain_unread()
+            self.fail(e.status, str(e))
         except BrokenPipeError:
             pass
         except Exception as e:                      # never leak a traceback
@@ -637,6 +1041,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def api(self, method: str, path: str, query: dict):
+        if path.startswith("/api/auth/"):
+            return self.auth(method, path[len("/api/auth/"):])
         if path == "/api/metrics" and method == "GET":
             return self.send_json(HTTPStatus.OK, {"metrics": METRICS,
                                                   "scopes": sorted(SCOPES)})
@@ -648,11 +1054,20 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 limit = clamp_int(query.get("limit", ["50"])[0], 1, 200, 50)
                 offset = clamp_int(query.get("offset", ["0"])[0], 0, 1 << 30, 0)
-                return self.send_json(HTTPStatus.OK,
-                                      {"runs": self.store.runs(limit, offset)})
+                return self.send_json(HTTPStatus.OK, {
+                    "runs": self.store.runs(limit, offset,
+                                            self.who_filter(query))})
             if method == "POST":
                 return self.upload()
             return self.fail(HTTPStatus.METHOD_NOT_ALLOWED, "method not allowed")
+
+        m = USER_RE.match(path)
+        if m and method == "GET":
+            user = self.store.user_by_name(m.group(1))
+            if user is None:
+                return self.fail(HTTPStatus.NOT_FOUND, "no such account")
+            return self.send_json(HTTPStatus.OK, {"user": public_user(
+                user, runs=self.store.run_count(user["id"]))})
 
         m = ID_RE.match(path)
         if m:
@@ -671,15 +1086,147 @@ class Handler(BaseHTTPRequestHandler):
                     return self.fail(HTTPStatus.NOT_FOUND, "no such run")
                 return self.send_json(HTTPStatus.OK, run)
             if method == "DELETE" and suffix is None:
-                token = (self.headers.get("X-Delete-Token")
-                         or query.get("token", [""])[0])
-                if not token:
-                    return self.fail(HTTPStatus.UNAUTHORIZED, "delete token required")
-                if not self.store.delete(run_id, token):
-                    return self.fail(HTTPStatus.FORBIDDEN,
-                                     "no such run, or wrong delete token")
-                return self.send_json(HTTPStatus.OK, {"deleted": run_id})
+                return self.withdraw(run_id, query)
         return self.fail(HTTPStatus.NOT_FOUND, "no such endpoint")
+
+    def withdraw(self, run_id: int, query: dict):
+        """Delete a run for its owner, or for whoever holds its delete token."""
+        user, how = self.identify()
+        if user is not None and how == "cookie":
+            self.check_csrf()
+        token = (self.headers.get("X-Delete-Token")
+                 or query.get("token", [""])[0])
+        if not token and user is None:
+            return self.fail(HTTPStatus.UNAUTHORIZED,
+                             "sign in, or send the run's delete token")
+        if not self.store.delete(run_id, token or None,
+                                 user["id"] if user else None):
+            return self.fail(HTTPStatus.FORBIDDEN,
+                             "no such run, or it is not yours to withdraw")
+        return self.send_json(HTTPStatus.OK, {"deleted": run_id})
+
+    def who_filter(self, query: dict) -> int | None:
+        """The account a listing is narrowed to, from `user=name` or `user=me`.
+
+        An unknown name filters to nothing rather than to everything: a board
+        that quietly widened when a name was misspelt would read as that
+        person having uploaded the lot.
+        """
+        name = _text(query.get("user", [None])[0], 32, "user")
+        if not name:
+            return None
+        if name == "me":
+            user, _ = self.identify()
+            if user is None:
+                raise Denied("sign in first", HTTPStatus.UNAUTHORIZED)
+            return int(user["id"])
+        found = self.store.user_by_name(name)
+        return int(found["id"]) if found else -1
+
+    # -- accounts ----------------------------------------------------------
+
+    def auth(self, method: str, action: str):
+        if action == "me" and method == "GET":
+            user, how = self.identify()
+            if user is None:
+                return self.send_json(HTTPStatus.OK, {"user": None})
+            # A signed-in page that has lost its CSRF cookie (it expires with
+            # the session, but a browser may drop it alone) can do nothing but
+            # read. Reissuing here costs one header and keeps a returning tab
+            # working without a sign-in it does not need.
+            if how == "cookie" and CSRF_COOKIE not in self.cookies():
+                csrf = secrets.token_urlsafe(24)
+                self.set_cookie(CSRF_COOKIE, csrf, SESSION_DAYS * 86400,
+                                http_only=False)
+            return self.send_json(HTTPStatus.OK, {
+                "user": public_user(user, runs=self.store.run_count(user["id"]),
+                                    token=(how == "cookie"))})
+
+        if method != "POST":
+            return self.fail(HTTPStatus.METHOD_NOT_ALLOWED, "method not allowed")
+
+        if action == "register":
+            return self.register()
+        if action == "login":
+            return self.login()
+        if action == "logout":
+            # Deliberately not CSRF-guarded and deliberately always 200: being
+            # signed out against your will is a nuisance, not a compromise, and
+            # a logout that can fail leaves a page that cannot get rid of a
+            # session it no longer wants.
+            self.end_session()
+            return self.send_json(HTTPStatus.OK, {"user": None})
+        if action == "token":
+            user = self.require_account()
+            return self.send_json(HTTPStatus.OK,
+                                  {"api_token": self.store.rotate_api_token(user["id"])})
+        if action == "password":
+            return self.change_password()
+        if action == "close":
+            return self.close_account()
+        return self.fail(HTTPStatus.NOT_FOUND, "no such endpoint")
+
+    def auth_allowed(self) -> None:
+        """Rate limit on guessing, per address rather than per name.
+
+        Per name would let anyone lock an account out by guessing at it.
+        """
+        if not self.auth_limiter.allow("auth:" + self.client_key()):
+            raise Denied("too many attempts from this address; try later",
+                         HTTPStatus.TOO_MANY_REQUESTS)
+
+    def register(self):
+        self.auth_allowed()
+        body = self.read_json(MAX_AUTH_BODY)
+        name = check_name(body.get("name"))
+        password = check_password(body.get("password"))
+        user = self.store.create_user(name, password)
+        csrf = self.start_session(user)
+        self.send_json(HTTPStatus.CREATED,
+                       {"user": public_user(user, runs=0, token=True),
+                        "csrf": csrf})
+
+    def login(self):
+        self.auth_allowed()
+        body = self.read_json(MAX_AUTH_BODY)
+        name = _text(body.get("name"), 32, "name") or ""
+        password = body.get("password")
+        user = self.store.user_by_name(name) if name else None
+        if user is None or not isinstance(password, str) \
+                or not password_matches(password, user["password_hash"]):
+            # One message for both halves: which of the two was wrong is not
+            # something a sign-in page should be willing to say.
+            raise Denied("wrong name or password", HTTPStatus.UNAUTHORIZED)
+        csrf = self.start_session(user)
+        self.send_json(HTTPStatus.OK, {
+            "user": public_user(user, runs=self.store.run_count(user["id"]),
+                                token=True),
+            "csrf": csrf})
+
+    def change_password(self):
+        self.auth_allowed()
+        user = self.require_account()
+        body = self.read_json(MAX_AUTH_BODY)
+        if not password_matches(str(body.get("current", "")), user["password_hash"]):
+            raise Denied("the current password is wrong", HTTPStatus.UNAUTHORIZED)
+        new = check_password(body.get("password"))
+        self.store.set_password(user["id"], new)
+        # Every other browser goes with it -- a password change is what you do
+        # when you think someone else has one, so leaving them signed in would
+        # undo the point of it. This one is signed straight back in.
+        self.store.end_all_sessions(user["id"])
+        csrf = self.start_session(user)
+        self.send_json(HTTPStatus.OK, {"ok": True, "csrf": csrf})
+
+    def close_account(self):
+        self.auth_allowed()
+        user = self.require_account()
+        body = self.read_json(MAX_AUTH_BODY)
+        if not password_matches(str(body.get("password", "")), user["password_hash"]):
+            raise Denied("wrong password", HTTPStatus.UNAUTHORIZED)
+        removed = self.store.close_account(user["id"])
+        self.end_session()
+        self.send_json(HTTPStatus.OK, {"closed": user["name"], "runs_deleted": removed})
 
     def query_cores(self, query: dict) -> list[dict]:
         def one(name, default=None):
@@ -719,6 +1266,7 @@ class Handler(BaseHTTPRequestHandler):
         flag = {"1": 1, "0": 0, "true": 1, "false": 0}
         return self.store.cores(
             scope=scope,
+            user_id=self.who_filter(query),
             target=_text(one("target"), 32, "target"),
             vectorize=flag.get(str(one("vectorize", "")).lower()),
             fma=flag.get(str(one("fma", "")).lower()),
@@ -730,6 +1278,19 @@ class Handler(BaseHTTPRequestHandler):
             desc=(order == "desc"),
             limit=clamp_int(one("limit", "50"), 1, 500, 50),
         )
+
+    def drain_unread(self):
+        """Swallow a request body nothing got round to reading."""
+        if getattr(self, "body_read", True):
+            return
+        self.body_read = True
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True
+            return
+        if length > 0:
+            self.drain(length)
 
     def drain(self, length: int):
         """Swallow a body we are about to refuse.
@@ -757,16 +1318,33 @@ class Handler(BaseHTTPRequestHandler):
             raise Invalid("empty body")
         if length > MAX_BODY:
             self.drain(length)
+            self.body_read = True
             return self.fail(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                              f"body larger than {MAX_BODY} bytes")
+        self.body_read = True
         raw = self.rfile.read(length)
         if len(raw) != length:
             raise Invalid("truncated body")
+        user, how = self.identify()
+        if user is not None and how == "cookie":
+            self.check_csrf()
         # After the body is consumed, so that a refused upload still leaves the
         # connection in a state the next request can use.
-        if not self.limiter.allow(self.client_key()):
+        #
+        # An account is limited as itself rather than as an address, so a lab
+        # behind one NAT is not one submitter, and gets more room because there
+        # is something to take away if it is abused. Anonymous uploads keep the
+        # per-address limit exactly as it was.
+        if user is not None:
+            allowed = self.limiter.allow(f"user:{user['id']}",
+                                         self.limiter.limit * ACCOUNT_RATE_FACTOR)
+            whose = "from this account"
+        else:
+            allowed = self.limiter.allow(self.client_key())
+            whose = "from this address"
+        if not allowed:
             return self.fail(HTTPStatus.TOO_MANY_REQUESTS,
-                             "too many uploads from this address; try later")
+                             f"too many uploads {whose}; try later")
 
         payload = parse_json(raw)
         # Label and notes may ride along in the query string or inside the
@@ -780,10 +1358,12 @@ class Handler(BaseHTTPRequestHandler):
 
         run, cores = validate(payload)
         run_id, token = self.store.insert(
-            run, cores, raw.decode("utf-8"), label, notes)
+            run, cores, raw.decode("utf-8"), label, notes,
+            user_id=user["id"] if user else None)
         self.send_json(HTTPStatus.CREATED, {
             "id": run_id,
             "delete_token": token,
+            "user": user["name"] if user else None,
             "url": f"/#run={run_id}",
             "records": len(cores),
         })
@@ -816,10 +1396,14 @@ class Server(ThreadingHTTPServer):
 
 
 def build_server(db_path: str, host: str, port: int, *, rate_limit: int = 30,
-                 window: float = 3600.0, trust_proxy: bool = False) -> Server:
+                 window: float = 3600.0, trust_proxy: bool = False,
+                 auth_limit: int = 20) -> Server:
     srv = Server((host, port), Handler)
     srv.store = Store(db_path)              # type: ignore[attr-defined]
     srv.limiter = RateLimiter(rate_limit, window)   # type: ignore[attr-defined]
+    # Sign-ins are limited separately and much harder: uploading a lot is
+    # enthusiasm, trying twenty passwords in a quarter of an hour is not.
+    srv.auth_limiter = RateLimiter(auth_limit, 900.0)   # type: ignore[attr-defined]
     srv.trust_proxy = trust_proxy           # type: ignore[attr-defined]
     return srv
 
@@ -833,14 +1417,20 @@ def main(argv=None) -> int:
                     help="bind address (default 127.0.0.1; use 0.0.0.0 to expose)")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--rate-limit", type=int, default=30,
-                    help="uploads per address per hour, 0 to disable")
+                    help="uploads per address per hour, 0 to disable "
+                         f"(a signed-in account gets {ACCOUNT_RATE_FACTOR}x this)")
+    ap.add_argument("--auth-limit", type=int, default=20,
+                    help="sign-in attempts per address per 15 minutes, "
+                         "0 to disable")
     ap.add_argument("--trust-proxy", action="store_true",
-                    help="take the client address from X-Forwarded-For "
-                         "(only behind a proxy that sets it)")
+                    help="take the client address from X-Forwarded-For, and "
+                         "the scheme from X-Forwarded-Proto so session cookies "
+                         "are marked Secure (only behind a proxy that sets them)")
     args = ap.parse_args(argv)
 
     srv = build_server(args.db, args.host, args.port,
-                       rate_limit=args.rate_limit, trust_proxy=args.trust_proxy)
+                       rate_limit=args.rate_limit, trust_proxy=args.trust_proxy,
+                       auth_limit=args.auth_limit)
     host, port = srv.server_address[:2]
     print(f"cpu-bench hub on http://{host}:{port}  (db: {args.db})", file=sys.stderr)
     try:

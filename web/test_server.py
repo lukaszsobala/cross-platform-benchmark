@@ -7,6 +7,8 @@ Runs a real server on an ephemeral port against a temporary database, so the
 HTTP layer, the validation and the SQL are all exercised together.
 """
 
+import http.client
+import http.cookiejar
 import json
 import tempfile
 import threading
@@ -334,6 +336,358 @@ class HubTest(unittest.TestCase):
         self.assertTrue(limiter.allow("a"))
         self.assertFalse(limiter.allow("a"))
         self.assertTrue(limiter.allow("b"))
+
+
+class Browser:
+    """One client with its own cookie jar, as a browser has.
+
+    Sends the CSRF header the page would send, since that is what the server
+    requires of a cookie-authenticated write; `csrf=False` reproduces the
+    request another site could make, which is the one that must be refused.
+    """
+
+    def __init__(self, base: str):
+        self.base = base
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+
+    def cookie(self, name: str) -> str | None:
+        for c in self.jar:
+            if c.name == name:
+                return c.value
+        return None
+
+    def call(self, path, method="GET", body=None, headers=None, csrf=True):
+        data = None
+        if body is not None:
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers=dict(headers or {}))
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        token = self.cookie(srv.CSRF_COOKIE)
+        if csrf and token:
+            req.add_header(srv.CSRF_HEADER, token)
+        try:
+            with self.opener.open(req) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+
+class AccountTest(unittest.TestCase):
+    """Accounts: signing in, what an account may do, and what it may not."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        # Both limiters off: these tests sign in far more often in a second
+        # than any person does in fifteen minutes.
+        cls.server = srv.build_server(str(Path(cls.tmp.name) / "a.sqlite3"),
+                                      "127.0.0.1", 0, rate_limit=0, auth_limit=0)
+        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.seq = 0
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def account(self, password="a good long password"):
+        """A fresh account, signed in, as (browser, name, token)."""
+        type(self).seq += 1
+        name = f"tester{self.seq}"
+        b = Browser(self.base)
+        status, out = b.call("/api/auth/register", "POST",
+                             {"name": name, "password": password})
+        self.assertEqual(status, 201, out)
+        return b, name, out["user"]["api_token"]
+
+    def anon(self):
+        return Browser(self.base)
+
+    # -- registering and signing in ---------------------------------------
+    def test_register_signs_the_browser_in(self):
+        b, name, _ = self.account()
+        status, out = b.call("/api/auth/me")
+        self.assertEqual(status, 200)
+        self.assertEqual(out["user"]["name"], name)
+        self.assertEqual(out["user"]["runs"], 0)
+
+    def test_the_two_cookies_carry_the_right_flags(self):
+        """The session cookie is the page's to send, not to read.
+
+        The CSRF cookie is the opposite: the page has to read it to echo it
+        back, which is the whole mechanism, so it alone is not HttpOnly.
+        """
+        req = urllib.request.Request(
+            self.base + "/api/auth/register", method="POST",
+            data=json.dumps({"name": "cookieflags",
+                             "password": "a good long password"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as resp:
+            set_cookies = resp.headers.get_all("Set-Cookie") or []
+        session = [c for c in set_cookies if c.startswith(srv.SESSION_COOKIE + "=")]
+        csrf = [c for c in set_cookies if c.startswith(srv.CSRF_COOKIE + "=")]
+        self.assertEqual(len(session), 1, set_cookies)
+        self.assertEqual(len(csrf), 1, set_cookies)
+        self.assertIn("HttpOnly", session[0])
+        self.assertIn("SameSite=Lax", session[0])
+        self.assertNotIn("HttpOnly", csrf[0])
+        # Plain http in the tests, so neither may claim Secure -- a Secure
+        # cookie over http is one the browser drops, i.e. a session that
+        # silently never works.
+        self.assertNotIn("Secure", session[0])
+
+    def test_bad_names_and_passwords_are_refused(self):
+        b = self.anon()
+        for name in ("ab", "no spaces", "a" * 33, "-leading"):
+            with self.subTest(name):
+                code, _ = b.call("/api/auth/register", "POST",
+                                 {"name": name, "password": "a good long password"})
+                self.assertEqual(code, 400)
+        code, err = b.call("/api/auth/register", "POST",
+                           {"name": "shorty", "password": "short"})
+        self.assertEqual(code, 400)
+        self.assertIn("8 characters", err["error"])
+
+    def test_names_are_taken_case_insensitively(self):
+        _, name, _ = self.account()
+        code, err = self.anon().call("/api/auth/register", "POST",
+                                     {"name": name.upper(), "password": "another password"})
+        self.assertEqual(code, 409)
+        self.assertIn("taken", err["error"])
+
+    def test_login_and_logout(self):
+        b, name, _ = self.account("a good long password")
+        self.assertEqual(b.call("/api/auth/logout", "POST", {})[0], 200)
+        self.assertIsNone(b.call("/api/auth/me")[1]["user"])
+
+        code, err = b.call("/api/auth/login", "POST",
+                           {"name": name, "password": "wrong password"})
+        self.assertEqual(code, 401)
+        # The message must not say which half was wrong.
+        self.assertIn("wrong name or password", err["error"])
+
+        status, out = b.call("/api/auth/login", "POST",
+                             {"name": name.upper(), "password": "a good long password"})
+        self.assertEqual(status, 200)
+        self.assertEqual(out["user"]["name"], name)
+
+    def test_password_change_ends_other_sessions(self):
+        b, name, _ = self.account("a good long password")
+        other = Browser(self.base)
+        self.assertEqual(other.call("/api/auth/login", "POST",
+                                    {"name": name, "password": "a good long password"})[0], 200)
+        self.assertEqual(b.call("/api/auth/password", "POST",
+                                {"current": "a good long password",
+                                 "password": "an even better password"})[0], 200)
+        self.assertIsNone(other.call("/api/auth/me")[1]["user"])
+        # The browser that changed it stays in.
+        self.assertIsNotNone(b.call("/api/auth/me")[1]["user"])
+        self.assertEqual(b.call("/api/auth/login", "POST",
+                                {"name": name, "password": "a good long password"})[0], 401)
+
+    def test_password_change_needs_the_current_one(self):
+        b, _, _ = self.account()
+        code, _ = b.call("/api/auth/password", "POST",
+                         {"current": "not it", "password": "a new long password"})
+        self.assertEqual(code, 401)
+
+    # -- uploading as an account -------------------------------------------
+    def test_upload_token_attributes_the_run(self):
+        b, name, token = self.account()
+        status, out = self.anon().call(
+            "/api/runs", "POST", document(),
+            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(status, 201)
+        self.assertEqual(out["user"], name)
+        _, run = b.call(f"/api/runs/{out['id']}")
+        self.assertEqual(run["user"], name)
+        # ...and the board says who it belongs to.
+        _, board = b.call(f"/api/cores?scope=cpu&user={name}")
+        self.assertEqual([c["user"] for c in board["cores"]], [name])
+
+    def test_unknown_upload_token_is_refused_not_anonymous(self):
+        """A stale token must fail loudly rather than upload to nobody."""
+        code, err = self.anon().call(
+            "/api/runs", "POST", document(),
+            headers={"Authorization": "Bearer no-such-token"})
+        self.assertEqual(code, 401)
+        self.assertIn("unknown upload token", err["error"])
+
+    def test_rotating_the_token_retires_the_old_one(self):
+        b, _, old = self.account()
+        status, out = b.call("/api/auth/token", "POST", {})
+        self.assertEqual(status, 200)
+        self.assertNotEqual(out["api_token"], old)
+        self.assertEqual(self.anon().call(
+            "/api/runs", "POST", document(),
+            headers={"Authorization": f"Bearer {old}"})[0], 401)
+        self.assertEqual(self.anon().call(
+            "/api/runs", "POST", document(),
+            headers={"Authorization": f"Bearer {out['api_token']}"})[0], 201)
+
+    def test_cookie_upload_requires_the_csrf_token(self):
+        """What stops another site posting for a signed-in visitor."""
+        b, _, _ = self.account()
+        self.assertEqual(b.call("/api/runs", "POST", document(), csrf=False)[0], 403)
+        self.assertEqual(b.call("/api/runs", "POST", document())[0], 201)
+
+    def test_a_refused_write_leaves_the_connection_usable(self):
+        """A refusal decided before the body was read must still eat it.
+
+        Otherwise the unread document sits in front of the next request on the
+        same keep-alive connection and is parsed as one.
+        """
+        b, _, _ = self.account()
+        conn = http.client.HTTPConnection(self.base.removeprefix("http://"))
+        body = json.dumps({"current": "x", "password": "a good long password"})
+        # No CSRF header: refused before change_password reads anything.
+        conn.request("POST", "/api/auth/password", body, {
+            "Content-Type": "application/json",
+            "Cookie": f"{srv.SESSION_COOKIE}={b.cookie(srv.SESSION_COOKIE)}",
+        })
+        refused = conn.getresponse()
+        self.assertEqual(refused.status, 403)
+        refused.read()
+        # The next request on the same connection must be understood.
+        conn.request("GET", "/api/stats")
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        json.loads(resp.read())
+        conn.close()
+
+    def test_anonymous_upload_still_needs_nothing(self):
+        status, out = self.anon().call("/api/runs", "POST", document())
+        self.assertEqual(status, 201)
+        self.assertIsNone(out["user"])
+        self.assertTrue(out["delete_token"])
+
+    # -- who may withdraw a run --------------------------------------------
+    def test_owner_withdraws_without_a_token(self):
+        b, _, _ = self.account()
+        _, out = b.call("/api/runs", "POST", document())
+        self.assertEqual(b.call(f"/api/runs/{out['id']}", "DELETE")[0], 200)
+        self.assertEqual(b.call(f"/api/runs/{out['id']}")[0], 404)
+
+    def test_another_account_cannot_withdraw_it(self):
+        mine, _, _ = self.account()
+        theirs, _, _ = self.account()
+        _, out = mine.call("/api/runs", "POST", document())
+        code, _ = theirs.call(f"/api/runs/{out['id']}", "DELETE")
+        self.assertEqual(code, 403)
+        self.assertEqual(mine.call(f"/api/runs/{out['id']}")[0], 200)
+
+    def test_the_delete_token_still_works_on_an_owned_run(self):
+        """Signing in must not strand a run uploaded from a shell."""
+        _, _, token = self.account()
+        _, out = self.anon().call("/api/runs", "POST", document(),
+                                  headers={"Authorization": f"Bearer {token}"})
+        status, _ = self.anon().call(
+            f"/api/runs/{out['id']}", "DELETE",
+            headers={"X-Delete-Token": out["delete_token"]})
+        self.assertEqual(status, 200)
+
+    def test_withdrawing_needs_one_claim_or_the_other(self):
+        _, out = self.anon().call("/api/runs", "POST", document())
+        code, err = self.anon().call(f"/api/runs/{out['id']}", "DELETE")
+        self.assertEqual(code, 401)
+        self.assertIn("delete token", err["error"])
+
+    # -- listing and profiles ----------------------------------------------
+    def test_user_filter_narrows_to_one_account(self):
+        b, name, _ = self.account()
+        b.call("/api/runs", "POST", document())
+        self.anon().call("/api/runs", "POST", document())
+        _, mine = b.call("/api/runs?user=me")
+        self.assertTrue(mine["runs"])
+        self.assertTrue(all(r["user"] == name for r in mine["runs"]))
+        _, by_name = self.anon().call(f"/api/runs?user={name}")
+        self.assertEqual([r["id"] for r in by_name["runs"]],
+                         [r["id"] for r in mine["runs"]])
+
+    def test_user_me_needs_a_session(self):
+        code, _ = self.anon().call("/api/runs?user=me")
+        self.assertEqual(code, 401)
+
+    def test_an_unknown_name_matches_nothing(self):
+        self.anon().call("/api/runs", "POST", document())
+        _, out = self.anon().call("/api/runs?user=nobody-at-all")
+        self.assertEqual(out["runs"], [])
+
+    def test_profile_leaks_neither_token_nor_hash(self):
+        _, name, token = self.account()   # token must appear nowhere below
+        status, out = self.anon().call(f"/api/users/{name}")
+        self.assertEqual(status, 200)
+        self.assertEqual(out["user"]["name"], name)
+        self.assertNotIn("api_token", out["user"])
+        self.assertNotIn("password_hash", out["user"])
+        self.assertNotIn(token, json.dumps(out))
+        self.assertEqual(self.anon().call("/api/users/nobody-here")[0], 404)
+
+    def test_own_token_is_only_shown_to_a_session(self):
+        b, _, token = self.account()
+        _, mine = b.call("/api/auth/me")
+        self.assertEqual(mine["user"]["api_token"], token)
+
+    # -- closing an account -------------------------------------------------
+    def test_closing_deletes_the_runs_and_frees_the_name(self):
+        b, name, _ = self.account("a good long password")
+        _, run = b.call("/api/runs", "POST", document())
+        code, _ = b.call("/api/auth/close", "POST", {"password": "wrong"})
+        self.assertEqual(code, 401)
+        status, out = b.call("/api/auth/close", "POST",
+                             {"password": "a good long password"})
+        self.assertEqual(status, 200)
+        self.assertEqual(out["runs_deleted"], 1)
+        self.assertEqual(b.call(f"/api/runs/{run['id']}")[0], 404)
+        self.assertIsNone(b.call("/api/auth/me")[1]["user"])
+        # The name is free again, and the new account inherits nothing.
+        fresh = Browser(self.base)
+        status, out = fresh.call("/api/auth/register", "POST",
+                                 {"name": name, "password": "a different password"})
+        self.assertEqual(status, 201)
+        self.assertEqual(out["user"]["runs"], 0)
+
+    def test_a_run_survives_its_uploader_being_forgotten(self):
+        """user_id may name an account that is gone; the run still reads back."""
+        _, out = self.anon().call("/api/runs", "POST", document())
+        store = srv.Store(str(Path(self.tmp.name) / "a.sqlite3"))
+        with store.connect() as db:
+            db.execute("UPDATE runs SET user_id = 424242 WHERE id = ?", (out["id"],))
+        status, run = self.anon().call(f"/api/runs/{out['id']}")
+        self.assertEqual(status, 200)
+        self.assertIsNone(run["user"])
+
+
+class PasswordTest(unittest.TestCase):
+    def test_hash_round_trip(self):
+        stored = srv.hash_password("a good long password")
+        self.assertTrue(srv.password_matches("a good long password", stored))
+        self.assertFalse(srv.password_matches("a good long passwore", stored))
+
+    def test_each_hash_is_salted(self):
+        self.assertNotEqual(srv.hash_password("same password"),
+                            srv.hash_password("same password"))
+
+    def test_a_damaged_hash_matches_nothing(self):
+        for stored in ("", "nonsense", "scrypt$x$8$1$aa$bb", "md5$1$1$1$aa$bb"):
+            with self.subTest(stored):
+                self.assertFalse(srv.password_matches("anything", stored))
+
+    def test_account_limit_is_separate_from_the_address_limit(self):
+        limiter = srv.RateLimiter(2, 60.0)
+        self.assertTrue(limiter.allow("user:1", 2 * srv.ACCOUNT_RATE_FACTOR))
+        for _ in range(2 * srv.ACCOUNT_RATE_FACTOR - 1):
+            self.assertTrue(limiter.allow("user:1", 2 * srv.ACCOUNT_RATE_FACTOR))
+        self.assertFalse(limiter.allow("user:1", 2 * srv.ACCOUNT_RATE_FACTOR))
+        # ...and the address it came from still has its own budget.
+        self.assertTrue(limiter.allow("10.0.0.1"))
 
 
 class ValidateTest(unittest.TestCase):

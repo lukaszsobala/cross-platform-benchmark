@@ -40,9 +40,24 @@ the benchmark. See [web/README.md](web/README.md).
 
 ```sh
 make serve          # the hub on http://127.0.0.1:8080
+make submit         # build, measure, upload -- one row on the board
 make check          # contract test + hub tests
 make testdata       # regenerate testdata/full-run.json on this machine
 ```
+
+Submitting is a drop target on the *Submit a result* tab — drag `run.json` onto
+it, or click, or paste — and a saved config for the machines that have no
+browser:
+
+```sh
+web/submit.sh --save -u https://hub.example -t YOUR-TOKEN   # once per machine
+make submit LABEL="workstation, quiet"                      # every time after
+```
+
+An account on the hub is optional and adds three things: your name on the runs
+you upload, withdrawing them from any browser rather than only from the one
+holding a delete token, and the upload token that makes the line above work.
+Anonymous uploads are not second-class and are not going away.
 
 ## Keeping the two halves in step
 
