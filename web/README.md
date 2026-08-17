@@ -82,10 +82,17 @@ account), `--auth-limit` (sign-in attempts per address per 15 minutes).
 
 | shown as | who vouches for it | what it rules out |
 | --- | --- | --- |
-| **verified** | GitHub, over these exact bytes, from a GitHub-hosted runner | everything the submitter could have done |
-| **attested** | GitHub, same workflow, on a self-hosted runner | editing the result — not an operator tampering with their own runner |
-| `v0.1.0 build` | nobody — it is the run's own word | nothing; it says which binary a run *claims* |
-| nothing | nobody | nothing. The normal case, and it ranks the same |
+| **github-signed** | GitHub, over these exact bytes, from a GitHub-hosted runner | everything the submitter could have done |
+| **signed, own machine** | GitHub, same workflow, on a self-hosted runner | editing the result — not an operator tampering with their own runner |
+| `vx.x.x build` | nobody — it is the run's own word | nothing about honesty; it says which binary a run reports, which is what makes runs comparable |
+| nothing | nobody | nothing. A local build, and it ranks the same |
+
+Each mark names its **signer**, deliberately: nothing here is a verdict on the
+numbers, and a badge reading "verified" was taken as one. The API keeps its own
+names — `attest_tier` is `ci` or `attested`, and `?verified=` still filters on
+them — because those are a wire contract; only the display changed. The board
+explains a mark only when some row carries it, so a hub nobody has attested to
+does not advertise two badges over a page of results that cannot have them.
 
 `build.binary_sha256` sits inside a document the submitter wrote, so matching it
 against a release is a claim, not evidence. Nor can the benchmark sign its own

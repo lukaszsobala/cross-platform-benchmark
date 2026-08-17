@@ -61,9 +61,9 @@
     <label>Trust
       <select name="verified">
         <option value="">anything</option>
-        <option value="attested">signed runs only</option>
-        <option value="ci">CI-measured only</option>
-        <option value="release">claims a release build</option>
+        <option value="attested">signed by GitHub</option>
+        <option value="ci">signed, on GitHub's runners</option>
+        <option value="release">from a published binary</option>
       </select>
     </label>
     <label class="grow">Search
@@ -79,15 +79,10 @@
     Results are only comparable between builds with the same <strong>vectorize</strong> and
     <strong>FMA</strong> flags.
   </p>
-  <p class="note">
-    <span class="badge">verified</span> GitHub signed these exact numbers as
-    measured on its own runner — nothing in that chain belongs to the submitter.
-    <span class="badge weak">attested</span> the same signed workflow on the
-    submitter's own machine: not editable, but the hardware is theirs.
-    <span class="claim">v0.1.0 build</span> is only what the run says about
-    itself. Everything else is self-reported, which is the normal case and
-    ranks the same.
-  </p>
+  <!-- Filled by renderBoardLegend(): which marks to explain depends on which
+       ones any row here carries, and the release name is the hub's, not a tag
+       frozen into this file. -->
+  <div id="board-legend"></div>
 
 
   <div class="scroller"><table id="board-table"><thead></thead><tbody></tbody></table></div>

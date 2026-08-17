@@ -112,7 +112,7 @@ result bytes. Call it from your own repository to measure your own machine:
 
 ```yaml
   measure:
-    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.3.1
+    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.3.2
     permissions: { id-token: write, contents: read }
     with: { hub: https://hub.example, runner: self-hosted, label: "my box" }
 ```
