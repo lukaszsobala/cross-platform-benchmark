@@ -86,11 +86,17 @@ upward by background load, not merely noised, so more reps do not fix it.
 
 The upload happens after the last measurement, so a hub that is down costs the
 reply and not the run. Without `--token` it goes up anonymously and the reply
-carries the delete token that is then the only way to withdraw it; `$CPCPUB_HUB`
+carries the delete token that is then the only way to withdraw it — printed on
+stderr, along with everything else the upload has to say, so redirecting the
+report neither hides a failed upload nor writes that token into a file you might
+share. `$CPCPUB_HUB`
 and `$CPCPUB_TOKEN` stand in for the two flags, which keeps the token out of the
 process list. `--variants --submit` uploads one run per variant, since results
-only compare between matching builds. https needs `curl` on `PATH` — there is no
-TLS in the binary itself. See [web/README.md](../web/README.md).
+only compare between matching builds — each run's label gets the variant name
+appended, which is what tells the four rows apart. `--label` and `--notes` are
+trimmed to what the hub keeps (200 and 2000 bytes) and say so when they are.
+https needs `curl` on `PATH` — there is no TLS in the binary itself. See
+[web/README.md](../web/README.md).
 
 ## What it measures
 

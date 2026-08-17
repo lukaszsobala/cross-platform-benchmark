@@ -981,7 +981,12 @@ function authForm() {
 
   // What this hub asks of a new account, filled in when it answers. A closed
   // hub says so on the button rather than on the failure.
-  api("/api/auth/challenge").then((policy) => {
+  //
+  // The policy rather than a challenge: this runs for every visitor who draws
+  // the form, and most of them are here to read the board. A puzzle fetched
+  // here would be one nobody solves -- createAccount asks for its own -- and
+  // paid for out of the same limit that registering needs.
+  api("/api/auth/policy").then((policy) => {
     inviteLabel.hidden = !policy.invite_required;
     if (!policy.open) {
       register.disabled = true;

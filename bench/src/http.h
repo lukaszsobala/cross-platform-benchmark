@@ -14,6 +14,11 @@ typedef struct {
     int   status;           // HTTP status, or 0 when no reply was read
     char *body;             // reply body, NUL-terminated; free with http_free
     char  error[256];       // why there was no reply, when status is 0
+    // Where a 3xx points. This client does not follow redirects -- one of them
+    // is usually http:// answering for an https:// hub, which is a different
+    // transport and not a detail to paper over -- so the address is handed back
+    // for the caller to put in front of whoever has to retype it.
+    char  location[512];
 } http_reply_t;
 
 // POST `body` as application/json to `url`. `token`, when non-empty, goes in an

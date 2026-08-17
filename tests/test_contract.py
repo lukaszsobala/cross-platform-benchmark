@@ -347,6 +347,46 @@ class SubmitTest(unittest.TestCase):
         self.assertEqual(self.get("/api/runs?limit=1")["runs"][0]["user"],
                          "submitter")
 
+    def test_notes_too_long_for_the_hub_are_trimmed_not_dropped(self):
+        """The upload is what matters; the tail of a note is not.
+
+        The fields go up in the query string, percent-encoded, and a character
+        outside ASCII costs three bytes per byte there. Trimming happens in the
+        benchmark, where it can be mentioned, rather than being a reason to
+        throw away a measurement that was already made.
+        """
+        proc = self.submit("--notes", "温" * 700)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("notes trimmed", proc.stdout + proc.stderr)
+        stored = [r["notes"] for r in self.get("/api/runs?limit=20")["runs"]
+                  if (r["notes"] or "").startswith("温")]
+        self.assertTrue(stored, "the run did not land")
+        self.assertLessEqual(len(stored[0]), srv.MAX_NOTES)
+
+    def test_a_long_label_still_leaves_room_for_the_variant(self):
+        """What tells four variant rows apart must survive the trimming.
+
+        The hub cuts a label from the end, which is where the tag is, so the
+        benchmark takes the tag's room out of the label first.
+        """
+        args = [self.binary, "--variants", "--threads", "1", "--time", "0.05",
+                "--reps", "1", "--warmup", "0.02", "--submit", self.base,
+                "--label", "K" * 205]
+        proc = subprocess.run(args, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # However many variants this ISA can tell apart -- one on a target where
+        # vectorization and FMA make no difference, four on x86-64.
+        labels = [r["label"] for r in self.get("/api/runs?limit=20")["runs"]
+                  if (r["label"] or "").startswith("KKK")]
+        self.assertTrue(labels, "the run did not land")
+        self.assertEqual(len(set(labels)), len(labels),
+                         "the variant rows cannot be told apart")
+        for label in labels:
+            self.assertLessEqual(len(label), srv.MAX_TEXT)
+            if len(labels) > 1:
+                self.assertTrue(label.endswith(")"), label[-24:])
+
     def test_a_refused_token_is_reported_and_fails(self):
         proc = self.submit("--token", "not-a-real-token")
         self.assertEqual(proc.returncode, 1)

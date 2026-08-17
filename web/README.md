@@ -57,8 +57,16 @@ upload token, and gets a larger upload allowance. It is a name and a password �
 **no email**, and so no password reset. Closing one deletes its runs.
 
 Registering costs a small proof of work (a SHA-256 search the browser does in
-under a second) and is capped per address. Neither stops a determined person;
-together they stop a script taking every name overnight.
+about half a second) and is capped per address. Neither stops a determined
+person; together they stop a script taking every name overnight.
+
+The page hashes at upwards of 130k a second — it carries its own SHA-256, since
+`crypto.subtle` needs a secure context a plain-http hub does not have — and each
+bit doubles the work: on average 16 is half a second, 20 is eight seconds, and
+22, the maximum, is half a minute. It is a random search, so one attempt in ten
+finishes almost at once and one in ten takes several times the average. Above 22
+the tail runs past what the page will try and past the challenge's own lifetime,
+so the ceiling is where the browser is, not where a server would like it.
 
 ```sh
 python3 server.py --register-pow 20         # more work per account (default 16)
@@ -114,7 +122,8 @@ python3 verified.py --db runs.sqlite3 --forget v0.1.0
 | `GET` | `/api/cores?run=<id>` / `?ids=1,2,3` | every record of one run / named records |
 | `GET` | `/api/metrics`, `/api/stats`, `/api/builds` | metric definitions; counts; recognised release digests |
 | `GET` | `/api/users/<name>` | public profile: name, since, run count |
-| `GET` | `/api/auth/challenge` | registration policy, and a puzzle to register with |
+| `GET` | `/api/auth/policy` | what registering here costs: `{open, invite_required, bits}` |
+| `GET` | `/api/auth/challenge` | the same, plus a single-use puzzle to register with |
 | `POST` | `/api/auth/register` | `{name, password, challenge, nonce}`, plus `invite` where required |
 | `POST` | `/api/auth/login` `/logout` `/token` `/password` `/close` | sign in; sign out; reissue the upload token; change password; delete the account |
 | `GET` | `/api/auth/me` | the signed-in account, or `{"user": null}` |

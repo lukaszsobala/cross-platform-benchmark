@@ -1828,10 +1828,14 @@ static void emit_json(const suite_t *s, const char *mode, const run_opts_t *o,
 // and cannot fail it: the numbers are already on stdout by then, and a hub
 // that is down is not a reason to have to measure again.
 //
-// A little over what the hub stores (200 and 2000 characters), so an overlong
-// one is trimmed there with a message rather than truncated silently here.
-#define MAX_LABEL 256
-#define MAX_NOTES 2048
+// What the hub keeps of a label and of the notes. It truncates the rest without
+// saying so, so the trimming happens here instead -- where the cut can be
+// mentioned, and where the variant tag can be kept rather than being the part
+// that falls off the end. Bytes here against characters there, which is the
+// safe direction to be wrong in: a label of non-ASCII gets fewer characters
+// than the hub would have taken, and nothing is lost at the far end.
+#define MAX_LABEL 200
+#define MAX_NOTES 2000
 
 static int         g_submit = 0;
 static int         g_submit_errors = 0;     // uploads that did not land
@@ -1863,25 +1867,90 @@ static int url_encode(const char *s, char *out, size_t cap) {
     return 1;
 }
 
+// Copy `s` into `out`, keeping at most cap-1 bytes and never cutting a UTF-8
+// character in half -- half a character is not a shorter label, it is a broken
+// one. Returns 1 when the whole string fitted.
+static int copy_trimmed(char *out, size_t cap, const char *s) {
+    size_t n = strlen(s);
+    if (n < cap) {
+        memcpy(out, s, n + 1);
+        return 1;
+    }
+    n = cap - 1;
+    while (n > 0 && ((unsigned char)s[n] & 0xc0) == 0x80) --n;  // continuations
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return 0;
+}
+
+// Print what a hub said back. Bytes from the network, not necessarily JSON and
+// not necessarily printable: an escape sequence in a "reply" can repaint a
+// terminal or scroll away what it just said, and this is the one thing in the
+// upload path that puts a stranger's bytes on a screen. Control characters
+// therefore go out as \xNN, anything above ASCII passes through so a hub may
+// answer in its own language, and the whole thing is capped -- the useful part
+// of an answer is its front.
+static void print_reply(FILE *o, const char *body) {
+    const size_t max = 1024;
+    // The newline a reply may or may not end with is not information, and
+    // escaping it would only make the ordinary case look like the hostile one.
+    // Anything further in stays escaped: a line break in the middle of a reply
+    // can forge an output line of its own.
+    size_t len = strlen(body);
+    while (len > 0 && strchr(" \t\r\n", body[len - 1])) --len;
+
+    size_t i = 0;
+    for (; i < len && i < max; ++i) {
+        const unsigned char c = (unsigned char)body[i];
+        if (c >= 0x20 && c != 0x7f) fputc((int)c, o);
+        else                        fprintf(o, "\\x%02x", c);
+    }
+    if (i < len) fprintf(o, " ...");
+}
+
 // POST one result document. `variant` names the build it came from when a
 // --variants run is uploading several, which is how the labels on the board
 // stay told apart; the hub keys a run on the build flags in the document
 // itself, so each variant is a run of its own.
 static int submit_document(const char *doc, size_t len, const char *variant) {
-    FILE *o = msg();
-    char label[MAX_LABEL];
-    if (variant && *variant) {
-        snprintf(label, sizeof(label), "%s%s(%s)", g_label ? g_label : "",
-                 g_label ? " " : "", variant);
-    } else {
-        snprintf(label, sizeof(label), "%s", g_label ? g_label : "");
-    }
+    // Not msg(): an upload is a side effect, not part of the report, and its
+    // outcome has to be visible when the report itself is being redirected --
+    // `cpcpub --full --submit ... > run.txt` must not hide that nothing landed.
+    // It also keeps the delete token out of a file that gets shared: it is the
+    // credential that withdraws the run.
+    FILE *o = stderr;
 
-    // 3 bytes per byte is the worst percent-encoding can do, and the hub caps
-    // both fields well below this.
-    char enc_label[MAX_LABEL * 3], enc_notes[MAX_NOTES * 3];
+    // The tag goes on the end and the hub truncates from the end, so the room
+    // it needs comes out of the label first. Four rows that all read "(scal"
+    // are four rows nobody can tell apart, and on a --variants run the tag is
+    // the only thing that distinguishes them.
+    char tag[32] = "";
+    if (variant && *variant) snprintf(tag, sizeof(tag), "(%s)", variant);
+    const size_t reserve = tag[0] ? strlen(tag) + 1 : 0;   // and a space to join
+
+    char label[MAX_LABEL + 1], notes[MAX_NOTES + 1];
+    const int label_fit = copy_trimmed(label, sizeof(label) - reserve,
+                                       g_label ? g_label : "");
+    const int notes_fit = copy_trimmed(notes, sizeof(notes),
+                                       g_notes ? g_notes : "");
+    if (tag[0]) {
+        size_t at = strlen(label);
+        if (at) label[at++] = ' ';
+        memcpy(label + at, tag, strlen(tag) + 1);
+    }
+    if (!label_fit)
+        fprintf(o, "submit: label trimmed to %d bytes, which is what the hub "
+                   "keeps\n", MAX_LABEL);
+    if (!notes_fit)
+        fprintf(o, "submit: notes trimmed to %d bytes, which is what the hub "
+                   "keeps\n", MAX_NOTES);
+
+    // 3 bytes per byte is the worst percent-encoding can do, so after the
+    // trimming above this cannot fail. Checked rather than trusted, because the
+    // failure it would otherwise be is a URL built past the end of a buffer.
+    char enc_label[MAX_LABEL * 3 + 1], enc_notes[MAX_NOTES * 3 + 1];
     if (!url_encode(label, enc_label, sizeof(enc_label)) ||
-        !url_encode(g_notes ? g_notes : "", enc_notes, sizeof(enc_notes))) {
+        !url_encode(notes, enc_notes, sizeof(enc_notes))) {
         fprintf(o, "submit: label or notes too long\n");
         ++g_submit_errors;
         return -1;
@@ -1913,10 +1982,22 @@ static int submit_document(const char *doc, size_t len, const char *variant) {
         // needs to withdraw itself later, and the page to look at. Printed
         // whole rather than picked apart: there is no JSON parser in here, and
         // the delete token is the one thing that cannot be recovered later.
-        fprintf(o, "uploaded: %s\n", reply.body);
+        fprintf(o, "uploaded: ");
+        print_reply(o, reply.body);
+        fputc('\n', o);
+    } else if (reply.status >= 300 && reply.status < 400 && reply.location[0]) {
+        // Almost always an http:// address answering for an https:// hub. Not
+        // followed: the second address may be a different transport, a
+        // different host, or somewhere else entirely, and an upload carrying a
+        // token should go where it was addressed.
+        fprintf(o, "the hub redirected the upload (HTTP %d) to ", reply.status);
+        print_reply(o, reply.location);
+        fprintf(o, "\nsubmit to that address instead; this client does not "
+                   "follow redirects\n");
     } else {
-        fprintf(o, "hub refused the upload (HTTP %d): %s\n",
-                reply.status, reply.body);
+        fprintf(o, "hub refused the upload (HTTP %d): ", reply.status);
+        print_reply(o, reply.body);
+        fputc('\n', o);
     }
     const int ok = reply.status >= 200 && reply.status < 300;
     http_free(&reply);

@@ -1024,6 +1024,9 @@ class RegistrationTest(unittest.TestCase):
         server = srv.build_server(str(Path(tmp.name) / "r.sqlite3"),
                                   "127.0.0.1", 0, rate_limit=0, auth_limit=0,
                                   **policy)
+        # Kept so a test can look at the challenge store, which is the only
+        # state here that is not in the database.
+        self.hub = server
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
@@ -1052,6 +1055,36 @@ class RegistrationTest(unittest.TestCase):
         self.assertFalse(policy["invite_required"])
         self.assertEqual(policy["bits"], srv.REGISTER_POW_BITS)
         self.assertTrue(policy["challenge"])
+
+    def test_the_policy_costs_nothing_to_read(self):
+        """The page reads this on every draw, so it must not issue a puzzle.
+
+        A challenge per page view would fill the store with challenges nobody
+        solves, and spend the rate limit that registering needs on people who
+        only came to read the board.
+        """
+        base = self.serve()
+        status, policy = Browser(base).call("/api/auth/policy")
+        self.assertEqual(status, 200)
+        self.assertTrue(policy["open"])
+        self.assertEqual(policy["bits"], srv.REGISTER_POW_BITS)
+        self.assertNotIn("challenge", policy)
+        self.assertEqual(len(self.hub.challenges.live), 0)
+        # And the puzzle endpoint still does issue one.
+        Browser(base).call("/api/auth/challenge")
+        self.assertEqual(len(self.hub.challenges.live), 1)
+
+    def test_the_page_can_finish_the_hardest_puzzle_a_hub_may_ask_for(self):
+        """The ceiling is what the browser can search, not a round number.
+
+        app.js gives up after 2^26 nonces and the challenge expires besides, so
+        a maximum that needs more work than either allows is a door that looks
+        open and is not.
+        """
+        searchable = 1 << 26                       # the limit in solveChallenge
+        expected = 1 << srv.MAX_POW_BITS
+        self.assertLessEqual(expected * 8, searchable,
+                             "the search would fail more often than rarely")
 
     def test_a_solved_challenge_registers(self):
         base = self.serve(register_pow=12)
@@ -1179,6 +1212,28 @@ class RegistrationTest(unittest.TestCase):
         status, _ = Browser(base).call("/api/auth/register", "POST",
                                        {"name": "x", "password": "short"})
         self.assertEqual(status, 400)
+
+    def test_a_taken_name_does_not_cost_the_puzzle(self):
+        """Nor does a name someone else already has -- also not abuse.
+
+        Proved by re-using the very challenge the refused attempt carried: if it
+        had been spent, the second attempt could not register with it.
+        """
+        base = self.serve(register_pow=12)
+        b = Browser(base)
+        self.assertEqual(self.solved(base, "taken")[0], 201)
+
+        _, policy = b.call("/api/auth/challenge")
+        nonce = 0
+        while not srv.pow_solved(policy["challenge"], str(nonce), policy["bits"]):
+            nonce += 1
+        body = {"password": "a good long password",
+                "challenge": policy["challenge"], "nonce": str(nonce)}
+        again, err = b.call("/api/auth/register", "POST", dict(body, name="TAKEN"))
+        self.assertEqual(again, 409)
+        self.assertIn("taken", err["error"])
+        spare, out = b.call("/api/auth/register", "POST", dict(body, name="free"))
+        self.assertEqual(spare, 201, out)
 
 
 class ProofOfWorkTest(unittest.TestCase):

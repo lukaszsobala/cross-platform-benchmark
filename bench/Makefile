@@ -120,8 +120,14 @@ endif
 
 # Where `cpcpub --submit` uploads when given no URL. There is no public hub
 # yet; `make HUB_URL=https://hub.example` bakes one in when there is.
+#
+# Deliberately not in CFLAGS: those are reported verbatim as build.flags in
+# every result, and the hub a build was pointed at is a deployment detail, not
+# something a reader comparing two documents needs to see. It is also the one
+# entry there that would differ between builds that are otherwise identical.
+HUB_DEFINE :=
 ifneq ($(strip $(HUB_URL)),)
-	CFLAGS += -DCPCPUB_HUB_URL='"$(HUB_URL)"'
+	HUB_DEFINE := -DCPCPUB_HUB_URL='"$(HUB_URL)"'
 endif
 
 TARGET := cpcpub$(EXEEXT)
@@ -138,7 +144,10 @@ all: $(TARGET)
 # switch appears to succeed while changing nothing, and a build that is
 # supposed to have been re-targeted still runs (or crashes) as the old one.
 FLAGSTAMP := .build-flags
-BUILDID   := $(CC) $(CFLAGS) $(LDFLAGS) $(PLAT_LDFLAGS) $(LIBS)
+# HUB_DEFINE is named here even though it is not in CFLAGS: it changes the
+# binary, so it has to change the stamp, or `make HUB_URL=...` over a built tree
+# would keep the object compiled without it.
+BUILDID   := $(CC) $(CFLAGS) $(LDFLAGS) $(PLAT_LDFLAGS) $(LIBS) $(HUB_DEFINE)
 
 $(FLAGSTAMP): FORCE
 	@[ -f $@ ] && [ "$$(cat $@)" = "$(BUILDID)" ] || printf '%s' "$(BUILDID)" > $@
@@ -230,7 +239,8 @@ $(TARGET): $(OBJS)
 src/bench.o: src/bench.c src/platform.h src/kernels.h src/sha256.h src/http.h \
              $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -DBUILD_CC='"$(CC)"' -DBUILD_FLAGS='"$(CFLAGS)"' -c -o $@ $<
+	$(CC) $(CFLAGS) $(HUB_DEFINE) -DBUILD_CC='"$(CC)"' \
+	    -DBUILD_FLAGS='"$(CFLAGS)"' -c -o $@ $<
 
 # Not measured code, so it gets the shared flags and none of the variant ones:
 # what it hashes is the binary, and how fast it does that is nobody's result.

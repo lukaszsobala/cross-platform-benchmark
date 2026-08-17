@@ -90,11 +90,20 @@ SESSION_DAYS = 30
 # person, and neither is meant to: they turn "free and instant" into "a second
 # of CPU each and five an hour", which is what actually deters bulk signup.
 #
-# 16 bits is ~65k SHA-256 attempts -- a fraction of a second in the page,
-# unnoticed by a person, and the difference between a thousand accounts a
-# minute and a few. A hub that is being hammered can raise it.
+# 16 bits is ~65k SHA-256 attempts. The page hashes at roughly 130k a second --
+# it carries its own SHA-256, because crypto.subtle needs a secure context this
+# hub may not have -- so that is about half a second: unnoticed by a person, and
+# the difference between a thousand accounts a minute and a few. A hub that is
+# being hammered can raise it.
 REGISTER_POW_BITS = 16
-MAX_POW_BITS = 28           # past this an honest browser is waiting minutes
+# Each bit doubles the work, so at that rate 20 bits averages ~8 seconds and 22
+# ~30 -- an average over a memoryless search, so a given attempt can take
+# several times that and one in ten takes almost none. The ceiling is where the
+# page is, not where a server would like it: it searches 2^26 nonces before
+# giving up, and the challenge below expires, and 22 bits leaves both a wide
+# margin (2^26 is sixteen times the mean, 600s is twenty). Asking for work that
+# runs past either would be a door that looks open and is not.
+MAX_POW_BITS = 22
 CHALLENGE_TTL = 600.0       # seconds; long enough to solve, short enough to forget
 MAX_CHALLENGES = 20000      # bound the memory a challenge flood can take
 MAX_NONCE = 64
@@ -1400,24 +1409,35 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- accounts ----------------------------------------------------------
 
+    def register_policy(self) -> dict:
+        """What this hub asks of a new account. Costs nothing to answer."""
+        return {"open": self.hub.register_open,
+                "invite_required": bool(self.hub.signup_token),
+                "bits": self.hub.register_pow}
+
     def auth(self, method: str, action: str):
+        if action == "policy" and method == "GET":
+            # Deliberately separate from the puzzle below, and deliberately
+            # unlimited. The page reads this whenever it draws the sign-in form,
+            # which is once per visitor who never registers at all: issuing a
+            # challenge there would spend a store slot and a rate-limit slot per
+            # page view, and a shared address could then exhaust the very limit
+            # that registering needs. It is three booleans about the hub -- the
+            # same class of answer as /api/stats.
+            return self.send_json(HTTPStatus.OK, self.register_policy())
+
         if action == "challenge" and method == "GET":
-            # What it takes to register here, and the puzzle to register with.
-            # One endpoint rather than two: the page needs both, and a hub that
-            # is closed should say so before drawing a form.
+            # A puzzle to register with, plus the policy again so a client that
+            # wants both still needs only one request.
             #
-            # Limited on its own key, and loosely: the page asks whenever it
-            # draws the sign-in form, and someone who has looked at that form a
-            # dozen times has not been guessing at passwords. What the limit is
-            # for is a script filling the challenge store, and for that a
-            # generous ceiling is still a ceiling.
+            # Limited on its own key, and loosely: what the limit is for is a
+            # script filling the challenge store, and for that a generous
+            # ceiling is still a ceiling.
             if not self.auth_limiter.allow("chal:" + self.client_key(),
                                            self.auth_limiter.limit * 5):
                 raise Denied("too many requests from this address; try later",
                              HTTPStatus.TOO_MANY_REQUESTS)
-            out = {"open": self.hub.register_open,
-                   "invite_required": bool(self.hub.signup_token),
-                   "bits": self.hub.register_pow}
+            out = self.register_policy()
             if self.hub.register_open and self.hub.register_pow > 0:
                 out["challenge"] = self.hub.challenges.issue()
             return self.send_json(HTTPStatus.OK, out)
@@ -1492,6 +1512,15 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(given, str) or not secrets.compare_digest(
                     given, self.hub.signup_token):
                 raise Denied("this hub needs an invite code to register")
+
+        # Before the work is checked rather than after it. A name already taken
+        # is someone who forgot they had an account, or a name two people both
+        # wanted -- neither is an attempt at abuse, and neither should cost a
+        # solved puzzle and another wait. create_user's unique index is still
+        # what decides it: two registrations racing for one name is exactly what
+        # that index is there for, and this check cannot see the other one.
+        if self.store.user_by_name(name) is not None:
+            raise Denied("that name is taken", HTTPStatus.CONFLICT)
 
         bits = self.hub.register_pow
         if bits > 0:
@@ -1856,8 +1885,10 @@ def main(argv=None) -> int:
                     help="proof-of-work a new account must show, in leading "
                          f"zero bits (default {REGISTER_POW_BITS}, max "
                          f"{MAX_POW_BITS}; 0 disables it). Each bit doubles "
-                         "the work: 16 is a moment in the browser, 24 is a "
-                         "few seconds")
+                         "the work: on average 16 is half a second in the "
+                         "browser, 20 is eight seconds and 22 is half a minute "
+                         "-- a random search, so any one attempt may take "
+                         "several times that")
     ap.add_argument("--signup-token", metavar="CODE",
                     help="also require this invite code to register, so the "
                          "hub is readable and uploadable by anyone but only "

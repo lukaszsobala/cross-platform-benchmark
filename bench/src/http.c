@@ -15,6 +15,7 @@
 
 #include "http.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,10 +35,15 @@ typedef SOCKET sock_t;
 #define sock_close  closesocket
 #define popen       _popen
 #define pclose      _pclose
+// Binary, because a pipe opened in text mode on Windows turns every \n in the
+// document into \r\n on the way out -- so curl would upload bytes that are not
+// the bytes `--json` printed. POSIX popen takes no such letter and rejects it.
+#define POPEN_MODE  "wb"
 #else
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <signal.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -46,6 +52,7 @@ typedef SOCKET sock_t;
 typedef int sock_t;
 #define SOCK_BAD    (-1)
 #define sock_close  close
+#define POPEN_MODE  "w"
 #endif
 
 #define CONNECT_SECONDS 10
@@ -87,6 +94,38 @@ static const char *sock_error(void) {
 void http_free(http_reply_t *r) {
     free(r->body);
     r->body = NULL;
+}
+
+#ifndef _WIN32
+// A peer that hangs up mid-upload -- or a curl that could not be started at all
+// -- turns the next write into SIGPIPE, whose default disposition is to kill
+// the process. That would lose precisely what this file exists to protect: the
+// numbers are already out, and in a --variants run the variants still to come
+// would never be measured at all. So the signal is ignored for the length of
+// one upload and put back afterwards, because `cpcpub --json | head` should
+// still end when head does.
+typedef void (*sigpipe_fn)(int);
+
+static sigpipe_fn sigpipe_ignore(void) { return signal(SIGPIPE, SIG_IGN); }
+
+static void sigpipe_restore(sigpipe_fn old) {
+    if (old != SIG_ERR) signal(SIGPIPE, old);
+}
+#endif
+
+// Case-insensitive search, for header names: HTTP does not care how a proxy
+// spells them, so neither can we.
+static const char *ci_find(const char *hay, const char *needle) {
+    const size_t n = strlen(needle);
+    if (n == 0) return hay;
+    for (; *hay; ++hay) {
+        size_t i = 0;
+        while (i < n && hay[i] &&
+               tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i]))
+            ++i;
+        if (i == n) return hay;
+    }
+    return NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,10 +319,61 @@ static int send_all(sock_t s, const char *p, size_t len) {
     return 0;
 }
 
-// Everything the peer sends until it hangs up, capped. Small by construction:
-// a hub's reply to an upload is one line of JSON.
-static char *read_all(sock_t s, size_t *len_out, http_reply_t *r) {
-    size_t cap = 8192, len = 0;
+// ---------------------------------------------------------------------------
+// The reply
+// ---------------------------------------------------------------------------
+
+// Content-Length, or -1 when the headers do not carry a usable one. Matched
+// with the CR LF in front of the name, so a line of the body cannot pass for a
+// header once the two are sitting in the same buffer.
+static long content_length(const char *head) {
+    const char *at = ci_find(head, "\r\ncontent-length:");
+    if (!at) return -1;
+    at += strlen("\r\ncontent-length:");
+    while (*at == ' ' || *at == '\t') ++at;
+    char *end = NULL;
+    const long v = strtol(at, &end, 10);
+    return (end == at || v < 0) ? -1 : v;
+}
+
+// Copy one header's value into `out`, or leave it empty when the header is not
+// there. Bounded, and stops at the end of the line: a header value is one line.
+static void header_value(const char *head, const char *name, char *out,
+                         size_t cap) {
+    out[0] = '\0';
+    const char *at = ci_find(head, name);
+    if (!at) return;
+    at += strlen(name);
+    while (*at == ' ' || *at == '\t') ++at;
+    size_t n = 0;
+    while (at[n] && at[n] != '\r' && at[n] != '\n' && n + 1 < cap) ++n;
+    memcpy(out, at, n);
+    out[n] = '\0';
+}
+
+// Whether the body arrives in chunks. The word has to be inside the
+// Transfer-Encoding line and not merely somewhere in the headers, or a reply
+// mentioning it in passing would be decoded as though it were framed that way.
+static int says_chunked(const char *head) {
+    const char *at = ci_find(head, "\r\ntransfer-encoding:");
+    if (!at) return 0;
+    const char *eol = strstr(at + 2, "\r\n");
+    const char *found = ci_find(at, "chunked");
+    return found != NULL && (eol == NULL || found < eol);
+}
+
+// The reply, read only as far as the reply goes.
+//
+// Not simply "everything until the peer hangs up": `Connection: close` asks for
+// that, but a peer is free to ignore it, and then the read waits out IO_SECONDS
+// and reports a failed upload for a run that landed -- losing, for an anonymous
+// upload, the one copy of the delete token. So the framing the reply declares is
+// what ends the read: Content-Length where there is one, the terminating chunk
+// where the body is chunked, and EOF only when the peer promised neither.
+static char *read_reply(sock_t s, size_t *len_out, http_reply_t *r) {
+    size_t cap = 8192, len = 0, head_end = 0;
+    long want = -1;
+    int chunked = 0;
     char *buf = (char *)malloc(cap);
     if (!buf) { fail(r, "out of memory reading the reply"); return NULL; }
     for (;;) {
@@ -304,17 +394,34 @@ static char *read_all(sock_t s, size_t *len_out, http_reply_t *r) {
             fail(r, "reading the reply failed: %s", sock_error());
             return NULL;
         }
-        if (n == 0) break;
+        if (n == 0) break;                      // the peer hung up: that is all
         len += (size_t)n;
+        buf[len] = '\0';
+
+        if (head_end == 0) {
+            char *split = strstr(buf, "\r\n\r\n");
+            if (!split) continue;               // not even the headers yet
+            head_end = (size_t)(split - buf) + 4;
+            *split = '\0';                      // the header block, for the scan
+            want = content_length(buf);
+            chunked = says_chunked(buf);
+            *split = '\r';                      // and back, for parse_reply
+        }
+        const char *body = buf + head_end;
+        if (chunked) {
+            // The zero-length chunk that ends a chunked body, either at the
+            // front of it or after one. Found rather than counted: dechunk()
+            // does the counting, and this only has to know when there is
+            // nothing more coming.
+            if (!strncmp(body, "0\r\n", 3) || strstr(body, "\r\n0\r\n")) break;
+        } else if (want >= 0 && len - head_end >= (size_t)want) {
+            break;
+        }
     }
     buf[len] = '\0';
     *len_out = len;
     return buf;
 }
-
-// ---------------------------------------------------------------------------
-// The reply
-// ---------------------------------------------------------------------------
 
 // A proxy in front of a hub may chunk a reply the hub itself did not. Decoded
 // in place: the result is only ever shorter than what arrived.
@@ -348,10 +455,9 @@ static int parse_reply(char *raw, size_t len, http_reply_t *r) {
     char *split = strstr(raw, "\r\n\r\n");
     char *body = split ? split + 4 : raw + strlen(raw);
     if (split) *split = '\0';                   // headers alone, for the scan
-    // Case-insensitive enough: the only header we act on is this one, and a
-    // proxy spells it one of two ways.
-    const int chunked = strstr(raw, "Transfer-Encoding: chunked") != NULL ||
-                        strstr(raw, "transfer-encoding: chunked") != NULL;
+    const int chunked = says_chunked(raw);
+    if (r->status >= 300 && r->status < 400)
+        header_value(raw, "\r\nlocation:", r->location, sizeof(r->location));
     if (chunked) dechunk(body);
     r->body = dup_str(body);
     if (!r->body) return fail(r, "out of memory");
@@ -395,7 +501,7 @@ static int post_via_curl(const char *url, const char *token, const char *body,
     if (n < 0 || n >= (int)sizeof(cmd))
         return fail(r, "hub URL is too long for the curl fallback");
 
-    FILE *pipe = popen(cmd, "w");
+    FILE *pipe = popen(cmd, POPEN_MODE);
     if (!pipe) return fail(r, "https needs curl, and it could not be started");
     const size_t wrote = fwrite(body, 1, len, pipe);
     int rc = pclose(pipe);
@@ -407,6 +513,12 @@ static int post_via_curl(const char *url, const char *token, const char *body,
     if (WIFEXITED(rc)) rc = WEXITSTATUS(rc);
 #endif
     if (wrote != len || rc != 0) {
+        // 127 is the shell's "no such command", which for an https upload means
+        // the one dependency this file has is not installed. Named, because it
+        // is the failure an operator can actually do something about.
+        if (rc == 127)
+            return fail(r, "https needs curl and there is none on PATH; use an "
+                           "http:// hub, or install curl");
         return fail(r, "curl could not upload to %s (curl exit %d; it says why "
                        "on stderr)", url, rc);
     }
@@ -416,6 +528,50 @@ static int post_via_curl(const char *url, const char *token, const char *body,
     r->status = 201;
     r->body = dup_str("");
     return r->body ? 0 : fail(r, "out of memory");
+}
+
+// ---------------------------------------------------------------------------
+// The socket transport
+// ---------------------------------------------------------------------------
+
+static int post_via_socket(const url_t *u, const char *token, const char *body,
+                           size_t len, http_reply_t *out) {
+#ifdef _WIN32
+    if (winsock_up(out) != 0) return -1;
+#endif
+    const sock_t s = dial(u, out);
+    if (s == SOCK_BAD) return -1;
+
+    char head[9000];
+    const int n = snprintf(head, sizeof(head),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: cpcpub/1\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "%s%s%s"
+        "\r\n",
+        u->target, u->host, len,
+        (token && *token) ? "Authorization: Bearer " : "",
+        (token && *token) ? token : "",
+        (token && *token) ? "\r\n" : "");
+    if (n < 0 || n >= (int)sizeof(head)) {
+        sock_close(s);
+        return fail(out, "request headers are too long");
+    }
+    if (send_all(s, head, (size_t)n) != 0 || send_all(s, body, len) != 0) {
+        sock_close(s);
+        return fail(out, "sending the result failed: %s", sock_error());
+    }
+
+    size_t got = 0;
+    char *raw = read_reply(s, &got, out);
+    sock_close(s);
+    if (!raw) return -1;
+    const int rc = parse_reply(raw, got, out);
+    free(raw);
+    return rc;
 }
 
 // ---------------------------------------------------------------------------
@@ -433,42 +589,16 @@ int http_post_json(const char *url, const char *token, const char *body,
 
     url_t u;
     if (url_split(url, &u, out) != 0) return -1;
-    if (u.tls) return post_via_curl(url, token, body, len, out);
 
-#ifdef _WIN32
-    if (winsock_up(out) != 0) return -1;
+    // Both transports write to something that can go away underneath them, so
+    // the guard goes around both rather than inside either.
+#ifndef _WIN32
+    const sigpipe_fn old = sigpipe_ignore();
 #endif
-    const sock_t s = dial(&u, out);
-    if (s == SOCK_BAD) return -1;
-
-    char head[9000];
-    const int n = snprintf(head, sizeof(head),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "User-Agent: cpcpub/1\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "%s%s%s"
-        "\r\n",
-        u.target, u.host, len,
-        (token && *token) ? "Authorization: Bearer " : "",
-        (token && *token) ? token : "",
-        (token && *token) ? "\r\n" : "");
-    if (n < 0 || n >= (int)sizeof(head)) {
-        sock_close(s);
-        return fail(out, "request headers are too long");
-    }
-    if (send_all(s, head, (size_t)n) != 0 || send_all(s, body, len) != 0) {
-        sock_close(s);
-        return fail(out, "sending the result failed: %s", sock_error());
-    }
-
-    size_t got = 0;
-    char *raw = read_all(s, &got, out);
-    sock_close(s);
-    if (!raw) return -1;
-    const int rc = parse_reply(raw, got, out);
-    free(raw);
+    const int rc = u.tls ? post_via_curl(url, token, body, len, out)
+                         : post_via_socket(&u, token, body, len, out);
+#ifndef _WIN32
+    sigpipe_restore(old);
+#endif
     return rc;
 }
