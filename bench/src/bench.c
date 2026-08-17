@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,9 +29,18 @@
 #include "platform.h"
 #include "kernels.h"
 #include "sha256.h"
+#include "http.h"
 
 #ifndef ARRAY_LEN
 #define ARRAY_LEN(x) ((int)(sizeof(x) / sizeof((x)[0])))
+#endif
+
+// Where `--submit` sends a result when it is given no URL of its own. Empty in
+// this tree -- there is no public hub yet -- so a build can be pointed at one
+// with `make HUB_URL=https://hub.example` and its users then need no address
+// at all. See the uploading section below.
+#ifndef CPCPUB_HUB_URL
+#define CPCPUB_HUB_URL ""
 #endif
 
 // ---------------------------------------------------------------------------
@@ -47,6 +57,70 @@ static int       g_verbose = 0;
 
 // Where human-readable prose goes.
 static FILE *msg(void) { return g_format == FMT_TEXT ? stdout : stderr; }
+
+// ---------------------------------------------------------------------------
+// The JSON sink
+// ---------------------------------------------------------------------------
+//
+// The result document normally goes straight to stdout. --submit needs the
+// same bytes in memory instead -- they are what gets POSTed, and a text-mode
+// run has to produce them without printing them. So the JSON emitters write
+// through jout(), which is stdout until a buffer is put in front of it.
+
+typedef struct {
+    char  *p;
+    size_t len, cap;
+    int    oom;             // an allocation failed; the document is incomplete
+} sbuf_t;
+
+static sbuf_t *g_json_sink = NULL;
+
+static void sbuf_free(sbuf_t *b) {
+    free(b->p);
+    b->p = NULL;
+    b->len = b->cap = 0;
+}
+
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
+static void jout(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    if (!g_json_sink) {
+        vprintf(fmt, ap);
+        va_end(ap);
+        return;
+    }
+    sbuf_t *b = g_json_sink;
+    for (int attempt = 0; attempt < 2 && !b->oom; ++attempt) {
+        va_list copy;
+        va_copy(copy, ap);
+        const size_t room = b->cap - b->len;
+        // NULL with a size of zero is what vsnprintf is defined to accept, and
+        // is what the first pass on an empty buffer hands it -- b->p + 0 on a
+        // null pointer would not be.
+        char *at = b->p ? b->p + b->len : NULL;
+        const int n = vsnprintf(at, room, fmt, copy);
+        va_end(copy);
+        if (n < 0) { b->oom = 1; break; }
+        if ((size_t)n < room) { b->len += (size_t)n; break; }
+        // It did not fit: grow to hold it and write it again. vsnprintf said
+        // exactly how much it wanted, so the second pass always fits.
+        size_t want = b->cap ? b->cap : 8192;
+        while (want < b->len + (size_t)n + 1) want *= 2;
+        char *bigger = (char *)realloc(b->p, want);
+        if (!bigger) { b->oom = 1; break; }
+        b->p = bigger;
+        b->cap = want;
+    }
+    va_end(ap);
+}
+
+static void jputc(char c) {
+    if (g_json_sink) jout("%c", c);
+    else             putchar(c);
+}
 
 // ---------------------------------------------------------------------------
 // Timing
@@ -998,8 +1072,23 @@ static void usage(const char *prog) {
         "  --format F         output as text (default), json or tsv;\n"
         "                     --json and --tsv are shorthands. In json/tsv the\n"
         "                     results go to stdout and all prose to stderr\n"
-        "  -v, --verbose      explain every metric after the results\n",
-        prog);
+        "  -v, --verbose      explain every metric after the results\n"
+        "\n"
+        "Uploading (the results hub):\n"
+        "  --submit [URL]     after measuring, upload the result to the hub at\n"
+        "                     URL, e.g. http://my.server:8782%s\n"
+        "  --token TOKEN      upload token, so the run lands on your account\n"
+        "                     rather than anonymously. Get one from the hub's\n"
+        "                     Account tab. $CPCPUB_TOKEN is read when this is\n"
+        "                     not given, and keeps it out of the process list\n"
+        "  --label TEXT       short label for the run, e.g. the machine's name\n"
+        "  --notes TEXT       longer notes: cooling, governor, anything that\n"
+        "                     explains the numbers\n"
+        "The URL may also come from $CPCPUB_HUB. https needs curl on PATH.\n",
+        prog,
+        CPCPUB_HUB_URL[0] ? " (default: " CPCPUB_HUB_URL ")"
+                          : ". This build has no default hub, so the URL is "
+                            "required");
 }
 
 // Largest cache size the system reports, in bytes (0 if unknown).
@@ -1375,23 +1464,23 @@ static void tsv_result(const char *variant, const char *scope, const result_t *r
 
 // JSON: `,"key": value`, with null for anything not measured.
 static void j_num(const char *key, double v, int ok) {
-    if (ok && v > 0.0) printf(", \"%s\": %.6g", key, v);
-    else               printf(", \"%s\": null", key);
+    if (ok && v > 0.0) jout(", \"%s\": %.6g", key, v);
+    else               jout(", \"%s\": null", key);
 }
 
 static void j_str(const char *key, const char *v) {
-    printf(", \"%s\": \"", key);
+    jout(", \"%s\": \"", key);
     for (const char *p = v; *p; ++p) {
-        if (*p == '"' || *p == '\\') putchar('\\');
+        if (*p == '"' || *p == '\\') jputc('\\');
         if ((unsigned char)*p < 0x20) continue;
-        putchar(*p);
+        jputc(*p);
     }
-    printf("\"");
+    jout("\"");
 }
 
 static void json_result(const result_t *r, const char *scope, const char *indent) {
-    printf("%s{ \"scope\": \"%s\"", indent, scope);
-    if (r->cpu >= 0) printf(", \"cpu\": %d", r->cpu); else printf(", \"cpu\": null");
+    jout("%s{ \"scope\": \"%s\"", indent, scope);
+    if (r->cpu >= 0) jout(", \"cpu\": %d", r->cpu); else jout(", \"cpu\": null");
     j_num("mhz", r->mhz, 1);
     j_str("mhz_src", r->mhz > 0.0 ? (r->mhz_estimated ? "estimated" : "measured")
                                   : "unknown");
@@ -1413,7 +1502,7 @@ static void json_result(const result_t *r, const char *scope, const char *indent
     j_num("disp_gain", r->disp_gain, 1);
     j_num("disp_span", r->disp_span, r->disp_status != DISP_NA);
     j_num("score", r->score, 1);
-    printf(" }");
+    jout(" }");
 }
 
 // Opening half of the JSON document: schema, build, system and run config. The
@@ -1424,9 +1513,9 @@ static void json_open(const char *mode, const run_opts_t *o, int threads,
     compiler_string(cc, sizeof(cc));
     detect_cpu_models(models, sizeof(models));
 
-    printf("{\n  \"schema\": \"cpu-bench/1\"");
+    jout("{\n  \"schema\": \"cpu-bench/1\"");
     j_str("mode", mode);
-    printf(",\n  \"build\": { \"compiler\": \"%s\"", cc);
+    jout(",\n  \"build\": { \"compiler\": \"%s\"", cc);
     j_str("compiler_version", compiler_version());
     j_str("cc", BUILD_CC);
     j_str("flags", variant_flags(o->kernels));
@@ -1436,31 +1525,31 @@ static void json_open(const char *mode, const run_opts_t *o, int threads,
     // digest and then match it against another empty one.
     const char *digest = binary_sha256();
     if (digest) j_str("binary_sha256", digest);
-    printf(", \"vectorize\": %s, \"fma\": %s }",
-           o->kernels->vectorize ? "true" : "false",
-           o->kernels->fma ? "true" : "false");
+    jout(", \"vectorize\": %s, \"fma\": %s }",
+         o->kernels->vectorize ? "true" : "false",
+         o->kernels->fma ? "true" : "false");
 
     plat_sysinfo_t si;
-    printf(",\n  \"system\": {");
+    jout(",\n  \"system\": {");
     if (plat_sysinfo(&si) == 0) {
-        printf(" \"sysname\": \"%s\"", si.sysname);
+        jout(" \"sysname\": \"%s\"", si.sysname);
         j_str("release", si.release);
         j_str("machine", si.machine);
-        printf(",");
+        jout(",");
     }
-    printf(" \"cpus\": %d", get_cpu_count());
+    jout(" \"cpus\": %d", get_cpu_count());
     if (models[0]) j_str("cpu_models", models);
-    printf(" }");
+    jout(" }");
 
-    printf(",\n  \"config\": { \"threads\": %d, \"seconds_per_phase\": %g,"
+    jout(",\n  \"config\": { \"threads\": %d, \"seconds_per_phase\": %g,"
            " \"reps\": %d, \"warmup_seconds\": %g, \"mem_bytes_per_thread\": %zu,"
-           " \"pin\": %s, \"clock\": \"%s\", \"seed\": %llu }",
-           threads, o->seconds, o->reps, o->warmup, o->mem_per_thread,
-           pin ? "true" : "false", g_clock_raw ? "raw" : "mono",
-           (unsigned long long)o->seed);
+         " \"pin\": %s, \"clock\": \"%s\", \"seed\": %llu }",
+         threads, o->seconds, o->reps, o->warmup, o->mem_per_thread,
+         pin ? "true" : "false", g_clock_raw ? "raw" : "mono",
+         (unsigned long long)o->seed);
 }
 
-static void json_close(void) { printf("\n}\n"); }
+static void json_close(void) { jout("\n}\n"); }
 
 // ---------------------------------------------------------------------------
 // Phases
@@ -1704,30 +1793,135 @@ static void emit_json(const suite_t *s, const char *mode, const run_opts_t *o,
                       int threads, int pin) {
     json_open(mode, o, threads, pin);
     if (s->dram_hi > 0.0) {
-        printf(",\n  \"dram\": { \"name\": \"%s\", \"mhz_min\": %.6g,"
-               " \"mhz_max\": %.6g }", g_dram_name, s->dram_lo, s->dram_hi);
+        jout(",\n  \"dram\": { \"name\": \"%s\", \"mhz_min\": %.6g,"
+             " \"mhz_max\": %.6g }", g_dram_name, s->dram_lo, s->dram_hi);
     }
     if (s->have_threads) {
-        printf(",\n  \"threads\": [\n");
+        jout(",\n  \"threads\": [\n");
         for (int i = 0; i < s->n_threads; ++i) {
             json_result(&s->threads[i], "thread", "    ");
-            printf("%s\n", i + 1 < s->n_threads ? "," : "");
+            jout("%s\n", i + 1 < s->n_threads ? "," : "");
         }
-        printf("  ],\n  \"total\": ");
+        jout("  ],\n  \"total\": ");
         json_result(&s->total, "total", "");
     }
     if (s->n_cores > 0) {
-        printf(",\n  \"cores\": [\n");
+        jout(",\n  \"cores\": [\n");
         for (int i = 0; i < s->n_cores; ++i) {
             json_result(&s->cores[i], "cpu", "    ");
-            printf("%s\n", i + 1 < s->n_cores ? "," : "");
+            jout("%s\n", i + 1 < s->n_cores ? "," : "");
         }
-        printf("  ]");
+        jout("  ]");
         const double spread = core_spread(s);
-        if (spread > 0.0) printf(",\n  \"core_spread\": %.6g", spread);
+        if (spread > 0.0) jout(",\n  \"core_spread\": %.6g", spread);
     }
-    printf(",\n  \"checksum\": \"0x%016llx\"", (unsigned long long)s->checksum);
+    jout(",\n  \"checksum\": \"0x%016llx\"", (unsigned long long)s->checksum);
     json_close();
+}
+
+// ---------------------------------------------------------------------------
+// Uploading
+// ---------------------------------------------------------------------------
+//
+// `--submit URL --token T` posts the same document `--json` prints, straight
+// from the process that measured it. The upload is the last thing a run does
+// and cannot fail it: the numbers are already on stdout by then, and a hub
+// that is down is not a reason to have to measure again.
+//
+// A little over what the hub stores (200 and 2000 characters), so an overlong
+// one is trimmed there with a message rather than truncated silently here.
+#define MAX_LABEL 256
+#define MAX_NOTES 2048
+
+static int         g_submit = 0;
+static int         g_submit_errors = 0;     // uploads that did not land
+static const char *g_hub    = NULL;
+static const char *g_token  = NULL;
+static const char *g_label  = NULL;
+static const char *g_notes  = NULL;
+
+// Percent-encode into `out`, keeping only the unreserved set. Everything else,
+// including the bytes of a UTF-8 label, goes out as %XX -- so a label may say
+// whatever it likes without ending the query string early. Returns 0 if it did
+// not fit.
+static int url_encode(const char *s, char *out, size_t cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+        const int plain = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                          (*p >= '0' && *p <= '9') || strchr("-._~", (int)*p);
+        if (n + (plain ? 1u : 3u) + 1u > cap) return 0;
+        if (plain) {
+            out[n++] = (char)*p;
+        } else {
+            out[n++] = '%';
+            out[n++] = hex[*p >> 4];
+            out[n++] = hex[*p & 15];
+        }
+    }
+    out[n] = '\0';
+    return 1;
+}
+
+// POST one result document. `variant` names the build it came from when a
+// --variants run is uploading several, which is how the labels on the board
+// stay told apart; the hub keys a run on the build flags in the document
+// itself, so each variant is a run of its own.
+static int submit_document(const char *doc, size_t len, const char *variant) {
+    FILE *o = msg();
+    char label[MAX_LABEL];
+    if (variant && *variant) {
+        snprintf(label, sizeof(label), "%s%s(%s)", g_label ? g_label : "",
+                 g_label ? " " : "", variant);
+    } else {
+        snprintf(label, sizeof(label), "%s", g_label ? g_label : "");
+    }
+
+    // 3 bytes per byte is the worst percent-encoding can do, and the hub caps
+    // both fields well below this.
+    char enc_label[MAX_LABEL * 3], enc_notes[MAX_NOTES * 3];
+    if (!url_encode(label, enc_label, sizeof(enc_label)) ||
+        !url_encode(g_notes ? g_notes : "", enc_notes, sizeof(enc_notes))) {
+        fprintf(o, "submit: label or notes too long\n");
+        ++g_submit_errors;
+        return -1;
+    }
+
+    size_t base_len = strlen(g_hub);
+    while (base_len > 0 && g_hub[base_len - 1] == '/') --base_len;   // no //api
+    const size_t cap = base_len + strlen(enc_label) + strlen(enc_notes) + 64;
+    char *url = (char *)malloc(cap);
+    if (!url) { fprintf(o, "submit: out of memory\n"); ++g_submit_errors; return -1; }
+    int n = snprintf(url, cap, "%.*s/api/runs", (int)base_len, g_hub);
+    if (enc_label[0]) n += snprintf(url + n, cap - (size_t)n, "?label=%s", enc_label);
+    if (enc_notes[0]) n += snprintf(url + n, cap - (size_t)n, "%cnotes=%s",
+                                    enc_label[0] ? '&' : '?', enc_notes);
+
+    fprintf(o, "submitting %zu bytes to %.*s ...\n", len, (int)base_len, g_hub);
+    http_reply_t reply;
+    const int rc = http_post_json(url, g_token, doc, len, &reply);
+    free(url);
+
+    if (rc != 0) {
+        fprintf(o, "submit failed: %s\n", reply.error);
+        http_free(&reply);
+        ++g_submit_errors;
+        return -1;
+    }
+    if (reply.status >= 200 && reply.status < 300) {
+        // The reply carries the run id, the delete token an anonymous upload
+        // needs to withdraw itself later, and the page to look at. Printed
+        // whole rather than picked apart: there is no JSON parser in here, and
+        // the delete token is the one thing that cannot be recovered later.
+        fprintf(o, "uploaded: %s\n", reply.body);
+    } else {
+        fprintf(o, "hub refused the upload (HTTP %d): %s\n",
+                reply.status, reply.body);
+    }
+    const int ok = reply.status >= 200 && reply.status < 300;
+    http_free(&reply);
+    if (!ok) ++g_submit_errors;
+    return ok ? 0 : -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1856,14 +2050,37 @@ static int run_variant(const run_cfg_t *c, run_opts_t *opts, int idx, int n_sel,
         if (g_format == FMT_TEXT) text_per_core_footer(&s);
     }
 
-    if (g_format == FMT_TSV) {
-        emit_tsv(&s, opts->kernels->name, idx == 0);
-    } else if (g_format == FMT_JSON) {
-        if (n_sel > 1) printf(idx == 0 ? "[\n" : ",\n");
-        emit_json(&s, c->mode, opts, c->threads, c->pin);
-        if (n_sel > 1 && idx + 1 == n_sel) printf("]\n");
-    } else if (s.have_threads) {
+    if (g_format == FMT_TSV) emit_tsv(&s, opts->kernels->name, idx == 0);
+    else if (g_format == FMT_TEXT && s.have_threads) {
         printf("\nchecksum: 0x%016llx\n", (unsigned long long)s.checksum);
+    }
+
+    // The document, for whichever of the two asked for it -- and an upload
+    // happens whatever the output format, because what is printed here and
+    // what goes to a hub are two separate questions.
+    if (g_format == FMT_JSON || g_submit) {
+        // An upload sends one document per variant rather than the array
+        // --variants prints, because the hub stores one run per build.
+        sbuf_t doc = { NULL, 0, 0, 0 };
+        g_json_sink = &doc;
+        emit_json(&s, c->mode, opts, c->threads, c->pin);
+        g_json_sink = NULL;
+        if (doc.oom) {
+            fprintf(msg(), "out of memory building the result document\n");
+            sbuf_free(&doc);
+            suite_free(&s);
+            return -1;
+        }
+        if (g_format == FMT_JSON) {
+            if (n_sel > 1) printf(idx == 0 ? "[\n" : ",\n");
+            fwrite(doc.p, 1, doc.len, stdout);
+            if (n_sel > 1 && idx + 1 == n_sel) printf("]\n");
+            fflush(stdout);
+        }
+        if (g_submit) {
+            submit_document(doc.p, doc.len, n_sel > 1 ? opts->kernels->name : NULL);
+        }
+        sbuf_free(&doc);
     }
 
     if (g_format != FMT_JSON) report_dram(s.dram_lo, s.dram_hi);
@@ -2003,6 +2220,21 @@ int main(int argc, char **argv) {
             g_format = FMT_JSON;
         } else if (!strcmp(a, "--tsv")) {
             g_format = FMT_TSV;
+        } else if (!strcmp(a, "--submit")) {
+            g_submit = 1;
+            // The URL is optional so a build with a default hub needs only the
+            // flag. A following word is taken as the URL unless it is another
+            // option, which is what `--submit --token X` has to mean.
+            if (i + 1 < argc && argv[i + 1][0] != '-') g_hub = argv[++i];
+        } else if (!strncmp(a, "--submit=", 9)) {
+            g_submit = 1;
+            g_hub = a + 9;
+        } else if (!strcmp(a, "--token") && i + 1 < argc) {
+            g_token = argv[++i];
+        } else if (!strcmp(a, "--label") && i + 1 < argc) {
+            g_label = argv[++i];
+        } else if (!strcmp(a, "--notes") && i + 1 < argc) {
+            g_notes = argv[++i];
         } else if (!strcmp(a, "--verbose") || !strcmp(a, "-v")) {
             g_verbose = 1;
         } else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
@@ -2019,6 +2251,32 @@ int main(int argc, char **argv) {
     if (warmup < 0.0) warmup = 0.0;
     if (threads < 1) threads = 1;
     if (reps < 1) reps = 1;
+
+    // Where the upload goes and who it is from: the flag, then the
+    // environment, then whatever this build was compiled to default to.
+    // Settled here rather than at upload time so a missing address is an error
+    // before the machine spends a minute measuring.
+    if (g_submit) {
+        if (!g_hub || !*g_hub)     g_hub = getenv("CPCPUB_HUB");
+        if (!g_hub || !*g_hub)     g_hub = CPCPUB_HUB_URL;
+        if (!g_token || !*g_token) g_token = getenv("CPCPUB_TOKEN");
+        if (!*g_hub) {
+            fprintf(stderr, "--submit needs a hub address: "
+                            "--submit http://my.server:8782\n"
+                            "(or $CPCPUB_HUB; this build has no default hub)\n");
+            return 2;
+        }
+        if (strncmp(g_hub, "http://", 7) && strncmp(g_hub, "https://", 8)) {
+            fprintf(stderr, "--submit takes a hub URL: '%s' has no "
+                            "http:// or https:// on it\n", g_hub);
+            return 2;
+        }
+        if (disp_sweep) {
+            fprintf(stderr, "--disp-sweep produces a diagnostic curve, not a "
+                            "result a hub can compare; drop --submit\n");
+            return 2;
+        }
+    }
 
     // Pinning is not portable and is not optional to be honest about. macOS
     // gives no way to bind a thread to a numbered CPU -- placement is the
@@ -2221,5 +2479,8 @@ int main(int argc, char **argv) {
     if (cfg.want_cores) print_legend();
     else                print_legend_ratios();
 
-    return 0;
+    // The measurement is what this program is for, so a run that measured and
+    // failed to upload still printed its result -- but it says so in the exit
+    // status, because a script that submits wants to know.
+    return g_submit_errors > 0 ? 1 : 0;
 }

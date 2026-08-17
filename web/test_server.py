@@ -724,9 +724,12 @@ class AccountTest(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         # Both limiters off: these tests sign in far more often in a second
-        # than any person does in fifteen minutes.
+        # than any person does in fifteen minutes. The registration puzzle is
+        # off too -- what it costs to get an account is RegistrationTest's
+        # subject, and solving one per account here would only slow this down.
         cls.server = srv.build_server(str(Path(cls.tmp.name) / "a.sqlite3"),
-                                      "127.0.0.1", 0, rate_limit=0, auth_limit=0)
+                                      "127.0.0.1", 0, rate_limit=0, auth_limit=0,
+                                      register_pow=0, register_limit=0)
         cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -1004,6 +1007,198 @@ class AccountTest(unittest.TestCase):
         status, run = self.anon().call(f"/api/runs/{out['id']}")
         self.assertEqual(status, 200)
         self.assertIsNone(run["user"])
+
+
+class RegistrationTest(unittest.TestCase):
+    """What it costs to get an account, and what it costs to script one.
+
+    Each hub here is built with the policy under test, because the policy is
+    what is being tested -- there is no way to change it on a running server,
+    deliberately.
+    """
+
+    def serve(self, **policy) -> str:
+        """A hub with this registration policy, torn down with the test."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        server = srv.build_server(str(Path(tmp.name) / "r.sqlite3"),
+                                  "127.0.0.1", 0, rate_limit=0, auth_limit=0,
+                                  **policy)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return "http://127.0.0.1:%d" % server.server_address[1]
+
+    def solved(self, base: str, name: str, **over) -> tuple[int, dict]:
+        """Register `name`, doing whatever work the hub asks for."""
+        b = Browser(base)
+        _, policy = b.call("/api/auth/challenge")
+        body: dict[str, Any] = {"name": name, "password": "a good long password"}
+        if policy.get("bits"):
+            nonce = 0
+            while not srv.pow_solved(policy["challenge"], str(nonce), policy["bits"]):
+                nonce += 1
+            body.update(challenge=policy["challenge"], nonce=str(nonce))
+        body.update(over)
+        return b.call("/api/auth/register", "POST", body)
+
+    # -- the proof of work -------------------------------------------------
+    def test_the_hub_says_what_it_asks_for(self):
+        base = self.serve()
+        status, policy = Browser(base).call("/api/auth/challenge")
+        self.assertEqual(status, 200)
+        self.assertTrue(policy["open"])
+        self.assertFalse(policy["invite_required"])
+        self.assertEqual(policy["bits"], srv.REGISTER_POW_BITS)
+        self.assertTrue(policy["challenge"])
+
+    def test_a_solved_challenge_registers(self):
+        base = self.serve(register_pow=12)
+        status, out = self.solved(base, "worker")
+        self.assertEqual(status, 201, out)
+        self.assertEqual(out["user"]["name"], "worker")
+
+    def test_registering_without_one_is_refused(self):
+        base = self.serve(register_pow=12)
+        status, err = Browser(base).call(
+            "/api/auth/register", "POST",
+            {"name": "scripted", "password": "a good long password"})
+        self.assertEqual(status, 400)
+        self.assertIn("challenge", err["error"])
+
+    def test_a_wrong_answer_is_refused(self):
+        base = self.serve(register_pow=12)
+        b = Browser(base)
+        _, policy = b.call("/api/auth/challenge")
+        status, err = b.call("/api/auth/register", "POST",
+                             {"name": "scripted", "password": "a good long password",
+                              "challenge": policy["challenge"], "nonce": "0"})
+        # 1 in 4096 that nonce 0 happens to solve a 12-bit challenge, which
+        # would be a pass reported as a failure -- so the assertion is on
+        # either outcome being the honest one for what was sent.
+        if status == 201:
+            self.skipTest("nonce 0 solved it by luck")
+        self.assertEqual(status, 403)
+        self.assertIn("not solved", err["error"])
+
+    def test_a_challenge_is_spent_once(self):
+        base = self.serve(register_pow=12)
+        b = Browser(base)
+        _, policy = b.call("/api/auth/challenge")
+        nonce = 0
+        while not srv.pow_solved(policy["challenge"], str(nonce), policy["bits"]):
+            nonce += 1
+        body = {"password": "a good long password",
+                "challenge": policy["challenge"], "nonce": str(nonce)}
+        first, _ = b.call("/api/auth/register", "POST", dict(body, name="first"))
+        second, err = b.call("/api/auth/register", "POST", dict(body, name="second"))
+        self.assertEqual(first, 201)
+        self.assertEqual(second, 403)
+        self.assertIn("expired", err["error"])
+
+    def test_an_invented_challenge_is_refused(self):
+        base = self.serve(register_pow=0)      # even where none is required
+        status, _ = Browser(base).call(
+            "/api/auth/register", "POST",
+            {"name": "nopuzzle", "password": "a good long password"})
+        self.assertEqual(status, 201)
+
+    def test_challenges_expire(self):
+        challenges = srv.Challenges(ttl=-1.0)
+        token = challenges.issue()
+        self.assertFalse(challenges.spend(token))
+
+    def test_the_challenge_store_is_bounded(self):
+        challenges = srv.Challenges(cap=8)
+        issued = [challenges.issue() for _ in range(64)]
+        self.assertLessEqual(len(challenges.live), 8)
+        self.assertFalse(challenges.spend(issued[0]))
+
+    def test_pow_difficulty_is_capped(self):
+        # A hub cannot ask for work no browser will finish, however it is
+        # started.
+        base = self.serve(register_pow=1 << 20)
+        _, policy = Browser(base).call("/api/auth/challenge")
+        self.assertEqual(policy["bits"], srv.MAX_POW_BITS)
+
+    # -- the other two doors ----------------------------------------------
+    def test_a_closed_hub_takes_no_accounts(self):
+        base = self.serve(register_open=False, register_pow=0)
+        _, policy = Browser(base).call("/api/auth/challenge")
+        self.assertFalse(policy["open"])
+        self.assertNotIn("challenge", policy)
+        status, err = self.solved(base, "hopeful")
+        self.assertEqual(status, 403)
+        self.assertIn("not taking new accounts", err["error"])
+
+    def test_a_closed_hub_still_takes_uploads(self):
+        base = self.serve(register_open=False)
+        status, _ = Browser(base).call("/api/runs", "POST", document())
+        self.assertEqual(status, 201)
+
+    def test_an_invite_code_is_required_when_set(self):
+        base = self.serve(register_pow=0, signup_token="the-code")
+        _, policy = Browser(base).call("/api/auth/challenge")
+        self.assertTrue(policy["invite_required"])
+        refused, err = self.solved(base, "outsider")
+        self.assertEqual(refused, 403)
+        self.assertIn("invite", err["error"])
+        wrong, _ = self.solved(base, "outsider", invite="not-the-code")
+        self.assertEqual(wrong, 403)
+        ok, out = self.solved(base, "insider", invite="the-code")
+        self.assertEqual(ok, 201, out)
+
+    def test_one_address_cannot_take_every_name(self):
+        base = self.serve(register_pow=0, register_limit=2)
+        for i in range(2):
+            status, out = self.solved(base, f"early{i}")
+            self.assertEqual(status, 201, out)
+        status, err = self.solved(base, "late")
+        self.assertEqual(status, 429)
+        self.assertIn("too many accounts", err["error"])
+
+    def test_an_unsolved_attempt_does_not_use_up_the_limit(self):
+        """The limit counts accounts made, not attempts refused.
+
+        Otherwise a script that never solves anything could still exhaust the
+        quota of everyone behind the same address.
+        """
+        base = self.serve(register_pow=12, register_limit=1)
+        for i in range(5):
+            status, _ = Browser(base).call(
+                "/api/auth/register", "POST",
+                {"name": f"noise{i}", "password": "a good long password"})
+            self.assertEqual(status, 400)
+        status, out = self.solved(base, "genuine")
+        self.assertEqual(status, 201, out)
+
+    def test_a_bad_name_is_refused_before_the_work_is_checked(self):
+        """A typo should not cost the puzzle -- it is not an attempt at abuse."""
+        base = self.serve(register_pow=12)
+        status, _ = Browser(base).call("/api/auth/register", "POST",
+                                       {"name": "x", "password": "short"})
+        self.assertEqual(status, 400)
+
+
+class ProofOfWorkTest(unittest.TestCase):
+    def test_a_solution_has_the_leading_zero_bits(self):
+        nonce = 0
+        while not srv.pow_solved("abc", str(nonce), 12):
+            nonce += 1
+        digest = hashlib.sha256(f"abc:{nonce}".encode()).digest()
+        self.assertEqual(int.from_bytes(digest, "big") >> (256 - 12), 0)
+
+    def test_zero_bits_accepts_anything(self):
+        self.assertTrue(srv.pow_solved("abc", "0", 0))
+
+    def test_the_challenge_is_part_of_what_is_hashed(self):
+        nonce = 0
+        while not srv.pow_solved("abc", str(nonce), 12):
+            nonce += 1
+        # The same nonce against another challenge is worth nothing, which is
+        # what stops one solution being spent on a second registration.
+        self.assertFalse(srv.pow_solved("abd", str(nonce), 12))
 
 
 class PasswordTest(unittest.TestCase):

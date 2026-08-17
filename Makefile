@@ -59,15 +59,16 @@ serve:
 	@$(PYTHON) web/server.py
 
 # Build, measure, upload -- the whole path to a row on the board in one command.
-# Where it goes and who it is from come from the hub config written by
-# `web/submit.sh --save`; HUB, TOKEN and LABEL override that for one run:
+# The benchmark does the upload itself; HUB defaults to the local hub above,
+# and TOKEN (or $CPCPUB_TOKEN) puts the run on your account:
 #
 #   make submit LABEL="workstation, quiet"
-#   make submit HUB=https://hub.example TOKEN=... LABEL="sbc"
+#   make submit HUB=http://my.server:8782 TOKEN=... LABEL="sbc"
+HUB ?= http://127.0.0.1:8080
 submit: bench
-	@./$(BENCH) --full --json | web/submit.sh \
-	    $(if $(HUB),-u '$(HUB)') $(if $(TOKEN),-t '$(TOKEN)') \
-	    $(if $(LABEL),-l '$(LABEL)') $(if $(NOTES),-n '$(NOTES)')
+	@./$(BENCH) --full --submit '$(HUB)' \
+	    $(if $(TOKEN),--token '$(TOKEN)') \
+	    $(if $(LABEL),--label '$(LABEL)') $(if $(NOTES),--notes '$(NOTES)')
 
 clean:
 	@$(MAKE) -C bench clean

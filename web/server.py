@@ -9,11 +9,13 @@ no-dependencies policy.
 An upload may be signed in or anonymous. An account is a name and a password;
 it owns the runs uploaded under it, so they can be withdrawn from any browser
 and carry a submitter on the board, and it carries an upload token that makes
-submitting from the machine that ran the benchmark one line with nothing to
-copy back. Anonymous uploads keep working exactly as before, delete token and
-all -- an account is a convenience, never a gate. A rate limit, per account
-where there is one and per address where there is not, keeps the obvious abuse
-out.
+`cpcpub --submit URL --token T` put the run on your name. Anonymous uploads
+keep working exactly as before, delete token and all -- an account is a
+convenience, never a gate. A rate limit, per account where there is one and per
+address where there is not, keeps the obvious abuse out; registering costs a
+small proof of work as well, which is what keeps a script from taking every
+name on the hub overnight (--register-pow, --register-limit, --signup-token,
+--no-register).
 
 Nothing here claims an uploaded number was produced by the machine it names:
 an account says the same person uploaded these runs, not that they are true.
@@ -79,6 +81,23 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$")
 MIN_PASSWORD = 8
 MAX_PASSWORD = 256          # scrypt costs the same either way; this bounds work
 SESSION_DAYS = 30
+
+# Registration -------------------------------------------------------------
+#
+# There is no email address to confirm and no captcha to farm out, so what
+# stands between this hub and a script that registers all night is a small
+# proof of work plus a hard per-address limit. Neither stops a determined
+# person, and neither is meant to: they turn "free and instant" into "a second
+# of CPU each and five an hour", which is what actually deters bulk signup.
+#
+# 16 bits is ~65k SHA-256 attempts -- a fraction of a second in the page,
+# unnoticed by a person, and the difference between a thousand accounts a
+# minute and a few. A hub that is being hammered can raise it.
+REGISTER_POW_BITS = 16
+MAX_POW_BITS = 28           # past this an honest browser is waiting minutes
+CHALLENGE_TTL = 600.0       # seconds; long enough to solve, short enough to forget
+MAX_CHALLENGES = 20000      # bound the memory a challenge flood can take
+MAX_NONCE = 64
 SESSION_COOKIE = "cpb_session"
 CSRF_COOKIE = "cpb_csrf"    # readable by the page, unlike the session cookie
 CSRF_HEADER = "X-CSRF-Token"
@@ -454,6 +473,51 @@ def password_matches(password: str, stored: str) -> bool:
 
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def pow_solved(challenge: str, nonce: str, bits: int) -> bool:
+    """Whether sha256("challenge:nonce") starts with `bits` zero bits.
+
+    The client searches for a nonce; the server does one hash to check it.
+    That asymmetry is the whole mechanism, and it needs no state beyond the
+    challenge having been issued and not yet spent.
+    """
+    digest = hashlib.sha256(f"{challenge}:{nonce}".encode("utf-8")).digest()
+    return int.from_bytes(digest, "big") < (1 << (256 - bits))
+
+
+class Challenges:
+    """Registration challenges: issued by us, spent once, forgotten quickly.
+
+    Server-issued rather than derived from the request, so a challenge cannot
+    be prepared offline in bulk; single-use, so one solved puzzle is one
+    account; expiring, so the set stays small.
+    """
+
+    def __init__(self, ttl: float = CHALLENGE_TTL, cap: int = MAX_CHALLENGES):
+        self.ttl = ttl
+        self.cap = cap
+        self.live: dict[str, float] = {}
+        self.lock = threading.Lock()
+
+    def issue(self) -> str:
+        token = secrets.token_urlsafe(16)
+        now = time.monotonic()
+        with self.lock:
+            if len(self.live) >= self.cap:
+                for k in [k for k, exp in self.live.items() if exp <= now]:
+                    del self.live[k]
+                # Still full: the oldest go, which is the right thing to lose.
+                while len(self.live) >= self.cap:
+                    del self.live[min(self.live, key=self.live.__getitem__)]
+            self.live[token] = now + self.ttl
+        return token
+
+    def spend(self, token: str) -> bool:
+        """Take `token` if it is live. A second attempt with it fails."""
+        with self.lock:
+            expires = self.live.pop(token, None)
+        return expires is not None and expires > time.monotonic()
 
 
 def _url(v, field):
@@ -1048,6 +1112,10 @@ class Handler(BaseHTTPRequestHandler):
     def auth_limiter(self) -> RateLimiter:
         return self.hub.auth_limiter
 
+    @property
+    def register_limiter(self) -> RateLimiter:
+        return self.hub.register_limiter
+
     def client_key(self) -> str:
         if self.hub.trust_proxy:
             fwd = self.headers.get("X-Forwarded-For", "")
@@ -1333,6 +1401,27 @@ class Handler(BaseHTTPRequestHandler):
     # -- accounts ----------------------------------------------------------
 
     def auth(self, method: str, action: str):
+        if action == "challenge" and method == "GET":
+            # What it takes to register here, and the puzzle to register with.
+            # One endpoint rather than two: the page needs both, and a hub that
+            # is closed should say so before drawing a form.
+            #
+            # Limited on its own key, and loosely: the page asks whenever it
+            # draws the sign-in form, and someone who has looked at that form a
+            # dozen times has not been guessing at passwords. What the limit is
+            # for is a script filling the challenge store, and for that a
+            # generous ceiling is still a ceiling.
+            if not self.auth_limiter.allow("chal:" + self.client_key(),
+                                           self.auth_limiter.limit * 5):
+                raise Denied("too many requests from this address; try later",
+                             HTTPStatus.TOO_MANY_REQUESTS)
+            out = {"open": self.hub.register_open,
+                   "invite_required": bool(self.hub.signup_token),
+                   "bits": self.hub.register_pow}
+            if self.hub.register_open and self.hub.register_pow > 0:
+                out["challenge"] = self.hub.challenges.issue()
+            return self.send_json(HTTPStatus.OK, out)
+
         if action == "me" and method == "GET":
             user, how = self.identify()
             if user is None:
@@ -1383,10 +1472,48 @@ class Handler(BaseHTTPRequestHandler):
                          HTTPStatus.TOO_MANY_REQUESTS)
 
     def register(self):
+        """Create an account, for a client that can show it is not a script.
+
+        Three gates, cheapest first: is this hub taking accounts at all, is the
+        name and password even usable, and has the caller done the work. The
+        per-address limit is checked last, after the work has been shown, so a
+        flood of unsolved attempts cannot use up an honest neighbour's quota.
+        """
+        if not self.hub.register_open:
+            raise Denied("this hub is not taking new accounts; uploads still "
+                         "work without one")
         self.auth_allowed()
         body = self.read_json(MAX_AUTH_BODY)
         name = check_name(body.get("name"))
         password = check_password(body.get("password"))
+
+        if self.hub.signup_token:
+            given = body.get("invite")
+            if not isinstance(given, str) or not secrets.compare_digest(
+                    given, self.hub.signup_token):
+                raise Denied("this hub needs an invite code to register")
+
+        bits = self.hub.register_pow
+        if bits > 0:
+            challenge = body.get("challenge")
+            nonce = body.get("nonce")
+            if not isinstance(challenge, str) or not isinstance(nonce, str) \
+                    or len(nonce) > MAX_NONCE:
+                raise Invalid("registering needs a solved challenge from "
+                              "/api/auth/challenge")
+            # Spent whether or not it turns out to be solved: a challenge that
+            # survived a wrong answer would be a free retry, which is exactly
+            # what the work is supposed to cost.
+            if not self.hub.challenges.spend(challenge):
+                raise Denied("that challenge is unknown or has expired; ask "
+                             "for another")
+            if not pow_solved(challenge, nonce, bits):
+                raise Denied("the challenge was not solved")
+
+        if not self.register_limiter.allow("reg:" + self.client_key()):
+            raise Denied("too many accounts from this address; try later",
+                         HTTPStatus.TOO_MANY_REQUESTS)
+
         user = self.store.create_user(name, password)
         csrf = self.start_session(user)
         self.send_json(HTTPStatus.CREATED,
@@ -1663,6 +1790,14 @@ class Server(ThreadingHTTPServer):
     store: Store
     limiter: RateLimiter
     auth_limiter: RateLimiter
+    # What it takes to get an account here: a proof of work, a hard limit on
+    # how many an address may create, and optionally an invite code -- or the
+    # door shut entirely.
+    register_limiter: RateLimiter
+    challenges: Challenges
+    register_open: bool = True
+    register_pow: int = REGISTER_POW_BITS
+    signup_token: str | None = None
     trust_proxy: bool = False
     # The keys to check attestations against and the workflows to accept them
     # from, or None for a hub that takes no attestations at all.
@@ -1672,7 +1807,10 @@ class Server(ThreadingHTTPServer):
 def build_server(db_path: str, host: str, port: int, *, rate_limit: int = 30,
                  window: float = 3600.0, trust_proxy: bool = False,
                  auth_limit: int = 20, attest_workflows: list[str] | None = None,
-                 jwks_file: str | None = None) -> Server:
+                 jwks_file: str | None = None, register_open: bool = True,
+                 register_pow: int = REGISTER_POW_BITS,
+                 register_limit: int = 5,
+                 signup_token: str | None = None) -> Server:
     srv = Server((host, port), Handler)
     srv.store = Store(db_path)
     # An empty workflow list refuses attestations, spelled explicitly: a hub
@@ -1685,6 +1823,14 @@ def build_server(db_path: str, host: str, port: int, *, rate_limit: int = 30,
     # Sign-ins are limited separately and much harder: uploading a lot is
     # enthusiasm, trying twenty passwords in a quarter of an hour is not.
     srv.auth_limiter = RateLimiter(auth_limit, 900.0)
+    # New accounts are limited per hour rather than per quarter of an hour: a
+    # person makes one, ever, and the number that matters is how many a script
+    # can make overnight.
+    srv.register_limiter = RateLimiter(register_limit, 3600.0)
+    srv.challenges = Challenges()
+    srv.register_open = register_open
+    srv.register_pow = max(0, min(MAX_POW_BITS, register_pow))
+    srv.signup_token = signup_token or None
     srv.trust_proxy = trust_proxy
     return srv
 
@@ -1703,6 +1849,22 @@ def main(argv=None) -> int:
     ap.add_argument("--auth-limit", type=int, default=20,
                     help="sign-in attempts per address per 15 minutes, "
                          "0 to disable")
+    ap.add_argument("--register-limit", type=int, default=5,
+                    help="new accounts per address per hour, 0 to disable")
+    ap.add_argument("--register-pow", type=int, default=REGISTER_POW_BITS,
+                    metavar="BITS",
+                    help="proof-of-work a new account must show, in leading "
+                         f"zero bits (default {REGISTER_POW_BITS}, max "
+                         f"{MAX_POW_BITS}; 0 disables it). Each bit doubles "
+                         "the work: 16 is a moment in the browser, 24 is a "
+                         "few seconds")
+    ap.add_argument("--signup-token", metavar="CODE",
+                    help="also require this invite code to register, so the "
+                         "hub is readable and uploadable by anyone but only "
+                         "joinable by people you gave the code to")
+    ap.add_argument("--no-register", action="store_true",
+                    help="take no new accounts at all (existing ones, "
+                         "anonymous uploads and the board are unaffected)")
     ap.add_argument("--attest-workflow", action="append", metavar="REF",
                     help="a job_workflow_ref whose GitHub OIDC attestations "
                          "this hub accepts, without the @ref part (repeatable; "
@@ -1723,7 +1885,11 @@ def main(argv=None) -> int:
                        rate_limit=args.rate_limit, trust_proxy=args.trust_proxy,
                        auth_limit=args.auth_limit,
                        attest_workflows=[] if args.no_attest else args.attest_workflow,
-                       jwks_file=args.jwks_file)
+                       jwks_file=args.jwks_file,
+                       register_open=not args.no_register,
+                       register_pow=args.register_pow,
+                       register_limit=args.register_limit,
+                       signup_token=args.signup_token)
     host, port = srv.server_address[:2]
     print(f"cpcpub hub on http://{host}:{port}  (db: {args.db})", file=sys.stderr)
     try:

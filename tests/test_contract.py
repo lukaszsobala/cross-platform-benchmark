@@ -28,7 +28,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -279,6 +281,94 @@ class ContractTest(unittest.TestCase):
                 sweep = dict(doc, mode="disp-sweep")
                 with self.assertRaises(srv.Invalid):
                     srv.validate(sweep)
+
+
+class SubmitTest(unittest.TestCase):
+    """`cpcpub --submit` against a real hub: the other half of the contract.
+
+    The document check above says the two sides agree about what a result is.
+    This says they agree about how one gets there -- the URL the benchmark
+    builds, the header it puts the token in, and the reply it reads back.
+    Needs the binary, so it is what `make check` runs and a bare
+    `python3 tests/test_contract.py` skips.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.binary = os.environ.get("CPCPUB_BIN")
+        if not cls.binary:
+            raise unittest.SkipTest("no $CPCPUB_BIN; `make check` runs this")
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.server = srv.build_server(str(Path(cls.tmp.name) / "s.sqlite3"),
+                                      "127.0.0.1", 0, rate_limit=0, auth_limit=0,
+                                      register_pow=0, register_limit=0)
+        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def submit(self, *extra):
+        args = [self.binary, "--full", "--cpus", "0", "--threads", "1",
+                "--time", "0.05", "--reps", "1", "--warmup", "0.02",
+                "--submit", self.base, *extra]
+        return subprocess.run(args, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path) as r:
+            return json.load(r)
+
+    def test_a_run_submits_itself(self):
+        proc = self.submit("--label", "a labelled box", "--notes", "a & b")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        runs = self.get("/api/runs?limit=1")["runs"]
+        self.assertTrue(runs, "nothing landed on the hub")
+        self.assertEqual(runs[0]["label"], "a labelled box")
+        # Round-trips the characters a query string would otherwise eat.
+        self.assertEqual(runs[0]["notes"], "a & b")
+        self.assertEqual(runs[0]["mode"], "full")
+        self.assertIsNone(runs[0]["user"])
+
+    def test_a_token_puts_the_run_on_the_account(self):
+        req = urllib.request.Request(
+            self.base + "/api/auth/register", method="POST",
+            data=json.dumps({"name": "submitter",
+                             "password": "a good long password"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            token = json.load(r)["user"]["api_token"]
+        proc = self.submit("--token", token)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.get("/api/runs?limit=1")["runs"][0]["user"],
+                         "submitter")
+
+    def test_a_refused_token_is_reported_and_fails(self):
+        proc = self.submit("--token", "not-a-real-token")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("401", proc.stdout + proc.stderr)
+
+    def test_json_output_stays_one_clean_document(self):
+        """--json --submit prints the document and uploads it, not both mixed."""
+        proc = self.submit("--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        doc = json.loads(proc.stdout)
+        self.assertEqual(doc["schema"], "cpu-bench/1")
+
+    def test_an_unreachable_hub_does_not_lose_the_result(self):
+        args = [self.binary, "--threads", "1", "--time", "0.05", "--reps", "1",
+                "--warmup", "0.02", "--json", "--submit", "http://127.0.0.1:1"]
+        proc = subprocess.run(args, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("submit failed", proc.stderr)
+        # The measurement still came out, which is the point of doing the
+        # upload last.
+        self.assertEqual(json.loads(proc.stdout)["schema"], "cpu-bench/1")
 
 
 class SampleTest(unittest.TestCase):

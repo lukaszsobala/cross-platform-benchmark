@@ -113,10 +113,19 @@ PLAT_LDFLAGS :=
 ifneq (,$(TARGET_WIN))
 	EXEEXT       := .exe
 	PLAT_LDFLAGS := -static
+	# --submit opens a socket, and on Windows sockets are a library rather
+	# than part of libc. Still no dependency to install: ws2_32 is Windows.
+	LIBS         += -lws2_32
+endif
+
+# Where `cpcpub --submit` uploads when given no URL. There is no public hub
+# yet; `make HUB_URL=https://hub.example` bakes one in when there is.
+ifneq ($(strip $(HUB_URL)),)
+	CFLAGS += -DCPCPUB_HUB_URL='"$(HUB_URL)"'
 endif
 
 TARGET := cpcpub$(EXEEXT)
-OBJS   := src/bench.o src/sha256.o \
+OBJS   := src/bench.o src/sha256.o src/http.o \
           $(addprefix src/kernels-,$(addsuffix .o,$(VARIANTS)))
 
 .PHONY: all clean native sg2000 sg2000-xthead riscv-v rva23 loongarch FORCE
@@ -218,13 +227,19 @@ $(TARGET): $(OBJS)
 # passing is otherwise invisible in the numbers. These are the flags every
 # variant shares; the per-variant pair is baked into each kernels object below
 # and the two are concatenated at report time.
-src/bench.o: src/bench.c src/platform.h src/kernels.h src/sha256.h $(FLAGSTAMP)
+src/bench.o: src/bench.c src/platform.h src/kernels.h src/sha256.h src/http.h \
+             $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DBUILD_CC='"$(CC)"' -DBUILD_FLAGS='"$(CFLAGS)"' -c -o $@ $<
 
 # Not measured code, so it gets the shared flags and none of the variant ones:
 # what it hashes is the binary, and how fast it does that is nobody's result.
 src/sha256.o: src/sha256.c src/sha256.h $(FLAGSTAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Likewise: the upload happens after the last measurement is over.
+src/http.o: src/http.c src/http.h $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 

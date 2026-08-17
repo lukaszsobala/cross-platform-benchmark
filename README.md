@@ -62,36 +62,43 @@ crossed with FMA contraction off/on — and `--variants` runs each one the host
 ISA can tell apart, then compares them. The default is the scalar, unfused build
 that cross-ISA comparisons need.
 
-**[bench/README.md](bench/README.md) is the benchmark**: how each phase works,
-what every metric means, what each platform can and cannot report, and what a
-number may and may not be compared against. Read it before reading a result —
-several of the metrics say something other than what their name suggests.
-`--json` output is specified in [schema/cpu-bench-1.md](schema/cpu-bench-1.md).
+[bench/README.md](bench/README.md) covers building for each target, what every
+metric means, and what each platform can and cannot report. Read it before
+reading a result — several of the metrics say something other than what their
+name suggests. `--json` output is specified in
+[schema/cpu-bench-1.md](schema/cpu-bench-1.md).
 
-## The results hub
+## Share it
 
 [web/](web/) is an optional addition: a Python-stdlib service that collects
-`cpcpub --json` uploads and puts them side by side. It is not needed to run the
-benchmark. See [web/README.md](web/README.md).
+results and puts them side by side. The benchmark uploads its own, straight
+after measuring:
+
+```sh
+bench/cpcpub --full --submit http://my.server:8782 --token YOUR-TOKEN \
+             --label "my box"
+```
+
+The token comes from the hub's Account tab and puts the run on your name;
+without one the upload is anonymous, which every hub accepts just the same.
+`$CPCPUB_HUB` and `$CPCPUB_TOKEN` stand in for the two flags. There is no public
+hub yet — until there is, `--submit` needs an address, and a build can be given
+a default with `make HUB_URL=https://hub.example`.
+
+To run one yourself:
 
 ```sh
 make serve          # the hub on http://127.0.0.1:8080
 make submit         # build, measure, upload -- one row on the board
 ```
 
-Submitting is a drop target on the *Submit a result* tab — drag `run.json` onto
-it, or click, or paste — and a saved config for the machines that have no
-browser:
-
-```sh
-web/submit.sh --save -u https://hub.example -t YOUR-TOKEN   # once per machine
-make submit LABEL="workstation, quiet"                      # every time after
-```
+A machine that cannot reach the hub itself can hand its `run.json` to the
+*Submit a result* tab instead — drag it on, or click, or paste.
 
 An account is optional and adds three things: your name on the runs you upload,
 withdrawing them from any browser rather than only from the one holding a delete
-token, and the upload token that makes the line above work. Anonymous uploads
-are not second-class and rank the same.
+token, and the upload token above. Anonymous uploads are not second-class and
+rank the same. See [web/README.md](web/README.md).
 
 ## What a result on the board means
 
@@ -105,7 +112,7 @@ result bytes. Call it from your own repository to measure your own machine:
 
 ```yaml
   measure:
-    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.3.0
+    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.3.1
     permissions: { id-token: write, contents: read }
     with: { hub: https://hub.example, runner: self-hosted, label: "my box" }
 ```

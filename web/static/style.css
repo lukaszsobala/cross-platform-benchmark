@@ -89,6 +89,10 @@ main { max-width: 1100px; margin: 0 auto; }
   display: flex; flex-direction: column; gap: 0.25rem;
   font-size: 0.78rem; color: var(--muted);
 }
+/* `display` here beats the `hidden` attribute, which is only a UA rule -- so a
+   field the page hides (the invite code, on a hub that wants none) has to be
+   hidden again, explicitly. */
+.filters label[hidden], form label[hidden] { display: none; }
 .filters .grow { flex: 1 1 12rem; }
 .filters .check {
   flex-direction: row; align-items: center; gap: 0.4rem; padding-bottom: 0.4rem;

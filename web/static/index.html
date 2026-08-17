@@ -109,7 +109,7 @@
 <section id="upload" class="tab">
   <ol class="steps">
     <li>
-      <h2>Run the benchmark</h2>
+      <h2>Measure and submit, in one command</h2>
       <p class="note">
         On the machine you want on the board, with nothing else running:
         background load depresses every result and biases <code>DISPcap</code>
@@ -117,12 +117,18 @@
         what the machine does at once, the per-core records what each core does
         alone.
       </p>
-      <div class="cmd"><pre id="cmd-run"></pre><button type="button" class="copy" data-copy="cmd-run">Copy</button></div>
+      <div class="cmd"><pre id="cmd-submit"></pre><button type="button" class="copy" data-copy="cmd-submit">Copy</button></div>
+      <p class="note" id="shell-note"></p>
       <div id="verified-note"></div>
     </li>
 
     <li>
-      <h2>Send it here</h2>
+      <h2>Or send a result from this browser</h2>
+      <p class="note">
+        For a machine that cannot reach this hub itself: measure there with
+        <code>cpcpub --full --json &gt; run.json</code>, carry the file over,
+        and drop it here.
+      </p>
       <div class="drop" id="drop" tabindex="0" role="button"
            aria-label="Choose or drop a cpcpub result file">
         <strong>Drop <code>run.json</code> here</strong>
@@ -149,10 +155,7 @@
   </ol>
 
   <details class="more shell">
-    <summary>Submit from the machine itself, without a browser</summary>
-    <p class="note" id="shell-note"></p>
-    <div class="cmd"><pre id="cmd-setup"></pre><button type="button" class="copy" data-copy="cmd-setup">Copy</button></div>
-    <p class="note">Or in one line, with no helper script:</p>
+    <summary>Uploading a file you already have, with curl</summary>
     <div class="cmd"><pre id="cmd-curl"></pre><button type="button" class="copy" data-copy="cmd-curl">Copy</button></div>
   </details>
 </section>

@@ -41,7 +41,7 @@
 #
 #   jobs:
 #     measure:
-#       uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.3.0
+#       uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.3.1
 #       permissions:
 #         id-token: write        # required: this is what mints the token
 #         contents: read

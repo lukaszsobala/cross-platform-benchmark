@@ -727,6 +727,97 @@ async function showRun(id) {
 }
 
 // ---------------------------------------------------------------------------
+// The registration puzzle
+// ---------------------------------------------------------------------------
+//
+// Creating an account costs a small proof of work, so that a script cannot
+// take every name on the hub overnight. The page has to hash to solve it, and
+// crypto.subtle is unavailable on a hub served over plain http -- it needs a
+// secure context, which http://a-machine-on-my-network:8782 is not. So SHA-256
+// is here, in about forty lines, and works wherever the page loads.
+
+const SHA_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+  0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+  0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+  0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+  0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+  0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+  0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+  0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+  0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
+
+// The digest of `bytes`, as eight 32-bit words. Words rather than bytes
+// because the only question asked of it is how many leading zero bits it has.
+function sha256(bytes) {
+  const h = new Uint32Array([
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+  const total = ((bytes.length + 9 + 63) >> 6) << 6;
+  const buf = new Uint8Array(total);
+  buf.set(bytes);
+  buf[bytes.length] = 0x80;
+  const view = new DataView(buf.buffer);
+  view.setUint32(total - 8, Math.floor((bytes.length * 8) / 4294967296));
+  view.setUint32(total - 4, (bytes.length * 8) >>> 0);
+
+  const w = new Uint32Array(64);
+  for (let off = 0; off < total; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const a = w[i - 15], b = w[i - 2];
+      const s0 = rotr(a, 7) ^ rotr(a, 18) ^ (a >>> 3);
+      const s1 = rotr(b, 17) ^ rotr(b, 19) ^ (b >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) +
+                  ((e & f) ^ (~e & g)) + SHA_K[i] + w[i]) >>> 0;
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) +
+                  ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      hh = g; g = f; f = e; e = (d + t1) >>> 0;
+      d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    const next = [a, b, c, d, e, f, g, hh];
+    for (let i = 0; i < 8; i++) h[i] = (h[i] + next[i]) >>> 0;
+  }
+  return h;
+}
+
+function leadingZeros(words, bits) {
+  let i = 0, left = bits;
+  while (left >= 32) {
+    if (words[i++] !== 0) return false;
+    left -= 32;
+  }
+  return left === 0 || (words[i] >>> (32 - left)) === 0;
+}
+
+// Find a nonce the hub will accept, without freezing the tab: a slice of
+// attempts, then back to the event loop so the progress line paints and the
+// page stays answerable.
+async function solveChallenge(challenge, bits, progress) {
+  const enc = new TextEncoder();
+  const limit = 1 << 26;                  // ~67M: far past any sane difficulty
+  for (let n = 0; n < limit;) {
+    for (let i = 0; i < 4096; i++, n++) {
+      if (leadingZeros(sha256(enc.encode(`${challenge}:${n}`)), bits)) {
+        return String(n);
+      }
+    }
+    if (progress) progress(n);
+    await new Promise((done) => setTimeout(done, 0));
+  }
+  throw new Error("could not solve the registration challenge");
+}
+
+// ---------------------------------------------------------------------------
 // Accounts
 // ---------------------------------------------------------------------------
 //
@@ -814,33 +905,92 @@ function authForm() {
   register.type = "button";
   row.append(signin, register);
 
+  // Only drawn once the hub says it wants one. Most do not.
+  const invite = el("input");
+  invite.type = "text";
+  invite.id = "auth-invite";
+  invite.maxLength = 128;
+  const inviteLabel = el("label", null, "Invite code");
+  inviteLabel.append(invite);
+  inviteLabel.hidden = true;
+
   const msg = el("p", "authmsg");
-  const go = async (path) => {
-    msg.className = "authmsg";
-    msg.textContent = "";
+  const signedIn = async (out) => {
+    state.user = out.user;
+    pw.value = "";
+    renderWhoami();
+    renderAccount();
+    renderCommands();
+    renderMine();
+    await loadBoard();
+  };
+  const say = (text, warn) => {
+    msg.className = warn ? "authmsg warn" : "authmsg";
+    msg.textContent = text;
+  };
+
+  const signIn = async () => {
+    say("");
     try {
-      const out = await api(path, {
+      await signedIn(await api("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.value.trim(), password: pw.value }),
-      });
-      state.user = out.user;
-      pw.value = "";
-      renderWhoami();
-      renderAccount();
-      renderCommands();
-      renderMine();
-      await loadBoard();
+      }));
     } catch (e) {
-      msg.className = "authmsg warn";
-      msg.textContent = e.message;
+      say(e.message, true);
     }
   };
-  form.addEventListener("submit", (e) => { e.preventDefault(); go("/api/auth/login"); });
-  register.addEventListener("click", () => go("/api/auth/register"));
 
-  form.append(nameLabel, pwLabel, row, msg);
+  // Registering is the same two fields plus a puzzle: ask the hub for one,
+  // solve it here, and send the answer with the form. The challenge is spent
+  // whatever the outcome, so each attempt fetches its own.
+  const createAccount = async () => {
+    say("");
+    register.disabled = true;
+    try {
+      const policy = await api("/api/auth/challenge");
+      if (!policy.open) throw new Error("this hub is not taking new accounts");
+      const body = { name: name.value.trim(), password: pw.value };
+      if (policy.invite_required) body.invite = invite.value.trim();
+      if (policy.bits > 0) {
+        say("proving you are not a script…");
+        body.nonce = await solveChallenge(
+          policy.challenge, policy.bits,
+          (n) => say(`proving you are not a script… ${(n / 1000) | 0}k tries`));
+        body.challenge = policy.challenge;
+      }
+      await signedIn(await api("/api/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }));
+      say("");
+    } catch (e) {
+      say(e.message, true);
+    } finally {
+      register.disabled = false;
+    }
+  };
+
+  form.addEventListener("submit", (e) => { e.preventDefault(); signIn(); });
+  register.addEventListener("click", createAccount);
+
+  form.append(nameLabel, pwLabel, inviteLabel, row, msg);
   wrap.append(form);
+
+  // What this hub asks of a new account, filled in when it answers. A closed
+  // hub says so on the button rather than on the failure.
+  api("/api/auth/challenge").then((policy) => {
+    inviteLabel.hidden = !policy.invite_required;
+    if (!policy.open) {
+      register.disabled = true;
+      register.title = "this hub is not taking new accounts";
+      wrap.append(el("p", "note",
+        "This hub is not taking new accounts. Uploading without one still " +
+        "works and always will."));
+    }
+  }).catch(() => {});
   return wrap;
 }
 
@@ -1026,28 +1176,23 @@ function renderVerifiedNote() {
 
 function renderCommands() {
   const token = state.user && state.user.api_token;
-  $("#cmd-run").textContent =
+  $("#cmd-submit").textContent =
     "make\n" +
-    "bench/cpcpub --full --json > run.json";
+    `bench/cpcpub --full --submit ${location.origin}` +
+    (token ? ` --token ${token}` : "") + " --label \"my box\"";
 
   $("#shell-note").textContent = token
-    ? "Saved once per machine, with your upload token, so later runs are one " +
-      "pipe. The token identifies you: keep it out of shared shell history " +
-      "and out of scripts you publish."
-    : "Sign in first and these carry your upload token, so the result lands " +
-      "on your account. Without one they still work — the run goes up " +
+    ? "This carries your upload token, so the run lands on your account. The " +
+      "token identifies you: $CPCPUB_TOKEN keeps it out of shell history and " +
+      "out of the process list on a shared machine."
+    : "Sign in first and this carries your upload token, so the result lands " +
+      "on your account. Without one it still works — the run goes up " +
       "anonymously and the reply carries a delete token to keep.";
 
-  $("#cmd-setup").textContent =
-    `web/submit.sh --save -u ${location.origin}` +
-    (token ? ` -t ${token}` : "") + "\n" +
-    "bench/cpcpub --full --json | web/submit.sh -l \"my box\"";
-
   $("#cmd-curl").textContent =
-    "bench/cpcpub --full --json \\\n" +
-    `  | curl -fsS -X POST "${location.origin}/api/runs?label=my+box" \\\n` +
-    (token ? `         -H "Authorization: Bearer ${token}" \\\n` : "") +
-    "         -H 'Content-Type: application/json' --data-binary @-";
+    `curl -fsS -X POST "${location.origin}/api/runs?label=my+box" \\\n` +
+    (token ? `     -H "Authorization: Bearer ${token}" \\\n` : "") +
+    "     -H 'Content-Type: application/json' --data-binary @run.json";
 }
 
 // What was dropped or chosen, before anything is sent. Parsed here so a file

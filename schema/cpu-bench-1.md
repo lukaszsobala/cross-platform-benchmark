@@ -85,10 +85,10 @@ side. Posting the array as one body would instead need a run to hold four of
 every metric, and every comparison in the hub to learn about a dimension it does
 not have.
 
-`validate()` takes one document, so the splitting happens before the upload:
-[web/submit.sh](../web/submit.sh) posts each element in turn, appending the
-variant name to the label. Anything else feeding the hub has to do the same —
-`jq '.[0]'`, or a loop.
+`validate()` takes one document, so the splitting happens before the upload.
+`cpcpub --variants --submit URL` never builds the array at all: it posts each
+variant's document as it finishes, appending the variant name to the label.
+Anything else feeding the hub has to split it too — `jq '.[0]'`, or a loop.
 
 ## Records
 
