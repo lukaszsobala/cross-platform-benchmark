@@ -370,13 +370,16 @@ jobs:
           echo "CC=$found" >> "$GITHUB_ENV"
 
       # CC comes from $GITHUB_ENV for a cross build and is unset for a native
-      # one, where the Makefile's own default is right.
+      # one, where the Makefile's own default is right. VERSION is the tag being
+      # released, so `cpcpub --version` on a downloaded binary names the release
+      # it came from; a hand-built tree keeps the Makefile's "dev".
       - name: Build
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
         run: |
           set -eux
-          make -C bench ${{ matrix.make-target || 'all' }} ${{ matrix.vars }}
+          make -C bench ${{ matrix.make-target || 'all' }} \
+              VERSION="$TAG" ${{ matrix.vars }}
           # No file(1) in Git Bash, and nothing here depends on its output.
           command -v file >/dev/null && file "$BIN" || ls -l "$BIN"
 

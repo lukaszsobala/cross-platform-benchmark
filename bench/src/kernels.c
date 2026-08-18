@@ -76,12 +76,27 @@
 
 // The k-constants come from the context rather than being literals, so the
 // compiler cannot fold `+k1` and `-k3` together across the intervening xors.
+//
+// LANES steps per iteration, on the one lane: exactly as many counted ops per
+// loop iteration as the THR kernel below, and one dependency chain still --
+// unrolling a chain does not shorten it. The count has to match, because the
+// loop's own counter and branch are issued too and are *not* counted. An
+// out-of-order core hides them behind the chain and never noticed; a
+// single-issue in-order core issues them, so with one step per iteration this
+// kernel retired 4 counted ops per 6 instructions while THR retired 32 per 34.
+// That gap went straight into thr/lat -- a 1-wide core read as ILP 1.41 -- and
+// into the clock estimate derived from this kernel, which came out 1.5x low.
+// Matched, the overhead is the same 2 instructions per 32 ops in both and
+// cancels in the ratio, which is what the header above claims it does.
 NOINLINE static void KSYM(int_kernel_lat)(void *vctx, uint64_t n) {
     int_ctx_t *c = (int_ctx_t *)vctx;
     const uint64_t k1 = c->k[0], k2 = c->k[1];
     uint64_t a0 = c->l[0];
     for (uint64_t i = 0; i < n; ++i) {
-        INT_STEP(a0, k1, k2);
+        INT_STEP(a0, k1, k2); INT_STEP(a0, k1, k2);
+        INT_STEP(a0, k1, k2); INT_STEP(a0, k1, k2);
+        INT_STEP(a0, k1, k2); INT_STEP(a0, k1, k2);
+        INT_STEP(a0, k1, k2); INT_STEP(a0, k1, k2);
     }
     c->l[0] = a0;
 }

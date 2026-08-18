@@ -140,8 +140,8 @@ SCRYPT_MAXMEM = 64 << 20
 #         metric is still ranked, filtered and compared on.
 METRICS = [
     {"key": "score",       "label": "score",    "unit": "geomean", "kind": "rate",  "better": "high", "headline": True},
-    {"key": "int_thr",     "label": "INT-thr",  "unit": "Mops/s",  "kind": "rate",  "better": "high", "headline": True},
-    {"key": "int_lat",     "label": "INT-lat",  "unit": "Mops/s",  "kind": "rate",  "better": "high"},
+    {"key": "int_thr",     "label": "INT-thr",  "unit": "Mop/s",  "kind": "rate",  "better": "high", "headline": True},
+    {"key": "int_lat",     "label": "INT-lat",  "unit": "Mop/s",  "kind": "rate",  "better": "high"},
     {"key": "ilp",         "label": "ILP",      "unit": "x",       "kind": "ratio", "better": "high"},
     {"key": "mul_thr",     "label": "MUL-thr",  "unit": "Mmul/s",  "kind": "rate",  "better": "high"},
     {"key": "fp_thr",      "label": "FP-thr",   "unit": "Mflop/s", "kind": "rate",  "better": "high"},

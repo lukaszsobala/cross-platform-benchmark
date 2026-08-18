@@ -43,6 +43,17 @@
 #define CPCPUB_HUB_URL ""
 #endif
 
+// What `--version` reports. "dev" unless the build stamped one in -- see
+// VERSION in bench/Makefile -- so an unlabelled binary says so rather than
+// claiming to be a release it is not.
+// A clock the operator supplied with --mhz, in MHz, or 0. See the flag's own
+// note in usage(): it exists for the machines that will not say.
+static double g_mhz_given = 0.0;
+
+#ifndef CPCPUB_VERSION
+#define CPCPUB_VERSION "dev"
+#endif
+
 // ---------------------------------------------------------------------------
 // Output mode
 // ---------------------------------------------------------------------------
@@ -336,6 +347,63 @@ static double cpu_max_mhz(int cpu) {
     return khz > 0.0 ? khz / 1000.0 : 0.0;
 }
 
+// A device-tree integer property: 4 or 8 bytes, big-endian, which is how the
+// flattened tree stores them whatever the machine's own byte order is. Zero
+// for a missing file or any other length, so a caller reads "no answer" rather
+// than a number assembled out of something else. (The other property this file
+// reads, the board's `model` string, is in the CPU-naming section below.)
+static double dt_be_int(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0.0;
+    unsigned char b[8];
+    const size_t n = fread(b, 1, sizeof(b), f);
+    fclose(f);
+    if (n != 4 && n != 8) return 0.0;
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; ++i) v = (v << 8) | b[i];
+    return (double)v;
+}
+
+// The clock a CPU's device-tree node declares, in MHz.
+//
+// This is what answers for a board that runs at one fixed frequency and so
+// ships no cpufreq driver at all -- most RISC-V SBCs, and the smaller Arm ones.
+// Without it such a machine has no clock to report but the one inferred from
+// INT-lat, and that inference assumes the core retires one dependent op per
+// cycle: a wide out-of-order core does, an in-order one need not, and where it
+// does not the reported clock is wrong by exactly the IPC it actually got.
+//
+// A declared clock is not a measured one -- it is what the tree was written to
+// say -- but neither is `cpuinfo_max_freq`, and it beats an assumption about
+// the microarchitecture. `cpu@N` is tried for the logical index first, then the
+// first `cpu@` node in the tree: those agree on the uniform machines this is
+// the fallback for, and a machine with clusters that differ generally has the
+// cpufreq driver that would have answered above.
+static double dt_cpu_mhz(int cpu) {
+    char path[256];
+    if (cpu >= 0) {
+        snprintf(path, sizeof(path),
+                 "/proc/device-tree/cpus/cpu@%d/clock-frequency", cpu);
+        const double hz = dt_be_int(path);
+        if (hz > 0.0) return hz / 1e6;
+    }
+    DIR *d = opendir("/proc/device-tree/cpus");
+    if (!d) return 0.0;
+    double mhz = 0.0;
+    const struct dirent *e;
+    while (mhz <= 0.0 && (e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "cpu@", 4) != 0) continue;
+        // Bounded: d_name is up to NAME_MAX and `path` is not, and a node
+        // name that long is not one of these anyway.
+        snprintf(path, sizeof(path),
+                 "/proc/device-tree/cpus/%.128s/clock-frequency", e->d_name);
+        const double hz = dt_be_int(path);
+        if (hz > 0.0) mhz = hz / 1e6;
+    }
+    closedir(d);
+    return mhz;
+}
+
 // ---------------------------------------------------------------------------
 // DRAM controller frequency (Linux devfreq)
 // ---------------------------------------------------------------------------
@@ -552,7 +620,8 @@ static void *worker(void *arg) {
     // else: the raw curve the DISPcap number is derived from.
     if (w->disp_sweep) {
         // INT-lat is one dependent 1-cycle op per cycle, so it doubles as a
-        // clock reading on targets with no cpufreq node.
+        // clock reading on targets with no cpufreq node -- see --mhz for what
+        // to do where the core does not manage one op per cycle.
         for (int rep = 0; rep < reps; ++rep) {
             int_ctx_t c;
             for (int i = 0; i < LANES; ++i) c.l[i] = xs64(&seed) | 1u;
@@ -560,7 +629,8 @@ static void *worker(void *arg) {
             phase_begin(w, rep);
             const uint64_t it = run_timed(ks->int_lat, &c, w->seconds, 1024, &elapsed);
             keep_best_rate(&w->int_lat_mops,
-                           (double)it * (double)INT_OPS_PER_STEP / 1e6 / elapsed);
+                           (double)it * (double)(INT_OPS_PER_STEP * LANES)
+                           / 1e6 / elapsed);
             for (int i = 0; i < LANES; ++i) w->checksum ^= c.l[i];
             if (w->cpu_observed >= 0) {
                 const double mhz = cpu_cur_mhz(w->cpu_observed);
@@ -604,7 +674,8 @@ static void *worker(void *arg) {
         phase_begin(w, rep);
         const uint64_t it = run_timed(ks->int_lat, &c, w->seconds, 1024, &elapsed);
         keep_best_rate(&w->int_lat_mops,
-                       (double)it * (double)INT_OPS_PER_STEP / 1e6 / elapsed);
+                       (double)it * (double)(INT_OPS_PER_STEP * LANES)
+                       / 1e6 / elapsed);
         for (int i = 0; i < LANES; ++i) w->checksum ^= c.l[i];
     }
 
@@ -810,7 +881,228 @@ static const char *arch_string(void) {
 #endif
 }
 
-// Distinct CPU model names in /proc/cpuinfo (more than one on big.LITTLE).
+// ---------------------------------------------------------------------------
+// Naming the CPU
+// ---------------------------------------------------------------------------
+
+// The hosts that answer this question out of /proc/cpuinfo: everything that is
+// neither Windows, which has the registry, nor macOS, which has sysctl. Named
+// once so the helpers below and the branch that calls them cannot drift apart.
+#if !defined(_WIN32) && !defined(__APPLE__)
+#define CPCPUB_PROC_CPUINFO 1
+#endif
+
+#ifdef CPCPUB_PROC_CPUINFO
+// Append one name to the " + "-separated list in `out`, if it is not already
+// in it. The membership test is per element and exact: a substring test reads
+// "Cortex-A5" as already present once "Cortex-A55" is there, and those pairs
+// are precisely what the big.LITTLE case produces.
+static void models_add(char *out, size_t outsz, const char *name) {
+    if (!name[0]) return;
+    const size_t n = strlen(name);
+    for (const char *p = out; *p; ) {
+        const char *sep = strstr(p, " + ");
+        const size_t len = sep ? (size_t)(sep - p) : strlen(p);
+        if (len == n && strncmp(p, name, n) == 0) return;
+        if (!sep) break;
+        p = sep + 3;
+    }
+    const size_t used = strlen(out);
+    if (used + 1 >= outsz) return;
+    snprintf(out + used, outsz - used, "%s%s", used ? " + " : "", name);
+}
+#endif  // CPCPUB_PROC_CPUINFO
+
+#if defined(CPCPUB_PROC_CPUINFO) && defined(__aarch64__)
+// Arm parts carry no brand string: there is no CPUID leaf to hold one and no
+// vendor writes one into /proc/cpuinfo, which publishes the raw MIDR fields
+// instead -- an implementer byte and a 12-bit part number. Without the tables
+// below every Arm machine names itself "aarch64", which is the one thing a
+// reader of these results already knows from build.target.
+//
+// The numbers are the documented MIDR_EL1 values, as carried by Arm's own
+// manuals and the kernel's arch/arm64/include/asm/cputype.h. Only parts that
+// can run a 64-bit kernel are listed -- AArch32-only and Cortex-M cores cannot
+// be running this binary, so naming them would be dead weight. An unlisted
+// part still reports its numbers rather than "unknown": silicon newer than
+// this table is exactly the case where the raw pair is worth having.
+typedef struct { unsigned part; const char *name; } midr_part_t;
+
+static const midr_part_t midr_arm[] = {
+    { 0xd02, "Cortex-A34" },    { 0xd03, "Cortex-A53" },
+    { 0xd04, "Cortex-A35" },    { 0xd05, "Cortex-A55" },
+    { 0xd06, "Cortex-A65" },    { 0xd07, "Cortex-A57" },
+    { 0xd08, "Cortex-A72" },    { 0xd09, "Cortex-A73" },
+    { 0xd0a, "Cortex-A75" },    { 0xd0b, "Cortex-A76" },
+    { 0xd0c, "Neoverse-N1" },   { 0xd0d, "Cortex-A77" },
+    { 0xd0e, "Cortex-A76AE" },  { 0xd14, "Cortex-R82AE" },
+    { 0xd15, "Cortex-R82" },    { 0xd40, "Neoverse-V1" },
+    { 0xd41, "Cortex-A78" },    { 0xd42, "Cortex-A78AE" },
+    { 0xd43, "Cortex-A65AE" },  { 0xd44, "Cortex-X1" },
+    { 0xd46, "Cortex-A510" },   { 0xd47, "Cortex-A710" },
+    { 0xd48, "Cortex-X2" },     { 0xd49, "Neoverse-N2" },
+    { 0xd4a, "Neoverse-E1" },   { 0xd4b, "Cortex-A78C" },
+    { 0xd4c, "Cortex-X1C" },    { 0xd4d, "Cortex-A715" },
+    { 0xd4e, "Cortex-X3" },     { 0xd4f, "Neoverse-V2" },
+    { 0xd80, "Cortex-A520" },   { 0xd81, "Cortex-A720" },
+    { 0xd82, "Cortex-X4" },     { 0xd83, "Neoverse-V3AE" },
+    { 0xd84, "Neoverse-V3" },   { 0xd85, "Cortex-X925" },
+    { 0xd87, "Cortex-A725" },   { 0xd88, "Cortex-A520AE" },
+    { 0xd89, "Cortex-A720AE" }, { 0xd8a, "C1-Nano" },
+    { 0xd8b, "C1-Pro" },        { 0xd8c, "C1-Ultra" },
+    { 0xd8e, "Neoverse-N3" },   { 0xd8f, "Cortex-A320" },
+    { 0xd90, "C1-Premium" },
+};
+
+// Apple silicon reaches this path only under a Linux port -- macOS answers
+// from sysctl above and never gets here -- so the cores are named the way that
+// project's users see them rather than by the marketing part.
+static const midr_part_t midr_apple[] = {
+    { 0x020, "Icestorm-A14" },     { 0x021, "Firestorm-A14" },
+    { 0x022, "Icestorm-M1" },      { 0x023, "Firestorm-M1" },
+    { 0x024, "Icestorm-M1-Pro" },  { 0x025, "Firestorm-M1-Pro" },
+    { 0x026, "Thunder-M10" },      { 0x028, "Icestorm-M1-Max" },
+    { 0x029, "Firestorm-M1-Max" }, { 0x030, "Blizzard-A15" },
+    { 0x031, "Avalanche-A15" },    { 0x032, "Blizzard-M2" },
+    { 0x033, "Avalanche-M2" },     { 0x034, "Blizzard-M2-Pro" },
+    { 0x035, "Avalanche-M2-Pro" }, { 0x036, "Sawtooth-A16" },
+    { 0x037, "Everest-A16" },      { 0x038, "Blizzard-M2-Max" },
+    { 0x039, "Avalanche-M2-Max" },
+};
+
+static const midr_part_t midr_qcom[] = {
+    { 0x001, "Oryon" },          { 0x201, "Kryo" },
+    { 0x205, "Kryo" },           { 0x211, "Kryo" },
+    { 0x800, "Falkor-V1/Kryo" }, { 0x801, "Kryo-V2" },
+    { 0x802, "Kryo-3XX-Gold" },  { 0x803, "Kryo-3XX-Silver" },
+    { 0x804, "Kryo-4XX-Gold" },  { 0x805, "Kryo-4XX-Silver" },
+    { 0xc00, "Falkor" },         { 0xc01, "Saphira" },
+};
+
+static const midr_part_t midr_cavium[] = {
+    { 0x0a0, "ThunderX" },       { 0x0a1, "ThunderX-88XX" },
+    { 0x0a2, "ThunderX-81XX" },  { 0x0a3, "ThunderX-83XX" },
+    { 0x0af, "ThunderX2-99xx" }, { 0x0b0, "OcteonTX2" },
+    { 0x0b1, "OcteonTX2-98XX" }, { 0x0b2, "OcteonTX2-96XX" },
+    { 0x0b3, "OcteonTX2-95XX" }, { 0x0b4, "OcteonTX2-95XXN" },
+    { 0x0b5, "OcteonTX2-95XXMM" }, { 0x0b6, "OcteonTX2-95XXO" },
+    { 0x0b8, "ThunderX3-T110" },
+};
+
+// HiSilicon ships two Arm designs under its own implementer byte and advertises
+// them as the Arm parts they are, so the names follow what the silicon claims.
+static const midr_part_t midr_hisi[] = {
+    { 0xd01, "TaiShan-v110" }, { 0xd02, "TaiShan-v120" },
+    { 0xd40, "Cortex-A76" },   { 0xd41, "Cortex-A77" },
+};
+
+static const midr_part_t midr_nvidia[] = {
+    { 0x000, "Denver" }, { 0x003, "Denver-2" },
+    { 0x004, "Carmel" }, { 0x010, "Olympus" },
+};
+
+static const midr_part_t midr_samsung[] = {
+    { 0x001, "exynos-m1" }, { 0x002, "exynos-m3" },
+    { 0x003, "exynos-m4" }, { 0x004, "exynos-m5" },
+};
+
+static const midr_part_t midr_ampere[] = {
+    { 0xac3, "Ampere-1" }, { 0xac4, "Ampere-1a" },
+};
+
+static const midr_part_t midr_fujitsu[] = {
+    { 0x001, "A64FX" }, { 0x003, "MONAKA" },
+};
+
+static const midr_part_t midr_phytium[] = {
+    { 0x303, "FTC310" }, { 0x660, "FTC660" }, { 0x661, "FTC661" },
+    { 0x662, "FTC662" }, { 0x663, "FTC663" }, { 0x664, "FTC664" },
+    { 0x862, "FTC862" },
+};
+
+static const midr_part_t midr_brcm[]   = { { 0x100, "Brahma-B53" },
+                                           { 0x516, "ThunderX2" } };
+static const midr_part_t midr_apm[]    = { { 0x000, "X-Gene" } };
+static const midr_part_t midr_ms[]     = { { 0xd49, "Azure-Cobalt-100" } };
+
+typedef struct {
+    unsigned            impl;
+    const char         *vendor;
+    const midr_part_t  *parts;
+    int                 n;
+} midr_impl_t;
+
+static const midr_impl_t midr_impls[] = {
+    { 0x41, "Arm",       midr_arm,     ARRAY_LEN(midr_arm)     },
+    { 0x42, "Broadcom",  midr_brcm,    ARRAY_LEN(midr_brcm)    },
+    { 0x43, "Cavium",    midr_cavium,  ARRAY_LEN(midr_cavium)  },
+    { 0x46, "Fujitsu",   midr_fujitsu, ARRAY_LEN(midr_fujitsu) },
+    { 0x48, "HiSilicon", midr_hisi,    ARRAY_LEN(midr_hisi)    },
+    { 0x4e, "NVIDIA",    midr_nvidia,  ARRAY_LEN(midr_nvidia)  },
+    { 0x50, "APM",       midr_apm,     ARRAY_LEN(midr_apm)     },
+    { 0x51, "Qualcomm",  midr_qcom,    ARRAY_LEN(midr_qcom)    },
+    { 0x53, "Samsung",   midr_samsung, ARRAY_LEN(midr_samsung) },
+    { 0x61, "Apple",     midr_apple,   ARRAY_LEN(midr_apple)   },
+    { 0x6d, "Microsoft", midr_ms,      ARRAY_LEN(midr_ms)      },
+    { 0x70, "Phytium",   midr_phytium, ARRAY_LEN(midr_phytium) },
+    { 0xc0, "Ampere",    midr_ampere,  ARRAY_LEN(midr_ampere)  },
+};
+
+// One MIDR implementer/part pair as a name. The vendor is named too, except
+// where it would only repeat itself: an Arm part number spells out "Cortex-"
+// or "Neoverse-" already, and "Ampere-1" is not improved by "Ampere Ampere-1".
+static void midr_name(unsigned impl, unsigned part, char *out, size_t outsz) {
+    for (int i = 0; i < ARRAY_LEN(midr_impls); ++i) {
+        const midr_impl_t *v = &midr_impls[i];
+        if (v->impl != impl) continue;
+        for (int p = 0; p < v->n; ++p) {
+            if (v->parts[p].part != part) continue;
+            const char *name = v->parts[p].name;
+            if (impl == 0x41 ||
+                strncmp(name, v->vendor, strlen(v->vendor)) == 0) {
+                snprintf(out, outsz, "%s", name);
+            } else {
+                snprintf(out, outsz, "%s %s", v->vendor, name);
+            }
+            return;
+        }
+        snprintf(out, outsz, "%s part 0x%03x", v->vendor, part);
+        return;
+    }
+    snprintf(out, outsz, "impl 0x%02x part 0x%03x", impl, part);
+}
+#endif  // CPCPUB_PROC_CPUINFO && __aarch64__
+
+#ifdef CPCPUB_PROC_CPUINFO
+// The board's own name for itself, from the flattened device tree: a property
+// holding one NUL-terminated string, e.g. "Radxa ROCK 5B". It answers a
+// question the core names cannot -- an RK3588 and an Allwinner A733 are both
+// "Cortex-A55 + Cortex-A76", and on a board of SBCs that is the difference
+// between two rows and one. Absent on PCs, which have a brand string instead.
+static void dt_model(char *out, size_t outsz) {
+    out[0] = '\0';
+    FILE *f = fopen("/proc/device-tree/model", "rb");
+    if (!f) return;
+    char raw[128];
+    const size_t n = fread(raw, 1, sizeof(raw) - 1, f);
+    fclose(f);
+    raw[n] = '\0';
+    // Printable ASCII only, and collapsed to single spaces: this string is
+    // written by whoever wrote the device tree and ends up in a JSON document.
+    size_t w = 0;
+    for (size_t i = 0; i < n && raw[i] && w + 1 < outsz; ++i) {
+        const unsigned char c = (unsigned char)raw[i];
+        if (c < 0x20 || c > 0x7e) continue;
+        if (c == ' ' && (w == 0 || out[w - 1] == ' ')) continue;
+        out[w++] = (char)c;
+    }
+    while (w > 0 && out[w - 1] == ' ') w--;
+    out[w] = '\0';
+}
+#endif  // CPCPUB_PROC_CPUINFO
+
+// Distinct CPU model names (more than one on big.LITTLE), and the board they
+// are on where the machine will say.
 static void detect_cpu_models(char *out, size_t outsz) {
     if (!out || outsz == 0) return;
     out[0] = '\0';
@@ -843,37 +1135,101 @@ static void detect_cpu_models(char *out, size_t outsz) {
     }
     return;
 #else
-    FILE *f = fopen("/proc/cpuinfo", "r");
-    if (!f) return;
+    // Three ways a Linux kernel names a CPU, in order of how much they say:
+    //
+    //   1. a brand string under one of the model-name keys -- x86, loongarch,
+    //      ppc64le, and the RISC-V cores that fill in "uarch";
+    //   2. the MIDR implementer/part pair, which is all Arm publishes;
+    //   3. the platform's name for itself -- the device tree's `model`, or the
+    //      "Hardware" line an Android kernel writes -- which on an SBC or a
+    //      phone is the only thing separating two boards built from the same
+    //      cores.
+    //
+    // (2) is a fallback for (1) rather than an addition to it: a kernel that
+    // gives both is describing one CPU twice. (3) is an addition to either,
+    // in parentheses, and stands alone where neither of the others answered.
+    char models[320], platform[128];
+    models[0] = platform[0] = '\0';
 
-    char line[512];
-    const char *keys[] = { "model name", "Model Name", "cpu model", "Hardware" };
-    while (fgets(line, (int)sizeof(line), f)) {
-        for (int k = 0; k < ARRAY_LEN(keys); ++k) {
-            if (strncmp(line, keys[k], strlen(keys[k])) != 0) continue;
-            const char *colon = strchr(line, ':');
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        // "cpu" is ppc64le's key and "uarch" is RISC-V's; the others are the
+        // several spellings x86, loongarch and MIPS use. Matched whole, since
+        // a prefix test for "cpu" would also take x86's "cpu family".
+        static const char *const keys[] = {
+            "model name", "Model Name", "cpu model", "cpu", "uarch",
+        };
+#if defined(CPCPUB_PROC_CPUINFO) && defined(__aarch64__)
+        char midrs[320];
+        midrs[0] = '\0';
+        unsigned impl = 0;
+        int have_impl = 0;
+#endif
+        char line[1024];
+        int continuation = 0;
+        while (fgets(line, (int)sizeof(line), f)) {
+            // A Features or flags line can outrun the buffer, and its tail
+            // would then be read as a line of its own -- with a colon in it,
+            // on some kernels. Anything after a chunk that did not end in a
+            // newline is such a tail, and is skipped.
+            const size_t got = strlen(line);
+            const int was_partial = continuation;
+            continuation = got > 0 && line[got - 1] != '\n';
+            if (was_partial) continue;
+
+            char *colon = strchr(line, ':');
             if (!colon) continue;
-            colon++;
-            while (*colon == ' ' || *colon == '\t') colon++;
-            size_t len = strlen(colon);
-            while (len > 0 && (colon[len - 1] == '\n' || colon[len - 1] == '\r')) len--;
-            if (len == 0) continue;
-            char name[192];
-            const size_t cp = len < sizeof(name) - 1 ? len : sizeof(name) - 1;
-            memcpy(name, colon, cp);
-            name[cp] = '\0';
-            if (!strstr(out, name)) {                 // de-duplicate
-                if (out[0]) {
-                    const size_t used = strlen(out);
-                    snprintf(out + used, outsz - used, " + %s", name);
-                } else {
-                    snprintf(out, outsz, "%s", name);
+            *colon = '\0';
+            char *key = line, *val = colon + 1;
+            char *end = key + strlen(key);
+            while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+            while (*val == ' ' || *val == '\t') val++;
+            end = val + strlen(val);
+            while (end > val && (end[-1] == '\n' || end[-1] == '\r' ||
+                                 end[-1] == ' '  || end[-1] == '\t')) *--end = '\0';
+            if (!*key || !*val) continue;
+
+            for (int k = 0; k < ARRAY_LEN(keys); ++k) {
+                if (strcmp(key, keys[k]) == 0) {
+                    models_add(models, sizeof(models), val);
+                    break;
                 }
             }
-            break;
+            // Not a model name: "Hardware" is the SoC or board, which is why
+            // it is held aside as the platform rather than added to the list.
+            if (!platform[0] && strcmp(key, "Hardware") == 0) {
+                snprintf(platform, sizeof(platform), "%s", val);
+            }
+#if defined(CPCPUB_PROC_CPUINFO) && defined(__aarch64__)
+            // Both fields appear once per processor, implementer first, so a
+            // part number is always read against the implementer above it.
+            if (strcmp(key, "CPU implementer") == 0) {
+                impl = (unsigned)strtoul(val, NULL, 0);
+                have_impl = 1;
+            } else if (strcmp(key, "CPU part") == 0 && have_impl) {
+                char name[96];
+                midr_name(impl, (unsigned)strtoul(val, NULL, 0),
+                          name, sizeof(name));
+                models_add(midrs, sizeof(midrs), name);
+            }
+#endif
         }
+        fclose(f);
+#if defined(CPCPUB_PROC_CPUINFO) && defined(__aarch64__)
+        if (!models[0]) snprintf(models, sizeof(models), "%s", midrs);
+#endif
     }
-    fclose(f);
+
+    // The device tree names the board ("Radxa ROCK 5B"); "Hardware" tends to
+    // name the SoC behind it. The first is the more specific of the two, so it
+    // wins where the machine offers both.
+    char board[128];
+    dt_model(board, sizeof(board));
+    if (!board[0]) snprintf(board, sizeof(board), "%s", platform);
+
+    if (models[0] && board[0]) snprintf(out, outsz, "%s (%s)", models, board);
+    else if (models[0])        snprintf(out, outsz, "%s", models);
+    else                       snprintf(out, outsz, "%s", board);
 #endif
 }
 
@@ -1044,6 +1400,14 @@ static int run_workers(worker_t *w, int n, const run_opts_t *o) {
     return 0;
 }
 
+// `--version`. The version string is a label the build put there and can say
+// anything; the digest below it is what a reader can check against a release's
+// SHA256SUMS, so both are printed and the second is the one that settles it.
+static void print_version(void) {
+    fprintf(msg(), "cpcpub %s, schema cpu-bench/1\n", CPCPUB_VERSION);
+    print_platform();
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
@@ -1069,10 +1433,18 @@ static void usage(const char *prog) {
         "  --no-pin           do not set thread affinity\n"
         "  --clock mono|raw   clock source (default raw)\n"
         "  --seed N           PRNG seed for setup (default 1)\n"
+        "  --mhz N            the core clock, for a machine that will not say:\n"
+        "                     no cpufreq node and no device-tree clock leaves\n"
+        "                     only the INT-lat estimate, which assumes one\n"
+        "                     dependent op per cycle and reads low on a core\n"
+        "                     that does not manage it. Recorded as given, not\n"
+        "                     measured, and changes no other number\n"
         "  --format F         output as text (default), json or tsv;\n"
         "                     --json and --tsv are shorthands. In json/tsv the\n"
         "                     results go to stdout and all prose to stderr\n"
         "  -v, --verbose      explain every metric after the results\n"
+        "  --version          print the version, the build and this machine,\n"
+        "                     then exit\n"
         "\n"
         "Uploading (the results hub):\n"
         "  --submit [URL]     after measuring, upload the result to the hub at\n"
@@ -1185,9 +1557,11 @@ static void print_legend_ratios(void) {
     FILE *o = msg();
     fprintf(o, "\nreading the ratios\n");
     fprintf(o,
-        "  ILP tracks issue width: the integer kernel holds no multiply, so\n"
-        "  INT-lat pins to 1 op/cycle and the ratio is what the core issues in\n"
-        "  parallel. Roughly 2x for a 2-wide in-order core, 3x for 3 ALUs.\n");
+        "  ILP tracks issue width: the integer kernel holds no multiply, and its\n"
+        "  two forms carry the same loop overhead per counted op, so that\n"
+        "  cancels and the ratio is what the core issues in parallel. Roughly\n"
+        "  1x for a single-issue core, 2x for a 2-wide in-order one, 3x for\n"
+        "  3 ALUs.\n");
     fprintf(o,
         "  fILP is NOT a width measure and not \"bigger is better\": a core with\n"
         "  slow FP needs more ops in flight to fill its pipes and so scores\n"
@@ -1216,9 +1590,9 @@ static void print_legend(void) {
     FILE *o = msg();
     fprintf(o, "\nwhat each column means\n");
     static const char *rows[][3] = {
-        {"MHz",      "core clock",              "observed under load; '~' = estimated from INT-lat"},
-        {"INT-lat",  "integer latency",         "one dependent chain of 1-cycle ALU ops, Mops/s"},
-        {"INT-thr",  "integer throughput",      "8 independent chains, Mops/s"},
+        {"MHz",      "core clock",              "observed under load; '~' = estimated from INT-lat, which assumes one dependent op per cycle -- see --mhz"},
+        {"INT-lat",  "integer latency",         "one dependent chain of 1-cycle ALU ops, Mop/s"},
+        {"INT-thr",  "integer throughput",      "8 independent chains, Mop/s"},
         {"ILP",      "instruction parallelism", "INT-thr / INT-lat"},
         {"MUL-thr",  "multiply throughput",     "64-bit integer multiplies, Mmul/s"},
         {"FP-lat",   "FP latency",              "one dependent multiply-add chain, Mflop/s"},
@@ -1361,7 +1735,10 @@ static double core_score(const worker_t *w) {
 typedef struct {
     int    cpu;              // pinned CPU, or -1
     double mhz;              // 0 if unknown
-    int    mhz_estimated;    // clock derived from INT-lat, not from sysfs
+    // Where `mhz` came from, because the three are worth very different
+    // amounts to a reader: read off the machine, asserted by the operator, or
+    // inferred from INT-lat under an assumption the core may not honour.
+    enum { MHZ_READ, MHZ_GIVEN, MHZ_ESTIMATED } mhz_src;
     double int_lat, int_thr, mul_thr, fp_lat, fp_thr;
     double mem_gbps, mem_lat_ns, mem_lat8_ns;
     double ilp, filp, mlp;
@@ -1412,14 +1789,33 @@ static result_t summarize(const worker_t *w, int cpu) {
     r.score = core_score(w);
 
     // INT-lat is one dependent 1-cycle op per cycle by construction, so it
-    // doubles as a clock estimate where sysfs exposes no cpufreq node.
-    r.mhz = w->mhz_observed;
-    if (r.mhz <= 0.0 && cpu >= 0) r.mhz = cpu_max_mhz(cpu);
-    if (r.mhz <= 0.0) {
-        r.mhz = r.int_lat;
-        r.mhz_estimated = 1;
+    // doubles as a clock estimate where nothing on the machine will say -- but
+    // only by construction, so every source that knows is asked first: the
+    // clock sampled under load, then cpufreq's ceiling, then whatever the
+    // device tree declares for a board that has no cpufreq driver at all.
+    if (g_mhz_given > 0.0) {
+        r.mhz = g_mhz_given;
+        r.mhz_src = MHZ_GIVEN;
+    } else {
+        r.mhz = w->mhz_observed;
+        if (r.mhz <= 0.0 && cpu >= 0) r.mhz = cpu_max_mhz(cpu);
+        if (r.mhz <= 0.0)             r.mhz = dt_cpu_mhz(cpu);
+        if (r.mhz <= 0.0) {
+            r.mhz = r.int_lat;
+            r.mhz_src = MHZ_ESTIMATED;
+        }
     }
     return r;
+}
+
+// The `mhz_src` value in JSON and TSV. "given" is deliberately not "measured":
+// a reader can then tell a clock the machine reported from one its owner did.
+static const char *mhz_src_name(int src) {
+    switch (src) {
+        case MHZ_GIVEN:     return "given";
+        case MHZ_ESTIMATED: return "estimated";
+        default:            return "measured";
+    }
 }
 
 // TSV: one header line, then one row per scope. Missing values are empty. The
@@ -1441,7 +1837,7 @@ static void tsv_result(const char *variant, const char *scope, const result_t *r
     printf("%s\t%s", variant, scope);
     if (r->cpu >= 0) printf("\t%d", r->cpu); else printf("\t");
     tsv_num(r->mhz, 1);
-    printf("\t%s", r->mhz > 0.0 ? (r->mhz_estimated ? "estimated" : "measured")
+    printf("\t%s", r->mhz > 0.0 ? mhz_src_name(r->mhz_src)
                                 : "unknown");
     tsv_num(r->int_lat, 1);
     tsv_num(r->int_thr, 1);
@@ -1482,7 +1878,7 @@ static void json_result(const result_t *r, const char *scope, const char *indent
     jout("%s{ \"scope\": \"%s\"", indent, scope);
     if (r->cpu >= 0) jout(", \"cpu\": %d", r->cpu); else jout(", \"cpu\": null");
     j_num("mhz", r->mhz, 1);
-    j_str("mhz_src", r->mhz > 0.0 ? (r->mhz_estimated ? "estimated" : "measured")
+    j_str("mhz_src", r->mhz > 0.0 ? mhz_src_name(r->mhz_src)
                                   : "unknown");
     j_num("int_lat_mops", r->int_lat, 1);
     j_num("int_thr_mops", r->int_thr, 1);
@@ -1603,7 +1999,7 @@ static void aggregate(const result_t *rows, int n, result_t *tot) {
         tot->disp_gain += r->disp_gain;
         tot->disp_span += r->disp_span;
         if (r->mhz > 0.0)         { tot->mhz += r->mhz; mhz_n++; }
-        if (r->mhz_estimated)     tot->mhz_estimated = 1;
+        if (r->mhz_src > tot->mhz_src) tot->mhz_src = r->mhz_src;
         if (r->mem_lat_ns > 0.0)  { tot->mem_lat_ns += r->mem_lat_ns; lat_n++; }
         if (r->mem_lat8_ns > 0.0) { tot->mem_lat8_ns += r->mem_lat8_ns; mlp_n++; }
         if (r->disp_status == DISP_OK && r->disp_cap > 0.0) {
@@ -1682,9 +2078,9 @@ static void text_threads(const suite_t *s, size_t mem_per_thread) {
     printf("%-9s %-23s %8s %11s %11s\n",
            "metric", "what it measures", "unit", "total", "per-thread");
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
-           "INT-lat", "integer latency", "Mops/s", t->int_lat, t->int_lat / n);
+           "INT-lat", "integer latency", "Mop/s", t->int_lat, t->int_lat / n);
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
-           "INT-thr", "integer throughput", "Mops/s", t->int_thr, t->int_thr / n);
+           "INT-thr", "integer throughput", "Mop/s", t->int_thr, t->int_thr / n);
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
            "MUL-thr", "multiply throughput", "Mmul/s", t->mul_thr, t->mul_thr / n);
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
@@ -1735,7 +2131,7 @@ static void text_per_core_header(void) {
     printf(PER_CORE_FMT, "CPU", "MHz", "INT-lat", "INT-thr", "ILP", "MUL-thr",
            "FP-lat", "FP-thr", "fILP", "MEM", "MEMlat", "MLP",
            "DISP-thr", "DISPcap", "score");
-    printf(PER_CORE_FMT, "", "", "Mops/s", "Mops/s", "x", "Mmul/s",
+    printf(PER_CORE_FMT, "", "", "Mop/s", "Mop/s", "x", "Mmul/s",
            "Mflop/s", "Mflop/s", "x", "GB/s", "ns", "x",
            "Mcall/s", "calls", "geomean");
 }
@@ -1743,7 +2139,8 @@ static void text_per_core_header(void) {
 static void text_per_core_row(const result_t *r) {
     char mhzbuf[16], capbuf[16];
     if (r->mhz <= 0.0)         snprintf(mhzbuf, sizeof(mhzbuf), "?");
-    else if (r->mhz_estimated) snprintf(mhzbuf, sizeof(mhzbuf), "~%.0f", r->mhz);
+    else if (r->mhz_src == MHZ_ESTIMATED)
+        snprintf(mhzbuf, sizeof(mhzbuf), "~%.0f", r->mhz);
     else                       snprintf(mhzbuf, sizeof(mhzbuf), "%.0f", r->mhz);
     disp_cap_str(r->disp_status, r->disp_cap, capbuf, sizeof(capbuf));
     printf("%4d %6s  %8.1f %8.1f %5.2f %8.1f  %8.1f %8.1f %5.2f  %7.2f %7.1f %5.2f  %8.1f %7s  %8.1f\n",
@@ -2191,7 +2588,7 @@ static void text_variant_table(const variant_t **sel, const result_t *rows,
     printf("%-14s %9s %9s %9s %9s %8s %9s %7s\n", "variant",
            "INT-thr", "MUL-thr", "FP-lat", "FP-thr", "MEM", "score", "vs base");
     printf("%-14s %9s %9s %9s %9s %8s %9s %7s\n", "",
-           "Mops/s", "Mmul/s", "Mflop/s", "Mflop/s", "GB/s", "geomean", "x");
+           "Mop/s", "Mmul/s", "Mflop/s", "Mflop/s", "GB/s", "geomean", "x");
     const double base = rows[0].score;
     for (int i = 0; i < n; ++i) {
         const result_t *r = &rows[i];
@@ -2289,6 +2686,9 @@ int main(int argc, char **argv) {
             if (!strcmp(m, "mono")) use_clock_raw = 0;
             else if (!strcmp(m, "raw")) use_clock_raw = 1;
             else { fprintf(stderr, "bad --clock\n"); return 2; }
+        } else if (!strcmp(a, "--mhz") && i + 1 < argc) {
+            g_mhz_given = atof(argv[++i]);
+            if (g_mhz_given < 0.0) g_mhz_given = 0.0;
         } else if (!strcmp(a, "--seed") && i + 1 < argc) {
             seed = strtoull(argv[++i], NULL, 0);
         } else if (!strcmp(a, "--format") && i + 1 < argc) {
@@ -2318,6 +2718,9 @@ int main(int argc, char **argv) {
             g_notes = argv[++i];
         } else if (!strcmp(a, "--verbose") || !strcmp(a, "-v")) {
             g_verbose = 1;
+        } else if (!strcmp(a, "--version")) {
+            print_version();
+            return 0;
         } else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
             usage(argv[0]);
             return 0;

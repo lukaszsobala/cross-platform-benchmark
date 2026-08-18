@@ -51,6 +51,7 @@ profile. Plain `make` (`rv64gc`) runs everywhere.
 
 ```sh
 ./cpcpub --help
+./cpcpub --version                        # version, build, digest, and this machine
 ./cpcpub                                  # all cores at once
 ./cpcpub --per-core                       # sweep each CPU single-threaded
 ./cpcpub --full                           # both in one report -- the form to share
@@ -58,6 +59,7 @@ profile. Plain `make` (`rv64gc`) runs everywhere.
 ./cpcpub --cpus 4-7 --threads 4           # only the big cluster
 ./cpcpub --time 2.0 --reps 5              # longer and more repetitions
 ./cpcpub --no-mem / --no-pin              # skip the memory phases / do not pin
+./cpcpub --mhz 1050                       # state the clock on a board that will not
 ./cpcpub -v                               # explain every metric afterwards
 ./cpcpub --json > run.json                # machine-readable results
 ./cpcpub --disp-sweep                     # diagnostic: dispatch curve vs period
@@ -102,8 +104,8 @@ https needs `curl` on `PATH` — there is no TLS in the binary itself. See
 
 | Metric | Unit | Meaning |
 | --- | --- | --- |
-| `INT-lat` | Mops/s | integer latency: one dependent chain of 1-cycle ALU ops |
-| `INT-thr` | Mops/s | integer throughput: 8 independent chains |
+| `INT-lat` | Mop/s | integer latency: one dependent chain of 1-cycle ALU ops |
+| `INT-thr` | Mop/s | integer throughput: 8 independent chains |
 | `ILP` | x | `INT-thr / INT-lat` — integer issue width |
 | `MUL-thr` | Mmul/s | 64-bit integer multiply throughput, measured on its own |
 | `FP-lat` | Mflop/s | FP latency: one dependent multiply-add chain |
@@ -119,8 +121,13 @@ https needs `curl` on `PATH` — there is no TLS in the binary itself. See
 
 Every compute kernel exists in two forms built from the same op sequence — one
 dependency chain and eight independent ones — because the ratio is what
-separates a wide out-of-order core from a narrow in-order one. `-v` explains
-each column after the tables. Four things are worth knowing without it:
+separates a wide out-of-order core from a narrow in-order one. Both forms do the
+same number of counted ops per loop iteration, so the loop's own counter and
+branch — issued, never counted — cost each of them the same fraction and cancel
+in the ratio. They have to: an out-of-order core hides that overhead behind the
+chain, an in-order one issues it, and unequal amounts of it would show up as
+parallelism that is really just loop bookkeeping. `-v` explains each column
+after the tables. Four things are worth knowing without it:
 
 - **`fILP` is not "bigger is better."** A core with slow FP needs more ops in
   flight to fill its pipes and so scores higher; compare `FP-thr` for capability.
@@ -180,9 +187,15 @@ approximated:
 | load-average warning | yes | yes | no such number exists |
 | `--clock raw` | yes | yes | no; falls back to `mono` and records `mono` |
 
-Where there is no governor node, `MHz` is derived from `INT-lat` (one dependent
-1-cycle op per cycle by construction), marked `~` in the tables and `estimated`
-in the JSON.
+Where there is no governor node, `MHz` comes from the device tree's declared
+`clock-frequency` for the CPU if it has one, and otherwise is derived from
+`INT-lat` (one dependent 1-cycle op per cycle by construction), marked `~` in
+the tables and `estimated` in the JSON. That derivation is only as good as its
+assumption: a core that does not retire one dependent op per cycle reads low by
+exactly the margin it misses. `--mhz N` states the clock outright for a board
+that will not — several RISC-V and small Arm SBCs have neither a cpufreq driver
+nor a clock in their device tree, and only debugfs knows — and records it as
+`given` rather than `measured`.
 
 macOS is the one that changes a number rather than omitting it: pinning is
 turned off there and `config.pin` records that, so `--per-core` on a Mac sweeps

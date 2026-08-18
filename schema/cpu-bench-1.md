@@ -100,6 +100,13 @@ always present; anything not measured is `null`, never absent and never `0`.
 `filp`, `mem_gbps`, `mem_lat_ns`, `mem_lat8_ns`, `mlp`, `disp_thr_mcall_s`,
 `disp_cap_calls`, `disp_prediction`, `disp_gain`, `disp_span`, `score`.
 
+`mhz_src` says how much the clock beside it is worth: `measured` was read off
+the machine (cpufreq, or the device tree's declared `clock-frequency`), `given`
+was asserted by whoever ran it with `--mhz`, and `estimated` was inferred from
+`int_lat_mops` — which assumes the core retires one dependent op per cycle, and
+reads low on one that does not. A machine with no cpufreq driver and no clock in
+its device tree has nothing else to offer, which is what `--mhz` is for.
+
 `score` means something different by `scope`: on a `cpu` or `thread` record it is
 a single core's composite, on the `total` it is the same geomean over the summed
 throughputs and so scales with core count. Both are the same key with the same

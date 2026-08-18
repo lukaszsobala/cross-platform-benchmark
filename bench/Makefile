@@ -130,6 +130,14 @@ ifneq ($(strip $(HUB_URL)),)
 	HUB_DEFINE := -DCPCPUB_HUB_URL='"$(HUB_URL)"'
 endif
 
+# What `cpcpub --version` reports. A tree built by hand says "dev", because it
+# is one: only a release build is stamped, by the workflow passing the tag it
+# is building. Kept out of CFLAGS for the same reason HUB_DEFINE is -- it would
+# otherwise appear in every result's build.flags, where it says nothing about
+# comparability.
+VERSION ?= dev
+VERSION_DEFINE := -DCPCPUB_VERSION='"$(VERSION)"'
+
 TARGET := cpcpub$(EXEEXT)
 OBJS   := src/bench.o src/sha256.o src/http.o \
           $(addprefix src/kernels-,$(addsuffix .o,$(VARIANTS)))
@@ -144,10 +152,11 @@ all: $(TARGET)
 # switch appears to succeed while changing nothing, and a build that is
 # supposed to have been re-targeted still runs (or crashes) as the old one.
 FLAGSTAMP := .build-flags
-# HUB_DEFINE is named here even though it is not in CFLAGS: it changes the
-# binary, so it has to change the stamp, or `make HUB_URL=...` over a built tree
-# would keep the object compiled without it.
-BUILDID   := $(CC) $(CFLAGS) $(LDFLAGS) $(PLAT_LDFLAGS) $(LIBS) $(HUB_DEFINE)
+# HUB_DEFINE and VERSION_DEFINE are named here even though neither is in
+# CFLAGS: both change the binary, so both have to change the stamp, or
+# `make HUB_URL=...` (or `make VERSION=...`) over a built tree would keep the
+# object compiled without it.
+BUILDID   := $(CC) $(CFLAGS) $(LDFLAGS) $(PLAT_LDFLAGS) $(LIBS) $(HUB_DEFINE) $(VERSION_DEFINE)
 
 $(FLAGSTAMP): FORCE
 	@[ -f $@ ] && [ "$$(cat $@)" = "$(BUILDID)" ] || printf '%s' "$(BUILDID)" > $@
@@ -239,7 +248,7 @@ $(TARGET): $(OBJS)
 src/bench.o: src/bench.c src/platform.h src/kernels.h src/sha256.h src/http.h \
              $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(HUB_DEFINE) -DBUILD_CC='"$(CC)"' \
+	$(CC) $(CFLAGS) $(HUB_DEFINE) $(VERSION_DEFINE) -DBUILD_CC='"$(CC)"' \
 	    -DBUILD_FLAGS='"$(CFLAGS)"' -c -o $@ $<
 
 # Not measured code, so it gets the shared flags and none of the variant ones:

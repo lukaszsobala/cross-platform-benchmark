@@ -54,6 +54,7 @@ other targets; see [bench/README.md](bench/README.md).
 bench/cpcpub --full                 # one core, every core, and the machine at once
 bench/cpcpub --full --variants      # ...once per build variant
 bench/cpcpub --full -v              # with every metric explained
+bench/cpcpub --version              # which build this is, and what it is running on
 bench/cpcpub --help
 ```
 
