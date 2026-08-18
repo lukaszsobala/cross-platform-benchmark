@@ -144,8 +144,15 @@ function shownMetrics() {
   return state.metrics.filter((m) => m.headline || m.key === state.sort);
 }
 
-function machineName(row) {
-  return row.cpu_models || row.machine || "unknown CPU";
+// What to call a machine whose run never said. uname's `machine` is the
+// instruction set, not a CPU: printing it bare made a row read as a box called
+// "aarch64", which is both untrue and already the target column's job. Runs
+// uploaded by older binaries, before the benchmark could read a MIDR, are
+// permanently in that state — nothing can go back and name them — so the label
+// says what it knows and admits the rest.
+function machineName(row, unknown = "unknown CPU") {
+  if (row.cpu_models) return row.cpu_models;
+  return row.machine ? `unnamed ${row.machine} CPU` : unknown;
 }
 
 // Machine and record together, for the compare chips: there a row has been
@@ -332,10 +339,16 @@ function trustBadge(row) {
     // result looks like. The digest matches a binary that release published, so
     // the row is comparable with every other row claiming it -- which is the
     // question the mark answers. Who ran it is still the submitter's own word.
+    //
+    // The tag is the newest release those exact bytes appear in, which is the
+    // hub's answer and not the run's: a binary unchanged across four releases
+    // is one binary, and labelling it with the oldest of them would split one
+    // population of comparable runs into four that look like different builds.
     const mark = el("span", "claim", `${row.release_build} build`);
     mark.title = `the digest in this result matches a binary published in ` +
                  `${row.release_build}, so it compares directly with other ` +
-                 `${row.release_build} runs — reported by the run itself`;
+                 `${row.release_build} runs — the digest is the run's own ` +
+                 `word, the release is the newest one publishing those bytes`;
     return mark;
   }
   return null;
@@ -696,7 +709,7 @@ async function showRun(id) {
   const box = $("#detail-body");
   box.replaceChildren();
 
-  const title = el("h2", null, run.cpu_models || run.machine || `run ${run.id}`);
+  const title = el("h2", null, machineName(run, `run ${run.id}`));
   const mark = trustBadge(run);
   if (mark) title.append(mark);
   box.append(title);
@@ -1525,7 +1538,7 @@ async function renderAccountRuns() {
   }
   for (const run of runs) {
     const title = el("button", "linkish",
-      run.cpu_models || run.machine || `run ${run.id}`);
+      machineName(run, `run ${run.id}`));
     title.type = "button";
     title.addEventListener("click", () => showRun(run.id));
     box.append(runCard(title, run.created_at, {

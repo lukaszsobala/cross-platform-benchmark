@@ -11,6 +11,7 @@ import hashlib
 import http.client
 import http.cookiejar
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -547,6 +548,142 @@ class VerifiedTest(unittest.TestCase):
         self.assertEqual(out["builds"][0]["release"], "v3.0.0")
         _, stats = Browser(self.base).call("/api/stats")
         self.assertEqual(stats["release"]["release"], "v3.0.0")
+
+    # -- one binary, several releases ---------------------------------------
+    #
+    # The ordinary case, not a corner one: a release rebuilds every target and
+    # only some of them come out different, so most digests are published again
+    # unchanged. What a run claims is then the newest release carrying its
+    # bytes -- the version they are current in -- and never an accident of the
+    # order an operator loaded manifests in.
+    def test_a_digest_in_two_releases_reports_the_newer_one(self):
+        self.store.add_verified_builds(manifest("v1.0.0", [DIGEST_A]))
+        self.store.add_verified_builds(manifest("v1.1.0", [DIGEST_A]))
+        _, out = self.upload(DIGEST_A)
+        run = Browser(self.base).call(f"/api/runs/{out['id']}")[1]
+        self.assertEqual(run["release_build"], "v1.1.0")
+
+    def test_the_order_manifests_are_loaded_in_does_not_matter(self):
+        self.store.add_verified_builds(manifest("v1.1.0", [DIGEST_A]))
+        self.store.add_verified_builds(manifest("v1.0.0", [DIGEST_A]))
+        _, out = self.upload(DIGEST_A)
+        run = Browser(self.base).call(f"/api/runs/{out['id']}")[1]
+        self.assertEqual(run["release_build"], "v1.1.0")
+
+    def test_newest_is_by_version_and_not_by_string(self):
+        """v0.10.0 is newer than v0.9.0, which no string comparison agrees."""
+        self.store.add_verified_builds(manifest("v0.9.0", [DIGEST_A]))
+        self.store.add_verified_builds(manifest("v0.10.0", [DIGEST_A]))
+        _, out = self.upload(DIGEST_A)
+        run = Browser(self.base).call(f"/api/runs/{out['id']}")[1]
+        self.assertEqual(run["release_build"], "v0.10.0")
+        _, stats = Browser(self.base).call("/api/stats")
+        self.assertEqual(stats["release"]["release"], "v0.10.0")
+
+    def test_forgetting_the_newest_falls_back_to_the_one_before(self):
+        """The older release still published these bytes; it did not stop."""
+        self.store.add_verified_builds(manifest("v1.0.0", [DIGEST_A]))
+        self.store.add_verified_builds(manifest("v1.1.0", [DIGEST_A]))
+        _, out = self.upload(DIGEST_A)
+        b = Browser(self.base)
+        self.store.forget_release("v1.1.0")
+        self.assertEqual(b.call(f"/api/runs/{out['id']}")[1]["release_build"],
+                         "v1.0.0")
+
+    def test_a_release_that_drops_a_binary_stops_claiming_it(self):
+        """Re-loading a manifest speaks for that release only, as it always did."""
+        self.store.add_verified_builds(manifest("v1.0.0", [DIGEST_A]))
+        self.store.add_verified_builds(manifest("v1.1.0", [DIGEST_A, DIGEST_B]))
+        self.store.add_verified_builds(manifest("v1.1.0", [DIGEST_B]))
+        _, out = self.upload(DIGEST_A)
+        run = Browser(self.base).call(f"/api/runs/{out['id']}")[1]
+        self.assertEqual(run["release_build"], "v1.0.0")
+
+
+class ReleaseRankTest(unittest.TestCase):
+    """The order the board calls "newest", tag by tag."""
+
+    def newest(self, *tags: str) -> str:
+        return max(tags, key=srv.release_rank)
+
+    def test_numbers_compare_as_numbers(self):
+        self.assertEqual(self.newest("v0.9.0", "v0.10.0"), "v0.10.0")
+        self.assertEqual(self.newest("v1.9.9", "v1.10.0"), "v1.10.0")
+        self.assertEqual(self.newest("v2.0.0", "v10.0.0"), "v10.0.0")
+
+    def test_a_leading_v_is_not_part_of_the_version(self):
+        self.assertEqual(self.newest("v0.3.0", "0.4.0"), "0.4.0")
+
+    def test_a_prerelease_ranks_below_the_release_it_leads_to(self):
+        self.assertEqual(self.newest("v1.0.0-rc1", "v1.0.0"), "v1.0.0")
+        self.assertEqual(self.newest("v1.0.0-rc1", "v1.0.0-rc2"), "v1.0.0-rc2")
+        self.assertEqual(self.newest("v1.0.0", "v1.0.1-rc1"), "v1.0.1-rc1")
+
+    def test_an_absurd_component_does_not_scramble_its_neighbours(self):
+        """A tag with no version in it must not outrank every real one."""
+        self.assertEqual(self.newest("v2.0.0", "v" + "9" * 40 + ".0.0"),
+                         "v" + "9" * 40 + ".0.0")
+        self.assertEqual(self.newest("v1.0.0", "v1.0." + "9" * 40),
+                         "v1.0." + "9" * 40)
+
+    def test_tags_that_are_not_versions_still_rank_somewhere(self):
+        """Nothing here may raise: the tag is whatever a release was called."""
+        for tag in ("", "-", "release", "2026-08-18", "v1.0.0+build.7"):
+            with self.subTest(tag):
+                self.assertIsInstance(srv.release_rank(tag), str)
+
+
+class VerifiedBuildsMigrationTest(unittest.TestCase):
+    """A database written before one binary could belong to two releases."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "old.sqlite3")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def old_shape(self) -> None:
+        """The table as the previous schema declared it: keyed on the digest."""
+        srv.Store(self.db)          # everything else, at the current schema
+        with sqlite3.connect(self.db) as db:
+            db.execute("DROP TABLE verified_builds")
+            db.execute("""
+                CREATE TABLE verified_builds (
+                    sha256      TEXT PRIMARY KEY,
+                    release     TEXT NOT NULL,
+                    release_url TEXT,
+                    filename    TEXT,
+                    target      TEXT,
+                    march       TEXT,
+                    added_at    TEXT NOT NULL)""")
+            db.execute(
+                "INSERT INTO verified_builds "
+                "(sha256, release, release_url, filename, target, march, added_at) "
+                "VALUES (?, 'v1.0.0', 'https://example/v1.0.0', 'cpcpub-x', "
+                "        'x86_64', 'x86-64', '2026-01-01T00:00:00Z')",
+                (DIGEST_A,))
+
+    def test_what_the_old_table_held_survives(self):
+        self.old_shape()
+        builds = srv.Store(self.db).verified_builds()
+        self.assertEqual([(b["sha256"], b["release"], b["filename"])
+                          for b in builds],
+                         [(DIGEST_A, "v1.0.0", "cpcpub-x")])
+
+    def test_the_migrated_table_takes_a_second_release_for_one_binary(self):
+        self.old_shape()
+        store = srv.Store(self.db)
+        store.add_verified_builds(manifest("v1.1.0", [DIGEST_A]))
+        self.assertEqual({(b["sha256"], b["release"])
+                          for b in store.verified_builds()},
+                         {(DIGEST_A, "v1.0.0"), (DIGEST_A, "v1.1.0")})
+
+    def test_migrating_twice_is_a_no_op(self):
+        self.old_shape()
+        srv.Store(self.db)
+        before = srv.Store(self.db).verified_builds()
+        self.assertEqual(before, srv.Store(self.db).verified_builds())
 
 
 class AttestedUploadTest(unittest.TestCase):

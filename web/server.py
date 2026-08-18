@@ -199,8 +199,17 @@ SUBMITTER = "(SELECT u.name FROM users u WHERE u.id = r.user_id) AS user"
 # submitter wrote into their own document, so it says which build a result
 # claims -- useful, and not a proof of anything. The proof, where there is one,
 # is in the attest_* columns, which only a signature can set.
+#
+# The newest release that published those bytes, where several did. Most
+# releases rebuild a target without changing it -- same source, same pinned
+# toolchain, same flags -- so one digest is typically published by every release
+# from the one that introduced it onwards, and naming the oldest of them would
+# label a current binary with a version it has long outlived. Ordered by
+# release_rank, because the tags themselves do not sort; see release_rank().
 RELEASE_BUILD = ("(SELECT vb.release FROM verified_builds vb "
-                 "WHERE vb.sha256 = r.binary_sha256) AS release_build")
+                 "WHERE vb.sha256 = r.binary_sha256 "
+                 "ORDER BY vb.release_rank DESC, vb.added_at DESC "
+                 "LIMIT 1) AS release_build")
 
 RUN_COLUMNS = [
     "id", "created_at", "label", "notes", "mode", "binary_sha256",
@@ -544,6 +553,50 @@ def _url(v, field):
     return s
 
 
+def release_rank(tag: str) -> str:
+    """A sortable key for a release tag, so newest means newest.
+
+    Tags are text, and text does not sort the way versions do: every string
+    comparison there is puts "v0.10.0" before "v0.9.0", and it only takes one
+    two-digit component for a board to start labelling binaries with a release
+    they were superseded in. So each run of digits is padded to a fixed width
+    and compared as a number, and what is left between them is compared as
+    written.
+
+    Two smaller rules, both of them what a reader of the tag would expect:
+
+      * a leading "v" is dropped, so a repository that tagged "0.4.0" after
+        "v0.3.0" is not read as having gone backwards;
+      * a pre-release suffix ranks *below* the release it leads to -- v1.0.0-rc1
+        precedes v1.0.0 -- which the padding alone would get backwards, a longer
+        string being the greater one.
+
+    The key is stored rather than computed per query: SQLite has no version
+    collation to ORDER BY, and a Python-side sort would mean reading every row
+    of the table to answer one row of the board.
+    """
+    core, _, pre = tag.strip().lower().partition("-")
+    if core.startswith("v"):
+        core = core[1:]
+
+    def pad(s: str) -> str:
+        out = []
+        for part in re.findall(r"\d+|\D+", s):
+            if part.isdigit():
+                n = int(part)
+                # A component too large to be a version number is not one; it
+                # is clamped rather than allowed to widen the field and so
+                # scramble the ordering of every tag around it.
+                out.append("%012d" % n if n < 10 ** 12 else "9" * 12)
+            else:
+                out.append(part)
+        return "".join(out)
+
+    # "!" sorts below "~", which is the whole trick: v1.0.0 gets the "~" and so
+    # outranks every v1.0.0-<anything>.
+    return pad(core) + ("!" + pad(pre) if pre else "~")
+
+
 def parse_builds_manifest(doc: object) -> tuple[str, str | None, list[dict]]:
     """Validate a release build manifest into (release tag, url, builds).
 
@@ -640,6 +693,57 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS runs_user ON runs(user_id, id)")
             db.execute("CREATE INDEX IF NOT EXISTS runs_binary "
                        "ON runs(binary_sha256)")
+            self._migrate_verified_builds(db)
+
+    @staticmethod
+    def _migrate_verified_builds(db: sqlite3.Connection) -> None:
+        """Re-key a verified_builds table written before releases could share.
+
+        The old table was keyed on the digest alone, which cannot hold the same
+        binary appearing in two releases: the second manifest to be loaded
+        overwrote the first, so which release a run was labelled with came down
+        to the order an operator happened to run web/verified.py in. The primary
+        key is now (sha256, release), which SQLite cannot express as an ALTER --
+        hence the copy.
+
+        Nothing is lost and nothing is invented: whatever pairs the old table
+        held are carried over as they stand. The releases it dropped along the
+        way come back the next time their manifests are loaded, which is a
+        re-run of web/verified.py and not a repair job.
+        """
+        cols = list(db.execute("PRAGMA table_info(verified_builds)"))
+        if not cols:                        # a fresh database; schema.sql made it
+            return
+        key = {c["name"] for c in cols if c["pk"]}
+        if key == {"sha256", "release"} and any(c["name"] == "release_rank"
+                                                for c in cols):
+            return
+
+        db.execute("""
+            CREATE TABLE verified_builds_new (
+                sha256      TEXT    NOT NULL,
+                release     TEXT    NOT NULL,
+                release_rank TEXT   NOT NULL,
+                release_url TEXT,
+                filename    TEXT,
+                target      TEXT,
+                march       TEXT,
+                added_at    TEXT    NOT NULL,
+                PRIMARY KEY (sha256, release)
+            )""")
+        rows = [(r["sha256"], r["release"], release_rank(r["release"]),
+                 r["release_url"], r["filename"], r["target"], r["march"],
+                 r["added_at"])
+                for r in db.execute("SELECT * FROM verified_builds")]
+        db.executemany(
+            "INSERT OR REPLACE INTO verified_builds_new "
+            "(sha256, release, release_rank, release_url, filename, target, "
+            " march, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        db.execute("DROP TABLE verified_builds")
+        db.execute("ALTER TABLE verified_builds_new RENAME TO verified_builds")
+        # The old table's indexes went with it.
+        db.execute("CREATE INDEX IF NOT EXISTS verified_builds_sha "
+                   "ON verified_builds(sha256)")
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10.0)
@@ -879,12 +983,13 @@ class Store:
             targets = db.execute(
                 "SELECT target, COUNT(*) AS n FROM runs WHERE target IS NOT NULL "
                 "GROUP BY target ORDER BY n DESC").fetchall()
-            # The most recently loaded release, for the page to point at when it
-            # explains what a verified run is. Newest by when it was loaded, not
-            # by tag: tags do not sort.
+            # The newest release this hub knows of, for the page to point at
+            # when it explains what a release build is. By version and not by
+            # when the manifest happened to be loaded: an operator catching up
+            # on old releases must not leave the page recommending one of them.
             latest = db.execute(
-                "SELECT release, release_url, MAX(added_at) AS added_at "
-                "FROM verified_builds").fetchone()
+                "SELECT release, release_url FROM verified_builds "
+                "ORDER BY release_rank DESC, added_at DESC LIMIT 1").fetchone()
         release = None
         if latest and latest["release"]:
             release = {"release": latest["release"], "url": latest["release_url"]}
@@ -910,20 +1015,29 @@ class Store:
         """
         release, url, builds = parse_builds_manifest(manifest)
         now = iso_now()
-        rows = [(b["sha256"], release, url, b["filename"],
+        rank = release_rank(release)
+        rows = [(b["sha256"], release, rank, url, b["filename"],
                  b["target"], b["march"], now) for b in builds]
         with self.connect() as db:
             db.execute("DELETE FROM verified_builds WHERE release = ?", (release,))
             db.executemany(
                 "INSERT OR REPLACE INTO verified_builds "
-                "(sha256, release, release_url, filename, target, march, added_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+                "(sha256, release, release_rank, release_url, filename, target, "
+                " march, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
         return len(rows), release
 
     def verified_builds(self) -> list[dict]:
+        """Every (binary, release) pair this hub holds, newest release first.
+
+        A digest published unchanged by several releases appears once per
+        release: that is the table's shape, and flattening it here would hide
+        exactly the fact a reader of this list is checking -- which versions a
+        given binary is current in.
+        """
         with self.connect() as db:
             return [dict(r) for r in db.execute(
-                "SELECT * FROM verified_builds ORDER BY added_at DESC, filename")]
+                "SELECT * FROM verified_builds "
+                "ORDER BY release_rank DESC, added_at DESC, filename")]
 
     def forget_release(self, release: str) -> int:
         with self.connect() as db:

@@ -86,8 +86,16 @@ def main(argv=None) -> int:
         for b in builds:
             print(f"{b['sha256']}  {(b['filename'] or ''):<{width}}  "
                   f"{b['release']}  {b['march'] or ''}")
-        print(f"\n{len(builds)} build(s) from "
-              f"{len({b['release'] for b in builds})} release(s)", file=sys.stderr)
+        # Lines, binaries and releases counted separately, because they are
+        # three different numbers: a release that rebuilt a target without
+        # changing it publishes the same digest again, and that digest is one
+        # binary listed on as many lines as there are releases carrying it. A
+        # run is labelled with the newest of them.
+        print(f"\n{len(builds)} line(s): "
+              f"{len({b['sha256'] for b in builds})} distinct binar"
+              f"{'y' if len({b['sha256'] for b in builds}) == 1 else 'ies'} "
+              f"across {len({b['release'] for b in builds})} release(s)",
+              file=sys.stderr)
         return 0
 
     if args.forget:

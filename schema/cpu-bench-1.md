@@ -42,6 +42,14 @@ macOS and `ARM64` on Windows — `build.target` is the normalised one to key on.
 `config.clock` records the clock that was *used*: asking for `raw` on a host
 with no unadjusted monotonic clock (Windows) yields `mono` here.
 
+`system.cpu_models` is the CPU by name — a brand string where the host has one,
+the MIDR implementer/part pair rendered as core names on Arm (`Cortex-A55 +
+Cortex-A76`, one entry per distinct core, so a big.LITTLE part names both), and
+the board in parentheses where the device tree says (`… (Radxa ROCK 5B)`). It is
+**absent, never `null`**, on a host that would only name its instruction set: a
+value that repeats `build.target` is not a CPU model, and a reader is better off
+seeing the field missing than seeing `aarch64` in a column of CPU names.
+
 A `--disp-sweep` dump carries the same `schema` and `mode: "disp-sweep"`. The
 hub **rejects** it: it is a diagnostic curve with no summary metrics to rank.
 

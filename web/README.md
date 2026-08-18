@@ -94,6 +94,13 @@ them — because those are a wire contract; only the display changed. The board
 explains a mark only when some row carries it, so a hub nobody has attested to
 does not advertise two badges over a page of results that cannot have them.
 
+The `vx.x.x` in that third row is the **newest** release publishing those exact
+bytes, not the one that first did. Most releases rebuild every target and only
+some of them come out different, so an unchanged binary is published again by
+each release after it — and a board that named the earliest would split one
+population of identical builds into several that read as different ones. Load
+the manifests in any order you like; the answer does not depend on it.
+
 `build.binary_sha256` sits inside a document the submitter wrote, so matching it
 against a release is a claim, not evidence. Nor can the benchmark sign its own
 output: a key inside a public binary is a key anyone can read out of it. What is

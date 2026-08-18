@@ -139,15 +139,35 @@ CREATE TABLE IF NOT EXISTS cores (
 -- It is not proof and does not pretend to be: the digest is self-reported like
 -- every other field in an upload. What it establishes is sameness of code, not
 -- honesty of submitter.
+--
+-- One row per (binary, release) pair, not one per binary. A release only
+-- changes the bytes of the targets whose build actually changed, so the same
+-- digest is usually published again, unchanged, by every release after the one
+-- that introduced it -- and a table keyed on the digest alone can then hold
+-- only one of those answers, whichever manifest was loaded last. Keeping every
+-- pair is what lets a read pick the *newest* release a binary appears in, which
+-- is the one a reader wants: it is the version those bytes are current in, not
+-- the archaeology of when they were first compiled.
 CREATE TABLE IF NOT EXISTS verified_builds (
-    sha256      TEXT PRIMARY KEY,
-    release     TEXT NOT NULL,     -- the tag it was published under
+    sha256      TEXT    NOT NULL,
+    release     TEXT    NOT NULL,  -- the tag it was published under
+    -- Sortable form of `release`, written by server.release_rank(). Tags are
+    -- text and text does not sort: "v0.10.0" precedes "v0.9.0" in every string
+    -- comparison there is, and picking a newest release by ORDER BY needs a key
+    -- where it does not.
+    release_rank TEXT   NOT NULL,
     release_url TEXT,
     filename    TEXT,              -- the asset name, e.g. cpcpub-riscv64-rva23
     target      TEXT,              -- x86_64 | aarch64 | riscv64 | loongarch64 | ppc64le | s390x
     march       TEXT,              -- the ISA baseline it was built for
-    added_at    TEXT    NOT NULL
+    added_at    TEXT    NOT NULL,
+    PRIMARY KEY (sha256, release)
 );
+
+-- The lookup every board row makes: digest in hand, which releases published
+-- it. The primary key's own index leads with sha256 and would serve, but it is
+-- named here so a rebuilt table cannot lose it silently.
+CREATE INDEX IF NOT EXISTS verified_builds_sha ON verified_builds(sha256);
 
 CREATE INDEX IF NOT EXISTS cores_run   ON cores(run_id);
 CREATE INDEX IF NOT EXISTS cores_scope ON cores(scope, score);

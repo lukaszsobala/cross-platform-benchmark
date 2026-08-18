@@ -10,6 +10,7 @@
 // translation-unit flags. See kernels.h for that interface.
 
 #define _GNU_SOURCE 1
+#include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
@@ -1071,7 +1072,98 @@ static void midr_name(unsigned impl, unsigned part, char *out, size_t outsz) {
     }
     snprintf(out, outsz, "impl 0x%02x part 0x%03x", impl, part);
 }
+
+// The same implementer/part pairs, read from sysfs instead of /proc/cpuinfo.
+//
+// /proc/cpuinfo is the easier of the two to lose: a container runtime that
+// masks or synthesises it (lxcfs rewrites the file, some sandboxes replace it
+// with a stub), a kernel built without CONFIG_PROC_FS, or a hardened box that
+// strips the MIDR lines all leave a machine that can only call itself by the
+// name of its instruction set. The per-CPU register file survives all of that,
+// and it is the same value in a cleaner form -- one 64-bit MIDR_EL1 in hex, per
+// CPU, which is where lscpu reads its "Model name" from too.
+//
+// Every *present* CPU is read, not just the online ones: on a big.LITTLE part
+// with a cluster offline, the offline cluster is still half of what this
+// machine is, and the file is readable either way.
+static void midr_from_sysfs(char *out, size_t outsz) {
+    out[0] = '\0';
+
+    // "0-7", the kernel's own list of the CPUs that exist. Falling back to a
+    // dense 0..n-1 when it cannot be read costs nothing: those ids are the
+    // ones a machine without the file would have had anyway.
+    int cpus[1024];
+    int n = 0;
+    FILE *f = fopen("/sys/devices/system/cpu/present", "r");
+    if (f) {
+        char spec[256];
+        if (fgets(spec, (int)sizeof(spec), f)) {
+            spec[strcspn(spec, "\r\n")] = '\0';
+            n = parse_cpu_list(spec, cpus, ARRAY_LEN(cpus));
+        }
+        fclose(f);
+    }
+    if (n <= 0) {
+        n = get_cpu_count();
+        if (n > ARRAY_LEN(cpus)) n = ARRAY_LEN(cpus);
+        for (int i = 0; i < n; ++i) cpus[i] = i;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/regs/identification/midr_el1",
+                 cpus[i]);
+        FILE *r = fopen(path, "r");
+        if (!r) continue;
+        char raw[32];
+        char *got = fgets(raw, (int)sizeof(raw), r);
+        fclose(r);
+        if (!got) continue;
+        errno = 0;
+        char *end = NULL;
+        const unsigned long long v = strtoull(raw, &end, 16);
+        if (end == raw || errno != 0) continue;
+        // MIDR_EL1: implementer in bits 31:24, part number in bits 15:4.
+        char name[96];
+        midr_name((unsigned)((v >> 24) & 0xff), (unsigned)((v >> 4) & 0xfff),
+                  name, sizeof(name));
+        models_add(out, outsz, name);
+    }
+}
 #endif  // CPCPUB_PROC_CPUINFO && __aarch64__
+
+#ifdef CPCPUB_PROC_CPUINFO
+// Whether a "model name" says nothing the target field did not already say.
+//
+// Not every kernel that fills in a model-name key fills it in with a name. The
+// Arm ones that write anything write the architecture back at the reader --
+// "AArch64 Processor rev 4 (aarch64)" is the classic, and a bare "aarch64" or
+// "arm64" turns up in synthesised /proc/cpuinfo files under emulators and
+// container runtimes. Taking those at face value is worse than finding nothing:
+// they suppress the MIDR fallback below, which does know what the part is, and
+// leave the CPU column of a results board repeating build.target.
+static int name_is_generic(const char *s) {
+    char low[128];
+    size_t w = 0;
+    for (const char *p = s; *p && w + 1 < sizeof(low); ++p) {
+        low[w++] = (char)tolower((unsigned char)*p);
+    }
+    low[w] = '\0';
+
+    static const char *const nothings[] = {
+        "aarch64", "arm64", "armv8", "armv8l", "armv7l", "arm",
+        "unknown", "cpu", "processor", "generic",
+    };
+    for (int i = 0; i < ARRAY_LEN(nothings); ++i) {
+        if (strcmp(low, nothings[i]) == 0) return 1;
+    }
+    // "<arch> Processor rev N (<arch>)": the rev is in CPU revision already,
+    // and what is left is the architecture twice.
+    if (strstr(low, "processor rev")) return 1;
+    return strcmp(low, arch_string()) == 0;
+}
+#endif  // CPCPUB_PROC_CPUINFO
 
 #ifdef CPCPUB_PROC_CPUINFO
 // The board's own name for itself, from the flattened device tree: a property
@@ -1150,6 +1242,12 @@ static void detect_cpu_models(char *out, size_t outsz) {
     // in parentheses, and stands alone where neither of the others answered.
     char models[320], platform[128];
     models[0] = platform[0] = '\0';
+#if defined(CPCPUB_PROC_CPUINFO) && defined(__aarch64__)
+    // Outside the block below, because sysfs answers this even on a machine
+    // whose /proc/cpuinfo could not be opened at all.
+    char midrs[320];
+    midrs[0] = '\0';
+#endif
 
     FILE *f = fopen("/proc/cpuinfo", "r");
     if (f) {
@@ -1160,8 +1258,6 @@ static void detect_cpu_models(char *out, size_t outsz) {
             "model name", "Model Name", "cpu model", "cpu", "uarch",
         };
 #if defined(CPCPUB_PROC_CPUINFO) && defined(__aarch64__)
-        char midrs[320];
-        midrs[0] = '\0';
         unsigned impl = 0;
         int have_impl = 0;
 #endif
@@ -1191,7 +1287,12 @@ static void detect_cpu_models(char *out, size_t outsz) {
 
             for (int k = 0; k < ARRAY_LEN(keys); ++k) {
                 if (strcmp(key, keys[k]) == 0) {
-                    models_add(models, sizeof(models), val);
+                    // A value that only restates the architecture is dropped
+                    // here rather than kept as a name, so the MIDR pair below
+                    // still gets its turn.
+                    if (!name_is_generic(val)) {
+                        models_add(models, sizeof(models), val);
+                    }
                     break;
                 }
             }
@@ -1215,10 +1316,16 @@ static void detect_cpu_models(char *out, size_t outsz) {
 #endif
         }
         fclose(f);
-#if defined(CPCPUB_PROC_CPUINFO) && defined(__aarch64__)
-        if (!models[0]) snprintf(models, sizeof(models), "%s", midrs);
-#endif
     }
+
+#if defined(CPCPUB_PROC_CPUINFO) && defined(__aarch64__)
+    // Where /proc/cpuinfo carried no MIDR pair -- masked, synthesised, or not
+    // there at all -- the register file still has it. Only consulted as a
+    // fallback: the two report the same numbers, and /proc/cpuinfo is one file
+    // rather than one per CPU.
+    if (!midrs[0]) midr_from_sysfs(midrs, sizeof(midrs));
+    if (!models[0]) snprintf(models, sizeof(models), "%s", midrs);
+#endif
 
     // The device tree names the board ("Radxa ROCK 5B"); "Hardware" tends to
     // name the SoC behind it. The first is the more specific of the two, so it
