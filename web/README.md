@@ -132,7 +132,7 @@ python3 verified.py --db runs.sqlite3 --forget v0.1.0
 | `GET` | `/api/runs?limit=&offset=&user=` | recent runs, optionally one submitter's |
 | `GET` | `/api/runs/<id>`, `/raw`, `/rank` | one run; the document as uploaded; its percentile per metric |
 | `DELETE` | `/api/runs/<id>` | withdraw; needs `X-Delete-Token` or a signed-in owner |
-| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&user=&verified=&sort=&order=&limit=` | leaderboard rows: one per upload, each its best record at `sort` |
+| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&user=&verified=&sort=&order=&limit=&offset=` | leaderboard rows: one per upload, each its best record at `sort` |
 | `GET` | `/api/cores?run=<id>` / `?ids=1,2,3` | every record of one run / named records |
 | `GET` | `/api/metrics`, `/api/stats`, `/api/builds` | metric definitions; counts; recognised release digests |
 | `GET` | `/api/users/<name>` | public profile: name, since, run count |
@@ -141,6 +141,14 @@ python3 verified.py --db runs.sqlite3 --forget v0.1.0
 | `POST` | `/api/auth/register` | `{name, password, challenge, nonce}`, plus `invite` where required |
 | `POST` | `/api/auth/login` `/logout` `/token` `/password` `/close` | sign in; sign out; reissue the upload token; change password; delete the account |
 | `GET` | `/api/auth/me` | the signed-in account, or `{"user": null}` |
+
+Both listings are paged: `limit` (default 50, clamped to 500 — the sizes the
+page's own **Show** pickers offer) and `offset`, and both answer with
+`{limit, offset, total}` beside the rows. `total` counts the filtered listing,
+one row per upload where the board groups them, so it is exactly how many rows
+stepping `offset` will walk through. An offset past the end is an empty page,
+not an error. The page size decides how much is on screen and never how much
+can be read: every result is reachable by paging.
 
 Two ways to authenticate: `Authorization: Bearer <upload token>` for a machine,
 or the `cpb_session` cookie for a browser. A cookie-authenticated write must

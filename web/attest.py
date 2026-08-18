@@ -272,9 +272,9 @@ def check(token: str, body: bytes, store: KeyStore,
     if now > float(exp) + CLOCK_SKEW:                   # type: ignore[arg-type]
         raise AttestationError("attestation has expired; measure and upload "
                                "in one go rather than keeping tokens")
-    if isinstance(nbf, (int, float)) and not isinstance(nbf, bool):
-        if now + CLOCK_SKEW < float(nbf):
-            raise AttestationError("attestation is not valid yet")
+    if (isinstance(nbf, (int, float)) and not isinstance(nbf, bool)
+            and now + CLOCK_SKEW < float(nbf)):
+        raise AttestationError("attestation is not valid yet")
     if now + CLOCK_SKEW < float(iat):                   # type: ignore[arg-type]
         raise AttestationError("attestation is dated in the future")
     if now - float(iat) > MAX_TOKEN_AGE:                # type: ignore[arg-type]

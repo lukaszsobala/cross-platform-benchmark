@@ -6,6 +6,15 @@
 
 const state = {
   metrics: [],          // from /api/metrics
+  limit: 100,           // rows the board asks for, from its Show picker
+  offset: 0,            // how far down the board this page starts
+  total: 0,             // rows the board has in all, past this page
+  mineLimit: 50,        // the same, for either list under My uploads
+  mineOffset: 0,        // where the account half of My uploads starts
+  mineTotal: 0,
+  localOffset: 0,       // and where this browser's own list starts
+  accountRuns: null,    // this account's uploads, once fetched; null = not yet
+  accountError: "",     // why that listing is missing, if it is
   rows: [],             // current leaderboard page: one row per upload
   children: new Map(),  // run id -> that upload's records, once expanded
   expanded: new Set(),  // run ids currently showing their records
@@ -23,6 +32,12 @@ const state = {
   release: null,        // the newest release this hub verifies against, if any
   signed: null,         // {ci, attested}: how many runs carry an outside signature
 };
+
+// How many results a list may show at once. The server clamps every listing to
+// MAX_PAGE as well, so asking for more by hand gets the same answer as asking
+// for the cap; the picker offers the sizes worth choosing between.
+const MAX_PAGE = 500;
+const PAGE_SIZES = [25, 50, 100, 250, MAX_PAGE];
 
 // The page reads this one to prove a write came from the page rather than from
 // another site that merely knows the session cookie exists. The session cookie
@@ -55,6 +70,87 @@ const el = (tag, cls, text) => {
   if (text !== undefined && text !== null) n.textContent = String(text);
   return n;
 };
+
+// A page size that came from a picker, a stored preference or a stale saved
+// value, made into one this page will actually ask for.
+function pageSize(v, fallback) {
+  const n = Number.parseInt(v, 10);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(n, MAX_PAGE);
+}
+
+// A page size chosen once is the one you meant on the next visit too. Kept in
+// local storage, where a browser that refuses it costs the preference and
+// nothing else.
+function storedPage(key, fallback) {
+  try {
+    const n = pageSize(localStorage.getItem(key), fallback);
+    // A size the picker does not offer -- an older build's, or a hand-edited
+    // one -- would leave the picker showing nothing at all, so it is not kept.
+    return PAGE_SIZES.includes(n) ? n : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function rememberPage(key, n) {
+  try {
+    localStorage.setItem(key, String(n));
+  } catch {
+    /* a browser with storage denied still gets the size it picked, once */
+  }
+}
+
+// A page size is a window on a listing, not a cap on it: every list here can
+// be walked from end to end, so the size only decides how much of it is on
+// screen at a time. One pager draws that for all three.
+//
+// `go(offset)` is handed the first row of the page asked for; whoever owns the
+// list refetches or redraws from it.
+// Where the last page of a listing starts. Zero for a listing that has no
+// rows at all, which is also where a page that has outlived its rows belongs.
+function lastPage(total, limit) {
+  return total > 0 ? Math.floor((total - 1) / limit) * limit : 0;
+}
+
+function pager(where, { offset, limit, total }, go) {
+  if (total <= limit && offset === 0) return;      // one page holds the lot
+  const bar = el("nav", "pager");
+  bar.setAttribute("aria-label", "pages");
+  const last = lastPage(total, limit);
+
+  const step = (label, to, disabled, title) => {
+    const b = el("button", "page", label);
+    b.type = "button";
+    b.disabled = disabled;
+    if (title) b.title = title;
+    b.addEventListener("click", () => go(to));
+    return b;
+  };
+  bar.append(step("« first", 0, offset <= 0, "the first page"),
+             step("‹ prev", Math.max(0, offset - limit), offset <= 0, null));
+  // Where you are, in rows rather than in page numbers: the rows are what the
+  // reader is looking at, and the count is the answer to "is there more".
+  const from = total ? offset + 1 : 0;
+  const to = Math.min(offset + limit, total);
+  bar.append(el("span", "pagecount",
+    `${from.toLocaleString()}–${to.toLocaleString()} of ${total.toLocaleString()}`));
+  bar.append(step("next ›", offset + limit, offset + limit >= total, null),
+             step("last »", last, offset >= last, "the last page"));
+  where.append(bar);
+}
+
+// Both pickers are filled from PAGE_SIZES rather than written out in the
+// markup, so the cap is stated once and cannot drift from the server's.
+function fillPageSizes(select, current) {
+  select.replaceChildren();
+  for (const n of PAGE_SIZES) {
+    const opt = el("option", null, String(n));
+    opt.value = String(n);
+    select.append(opt);
+  }
+  select.value = String(current);
+}
 
 function cookie(name) {
   for (const part of document.cookie.split(";")) {
@@ -199,7 +295,8 @@ function filterParams() {
   // Sorting is not a filter either -- it lives on the column headers.
   p.set("sort", state.sort);
   p.set("order", state.order);
-  p.set("limit", "100");
+  p.set("limit", String(state.limit));
+  p.set("offset", String(state.offset));
   return p;
 }
 
@@ -216,10 +313,25 @@ function sortBy(key) {
   loadBoard().catch((e) => alert(e.message));
 }
 
-async function loadBoard() {
+// Bumped per load, so a reply that was overtaken -- two filters changed in
+// quick succession, a withdrawal refreshing the board while a search is still
+// in flight -- is dropped rather than drawn over the newer one.
+let boardGen = 0;
+
+// `keepPage` is for the reloads that are not a new question: a withdrawal
+// refreshing the board, or paging itself. Everything else -- a filter, a
+// search, a different sort, a different page size -- asks something new, and
+// the answer to something new starts at its first page.
+async function loadBoard({ keepPage = false } = {}) {
+  const gen = ++boardGen;
   const form = $("#filters");
   state.norm = form.elements.norm.value;
   state.detailed = form.elements.detailed.checked;
+  const size = pageSize(form.elements.limit.value, state.limit);
+  if (size !== state.limit) state.offset = 0;   // a resized page starts again
+  state.limit = size;
+  rememberPage("cpcpub-page-board", state.limit);
+  if (!keepPage) state.offset = 0;
   // Remember what was actually applied: expanding a row has to ask for the
   // same filters and the same order, not whatever the form says by then.
   state.params = filterParams();
@@ -231,10 +343,31 @@ async function loadBoard() {
   // record and half another. Uses the params just applied, so the record it
   // picks per run is the one the board is about to show.
   await retargetSelection(state.params.get("scope"));
-  const { cores } = await api("/api/cores?" + state.params.toString());
-  state.rows = cores;
+  const page = await api("/api/cores?" + state.params.toString());
+  if (gen !== boardGen) return;        // a newer load is already on its way
+  state.rows = page.cores;
+  state.total = page.total ?? page.cores.length;
+  // Withdrawing the last rows of the last page, or a filter narrowing under
+  // you, can leave the board standing past the end of its own listing. Step
+  // back to where the rows now stop rather than showing an empty board with a
+  // pager saying there is more above it. Only ever backwards, so a count and a
+  // page that disagree cost one retry and not an endless run of them.
+  const back = lastPage(state.total, state.limit);
+  if (!state.rows.length && back < state.offset) {
+    state.offset = back;
+    return loadBoard({ keepPage: true });
+  }
   renderBoard();
   renderSelection();
+}
+
+// Paging is a reload of the same question at a different depth, so it keeps
+// the filters, the sort and the ticks, and only moves the window.
+function goToPage(offset) {
+  state.offset = Math.max(0, offset);
+  loadBoard({ keepPage: true })
+    .then(() => $("#board-table").scrollIntoView({ block: "start" }))
+    .catch((e) => alert(e.message));
 }
 
 // The records of one upload, in the board's own order. Fetched on demand: a
@@ -246,6 +379,8 @@ async function toggleExpand(row) {
     p.set("run", row.run_id);
     p.set("group", "none");
     p.set("limit", "1024");
+    p.delete("offset");        // the board's page is not this run's records
+
     const { cores } = await api("/api/cores?" + p.toString());
     state.children.set(row.run_id, cores);
   }
@@ -456,6 +591,10 @@ function renderBoard() {
   thead.replaceChildren();
   tbody.replaceChildren();
   $("#board-empty").hidden = state.rows.length > 0;
+  const box = $("#board-pager");
+  box.replaceChildren();
+  pager(box, { offset: state.offset, limit: state.limit, total: state.total },
+        goToPage);
 
   const hr = el("tr");
   hr.append(el("th", "num", "#"), el("th", "", ""), el("th", "wide", "machine"),
@@ -467,7 +606,9 @@ function renderBoard() {
   state.rows.forEach((row, i) => {
     const open = state.expanded.has(row.run_id);
     const tr = el("tr", "run-row");
-    tr.append(el("td", "num", i + 1), selectBox(row));
+    // Its place in the whole ranking: on page three of a hundred-row board the
+    // top row is 201st, and numbering it 1 would say the opposite.
+    tr.append(el("td", "num", state.offset + i + 1), selectBox(row));
 
     const name = el("td", "wide");
     const head = el("div", "run-head");
@@ -1498,24 +1639,153 @@ async function afterDelete() {
   state.selected.clear();
   state.scopeNote = "";
   renderSelection();
-  renderMine();
+  // loadUser() redraws My uploads itself, so signed in this is one redraw and
+  // not two -- two of them racing is what used to list every upload twice.
   if (state.user) await loadUser();
-  loadBoard().catch(() => {});
+  else renderMine();
+  // The board is being refreshed, not re-asked: whoever was reading page four
+  // of it stays on page four (or on the last one, if that page has just gone).
+  loadBoard({ keepPage: true }).catch(() => {});
 }
 
-function runCard(title, at, { token, onDelete }) {
+// Which rows are ticked in each half, by run id. Held outside the lists so a
+// redraw -- a refetch finishing, another withdrawal landing -- keeps the ticks
+// that were made before it.
+const minePicked = { account: new Set(), local: new Set() };
+
+function runCard(entry, picked, onPick) {
   const card = el("div", "mine-card");
-  card.append(title);
-  card.append(el("span", "muted", at || ""));
-  if (token) card.append(el("code", "token", token));
-  const del = el("button", "danger", "Withdraw");
-  del.type = "button";
-  del.addEventListener("click", onDelete);
-  card.append(del);
+  const cb = el("input");
+  cb.type = "checkbox";
+  cb.className = "pick";
+  cb.checked = picked.has(entry.id);
+  cb.setAttribute("aria-label", `select run ${entry.id}`);
+  cb.addEventListener("change", () => onPick(cb.checked));
+  card.append(cb, entry.title, el("span", "muted", entry.at || ""));
+  if (entry.token) card.append(el("code", "token", entry.token));
   return card;
 }
 
-async function renderAccountRuns() {
+// Withdrawing whatever is ticked. One confirmation for the lot and then one
+// request each -- there is no batch endpoint, and a run that will not go
+// (someone else withdrew it, a token no longer matches) has to be named rather
+// than folded into one word about all of them.
+async function withdrawPicked(entries, picked, remove, redraw) {
+  const chosen = entries.filter((e) => picked.has(e.id));
+  // Both ways out redraw: the button was disabled on the way in, and a list
+  // left with a dead button after a cancelled confirmation is worse than the
+  // wasted redraw.
+  if (!chosen.length) return redraw();
+  if (!confirm(chosen.length === 1
+      ? `Withdraw run ${chosen[0].id} from the leaderboard?`
+      : `Withdraw these ${chosen.length} runs from the leaderboard?`)) {
+    return redraw();
+  }
+  const failed = [];
+  for (const e of chosen) {
+    try {
+      await remove(e);
+      picked.delete(e.id);
+      forgetRun(e.id);
+    } catch (err) {
+      failed.push(`run ${e.id}: ${err.message}`);
+    }
+  }
+  if (failed.length) {
+    alert(`${chosen.length - failed.length} of ${chosen.length} withdrawn. ` +
+          `Could not withdraw:\n${failed.join("\n")}`);
+  }
+  redraw();
+  await afterDelete();
+}
+
+// One half of My uploads: a bar that acts on whatever is ticked, then a card
+// per upload. Both halves are the same list with a different way of proving
+// the run is yours, so one function draws them both.
+function renderRunList(box, entries, picked, remove, redraw) {
+  const ids = new Set(entries.map((e) => e.id));
+  // Ticks for rows that are no longer here -- withdrawn in another tab, or off
+  // the end of a smaller page -- would otherwise be counted forever.
+  for (const id of [...picked]) if (!ids.has(id)) picked.delete(id);
+
+  const bar = el("div", "batch");
+  const all = el("label", "check");
+  const allBox = el("input");
+  allBox.type = "checkbox";
+  allBox.checked = entries.length > 0 && picked.size === entries.length;
+  allBox.indeterminate = picked.size > 0 && picked.size < entries.length;
+  allBox.addEventListener("change", () => {
+    picked.clear();
+    if (allBox.checked) for (const e of entries) picked.add(e.id);
+    redraw();
+  });
+  all.append(allBox, el("span", null, "Select all"));
+
+  const go = el("button", "danger", picked.size > 1
+    ? `Withdraw ${picked.size} results` : "Withdraw selected");
+  go.type = "button";
+  go.disabled = !picked.size;
+  go.addEventListener("click", () => {
+    go.disabled = true;                 // no second click while the first runs
+    withdrawPicked(entries, picked, remove, redraw).catch((e) => alert(e.message));
+  });
+  bar.append(all, go);
+  box.append(bar);
+
+  for (const e of entries) {
+    box.append(runCard(e, picked, (on) => {
+      if (on) picked.add(e.id);
+      else picked.delete(e.id);
+      redraw();
+    }));
+  }
+}
+
+function runTitle(id, name) {
+  const title = el("button", "linkish", name || `run ${id}`);
+  title.type = "button";
+  title.addEventListener("click", () => showRun(id));
+  return title;
+}
+
+// The account half is fetched, so its drawing is kept apart from its loading:
+// ticking a box or withdrawing redraws from the last listing, and only a real
+// change asks the server for a new one.
+let accountGen = 0;
+
+async function loadAccountRuns() {
+  const gen = ++accountGen;             // a reply from an older load is stale
+  if (!state.user) {
+    state.accountRuns = null;
+    state.accountError = "";
+    state.mineOffset = 0;
+    state.mineTotal = 0;
+    minePicked.account.clear();   // whoever signs in next ticked none of these
+    return drawAccountRuns();
+  }
+  try {
+    const page = await api(`/api/runs?user=me&limit=${state.mineLimit}` +
+                           `&offset=${state.mineOffset}`);
+    if (gen !== accountGen) return;     // a newer load is already on its way
+    state.accountRuns = page.runs;
+    state.mineTotal = page.total ?? page.runs.length;
+    state.accountError = "";
+    // Withdrawing a whole page leaves this one standing past the end of the
+    // listing; step back to where the uploads now stop, and only backwards.
+    const back = lastPage(state.mineTotal, state.mineLimit);
+    if (!page.runs.length && back < state.mineOffset) {
+      state.mineOffset = back;
+      return loadAccountRuns();
+    }
+  } catch (e) {
+    if (gen !== accountGen) return;
+    state.accountRuns = [];
+    state.accountError = e.message;
+  }
+  drawAccountRuns();
+}
+
+function drawAccountRuns() {
   const box = $("#mine-account");
   box.replaceChildren();
   if (!state.user) {
@@ -1525,39 +1795,40 @@ async function renderAccountRuns() {
     return;
   }
   box.append(el("h2", null, `On your account (${state.user.name})`));
-  let runs = [];
-  try {
-    ({ runs } = await api("/api/runs?user=me&limit=200"));
-  } catch (e) {
-    box.append(el("p", "warn", e.message));
+  if (state.accountError) {
+    box.append(el("p", "warn", state.accountError));
     return;
   }
-  if (!runs.length) {
+  if (state.accountRuns === null) {
+    box.append(el("p", "empty", "Loading…"));
+    return;
+  }
+  if (!state.accountRuns.length) {
     box.append(el("p", "empty", "Nothing uploaded to this account yet."));
     return;
   }
-  for (const run of runs) {
-    const title = el("button", "linkish",
-      machineName(run, `run ${run.id}`));
-    title.type = "button";
-    title.addEventListener("click", () => showRun(run.id));
-    box.append(runCard(title, run.created_at, {
-      onDelete: async () => {
-        if (!confirm(`Withdraw run ${run.id} from the leaderboard?`)) return;
-        try {
-          await api(`/api/runs/${run.id}`, { method: "DELETE" });
-          forgetRun(run.id);
-          await afterDelete();
-        } catch (e) {
-          alert(e.message);
-        }
-      },
-    }));
-  }
+  const entries = state.accountRuns.map((run) => ({
+    id: run.id,
+    at: run.created_at,
+    title: runTitle(run.id, machineName(run, `run ${run.id}`)),
+  }));
+  renderRunList(box, entries, minePicked.account,
+                // Taken out of the listing as it goes rather than waiting for
+                // the refetch, so a withdrawn run is never redrawn as present.
+                (e) => api(`/api/runs/${e.id}`, { method: "DELETE" }).then(() => {
+                  state.accountRuns = state.accountRuns.filter((r) => r.id !== e.id);
+                  state.mineTotal = Math.max(0, state.mineTotal - 1);
+                }),
+                drawAccountRuns);
+  pager(box, { offset: state.mineOffset, limit: state.mineLimit,
+               total: state.mineTotal },
+        (offset) => {
+          state.mineOffset = Math.max(0, offset);
+          loadAccountRuns().catch(() => {});
+        });
 }
 
-function renderMine() {
-  renderAccountRuns().catch(() => {});
+function drawLocalRuns() {
   const box = $("#minelist");
   box.replaceChildren();
   const all = myRuns();
@@ -1565,27 +1836,33 @@ function renderMine() {
     box.append(el("p", "empty", "No anonymous uploads from this browser."));
     return;
   }
-  for (const entry of all) {
-    const title = el("button", "linkish", entry.name || `run ${entry.id}`);
-    title.type = "button";
-    title.addEventListener("click", () => showRun(entry.id));
-    box.append(runCard(title, entry.at, {
-      token: entry.token,
-      onDelete: async () => {
-        if (!confirm(`Withdraw run ${entry.id} from the leaderboard?`)) return;
-        try {
-          await api(`/api/runs/${entry.id}`, {
-            method: "DELETE",
-            headers: { "X-Delete-Token": entry.token },
-          });
-          forgetRun(entry.id);
-          await afterDelete();
-        } catch (e) {
-          alert(e.message);
-        }
-      },
-    }));
+  if (state.localOffset >= all.length) {
+    state.localOffset = lastPage(all.length, state.mineLimit);
   }
+  const shown = all.slice(state.localOffset, state.localOffset + state.mineLimit);
+  const entries = shown.map((entry) => ({
+    id: entry.id,
+    at: entry.at,
+    token: entry.token,
+    title: runTitle(entry.id, entry.name),
+  }));
+  renderRunList(box, entries, minePicked.local,
+                (e) => api(`/api/runs/${e.id}`, {
+                  method: "DELETE",
+                  headers: { "X-Delete-Token": e.token },
+                }),
+                drawLocalRuns);
+  pager(box, { offset: state.localOffset, limit: state.mineLimit,
+               total: all.length },
+        (offset) => {
+          state.localOffset = Math.max(0, offset);
+          drawLocalRuns();
+        });
+}
+
+function renderMine() {
+  loadAccountRuns().catch(() => {});
+  drawLocalRuns();
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,6 +1873,24 @@ function setupTabs() {
   for (const b of document.querySelectorAll("#tabs button")) {
     b.addEventListener("click", () => showTab(b.dataset.tab));
   }
+}
+
+// How many results each list shows. Read back from local storage before the
+// first load, so the board comes up at the size that was chosen last time
+// rather than at the default and then jumping.
+function setupPageSizes() {
+  state.limit = storedPage("cpcpub-page-board", state.limit);
+  state.mineLimit = storedPage("cpcpub-page-mine", state.mineLimit);
+  fillPageSizes($("#filters").elements.limit, state.limit);
+  const mine = $("#mine-limit");
+  fillPageSizes(mine, state.mineLimit);
+  mine.addEventListener("change", () => {
+    state.mineLimit = pageSize(mine.value, state.mineLimit);
+    rememberPage("cpcpub-page-mine", state.mineLimit);
+    state.mineOffset = 0;
+    state.localOffset = 0;
+    renderMine();
+  });
 }
 
 // The drop target is also a file picker and also keyboard-reachable: the same
@@ -1645,6 +1940,7 @@ function setupDropzone() {
 async function boot() {
   setupTabs();
   setupDropzone();
+  setupPageSizes();
   for (const b of document.querySelectorAll("button.copy")) {
     b.addEventListener("click", () => copyButton(b));
   }
@@ -1677,7 +1973,7 @@ async function boot() {
   });
   // Picking from a dropdown is the whole gesture -- there is nothing to confirm
   // afterwards, so each one reloads the board itself.
-  for (const name of ["scope", "target", "vectorize", "fma", "verified"]) {
+  for (const name of ["scope", "target", "vectorize", "fma", "verified", "limit"]) {
     $("#filters").elements[name].addEventListener("change", () => {
       loadBoard().catch((err) => alert(err.message));
     });

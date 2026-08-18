@@ -39,7 +39,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import server as srv                                        # noqa: E402
+import server as srv  # noqa: E402
 
 MAX_MANIFEST = 1 << 20      # a hundred builds of metadata, generously
 

@@ -1,0 +1,12 @@
+# Ruff on its own defaults, plus one rule.
+#
+# E402 -- an import that is not at the top of its file -- is off by default in
+# current ruff. web/verified.py breaks that rule deliberately: it puts its own
+# directory on sys.path and only then imports the hub module next door, which
+# is how `python3 web/verified.py` finds it without packaging the hub. The
+# import is marked `# noqa: E402` at the spot. Selecting the rule is what keeps
+# that marker meaning something: with the rule off, ruff reports the
+# suppression itself as unused (RUF100), and deleting it would leave the same
+# import unmarked for anyone whose ruff or flake8 does check E402.
+[lint]
+extend-select = ["E402"]

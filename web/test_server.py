@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import server as srv
+
 # The token helpers live with the tests that exercise them; here they are only
 # a way to produce a signature the hub will accept.
 import test_attest as ta
@@ -72,7 +73,7 @@ class HubTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.server = srv.build_server(str(Path(cls.tmp.name) / "t.sqlite3"),
                                       "127.0.0.1", 0, rate_limit=0)
-        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -196,7 +197,7 @@ class HubTest(unittest.TestCase):
 
         def row(sort, order):
             _, b = self.req(f"/api/cores?scope=cpu&sort={sort}&order={order}&limit=200")
-            return [c for c in b["cores"] if c["run_id"] == out["id"]][0]
+            return next(c for c in b["cores"] if c["run_id"] == out["id"])
 
         best = row("score", "desc")
         self.assertEqual(best["cpu"], 1)
@@ -252,8 +253,8 @@ class HubTest(unittest.TestCase):
 
     def test_delete_requires_matching_token(self):
         out = self.upload()
-        code, err = self.expect_error(f"/api/runs/{out['id']}", "DELETE",
-                                      headers={"X-Delete-Token": "wrong"})
+        code, _ = self.expect_error(f"/api/runs/{out['id']}", "DELETE",
+                                    headers={"X-Delete-Token": "wrong"})
         self.assertEqual(code, 403)
         status, _ = self.req(f"/api/runs/{out['id']}", "DELETE",
                              headers={"X-Delete-Token": out["delete_token"]})
@@ -268,10 +269,95 @@ class HubTest(unittest.TestCase):
         _, board = self.req("/api/cores?scope=cpu&sort=score&order=asc&limit=200")
         self.assertFalse([c for c in board["cores"] if c["run_id"] == out["id"]])
 
+    # -- page size --------------------------------------------------------
+    def test_a_listing_shows_the_page_size_it_was_asked_for(self):
+        for _ in range(3):
+            self.upload()
+        _, one = self.req("/api/runs?limit=1")
+        self.assertEqual(len(one["runs"]), 1)
+        _, two = self.req("/api/cores?scope=cpu&limit=2")
+        self.assertEqual(len(two["cores"]), 2)
+
+    def test_a_listing_can_be_walked_page_by_page(self):
+        """Every row is reachable, once, by stepping the offset.
+
+        The size of a page decides how much is on screen, never how much of the
+        board can be read: what is past the first page is what `offset` is for,
+        and `total` is how a page knows there is another one.
+        """
+        for i in range(7):
+            self.upload(document(label=f"page me {i}"))
+        seen, offset = [], 0
+        while True:
+            _, page = self.req(f"/api/cores?scope=cpu&limit=3&offset={offset}")
+            self.assertEqual(page["offset"], offset)
+            self.assertEqual(page["limit"], 3)
+            seen += [c["id"] for c in page["cores"]]
+            offset += 3
+            if offset >= page["total"]:
+                break
+        self.assertEqual(len(seen), len(set(seen)))       # no row twice
+        self.assertEqual(len(seen), page["total"])        # and none missed
+        # Past the end is an empty page rather than an error or a wrap-around.
+        _, past = self.req(f"/api/cores?scope=cpu&limit=3&offset={page['total'] + 90}")
+        self.assertEqual(past["cores"], [])
+        self.assertEqual(past["total"], page["total"])
+
+    def test_runs_are_paged_the_same_way(self):
+        for i in range(4):
+            self.upload(document(label=f"run page {i}"))
+        _, first = self.req("/api/runs?limit=2&offset=0")
+        _, second = self.req("/api/runs?limit=2&offset=2")
+        self.assertEqual(len(first["runs"]), 2)
+        self.assertEqual(len(second["runs"]), 2)
+        self.assertGreaterEqual(first["total"], 4)
+        self.assertFalse({r["id"] for r in first["runs"]} &
+                         {r["id"] for r in second["runs"]})
+
+    def test_a_count_counts_what_the_filters_left(self):
+        """The total is the filtered listing's, not the whole hub's.
+
+        A pager built from a count that ignored the filters would offer pages
+        that are not there.
+        """
+        self.upload(document(label="countme-alpha"))
+        _, page = self.req("/api/cores?scope=cpu&q=countme-alpha&limit=1")
+        self.assertEqual(page["total"], 1)
+        self.assertEqual(len(page["cores"]), 1)
+        # One row per upload on the board, however many records it holds --
+        # counted the same way, or the last page would be short of rows that
+        # were never going to be shown separately.
+        out = self.upload(document("per-core", label="countme-beta",
+                                   cores=[core(cpu=i, score=float(i + 1))
+                                          for i in range(5)]))
+        _, grouped = self.req("/api/cores?scope=cpu&q=countme-beta&limit=10")
+        self.assertEqual(grouped["total"], 1)
+        _, flat = self.req("/api/cores?scope=cpu&q=countme-beta&group=none&limit=10")
+        self.assertEqual(flat["total"], 5)
+        self.assertEqual(flat["cores"][0]["run_id"], out["id"])
+
+    def test_both_listings_stop_at_the_same_cap(self):
+        """An over-cap limit is clamped rather than refused.
+
+        The two endpoints used to cap at different numbers, which made the
+        page's own picker wrong for one of them. Nothing here uploads MAX_PAGE
+        runs to see the cut -- what matters is that neither listing errors and
+        neither hands back more than the cap the picker offers.
+        """
+        self.upload()
+        for path in (f"/api/runs?limit={srv.MAX_PAGE * 10}",
+                     f"/api/cores?scope=cpu&limit={srv.MAX_PAGE * 10}"):
+            status, out = self.req(path)
+            self.assertEqual(status, 200)
+            rows = out.get("runs", out.get("cores"))
+            self.assertLessEqual(len(rows), srv.MAX_PAGE)
+        # A limit that is not a number at all falls back rather than failing.
+        self.assertEqual(self.req("/api/runs?limit=lots")[0], 200)
+
     # -- rejected input ---------------------------------------------------
     def test_rejects_wrong_schema(self):
         code, err = self.expect_error("/api/runs", "POST",
-                                      document(**{"schema": "something/2"}))
+                                      document(schema="something/2"))
         self.assertEqual(code, 400)
         self.assertIn("schema", err["error"])
 
@@ -416,7 +502,7 @@ class VerifiedTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.db = str(Path(cls.tmp.name) / "v.sqlite3")
         cls.server = srv.build_server(cls.db, "127.0.0.1", 0, rate_limit=0)
-        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.store = srv.Store(cls.db)
@@ -477,7 +563,7 @@ class VerifiedTest(unittest.TestCase):
         b = Browser(self.base)
         _, run = b.call(f"/api/runs/{out['id']}")
         self.assertEqual(run["release_build"], "v1.2.3")
-        _, board = b.call(f"/api/cores?scope=cpu&verified=release")
+        _, board = b.call("/api/cores?scope=cpu&verified=release")
         self.assertIn(out["id"], [c["run_id"] for c in board["cores"]])
 
     def test_an_unpublished_digest_does_not(self):
@@ -520,15 +606,14 @@ class VerifiedTest(unittest.TestCase):
     # -- the manifest -------------------------------------------------------
     def test_manifest_must_carry_the_right_schema(self):
         with self.assertRaises(srv.Invalid):
-            self.store.add_verified_builds(manifest(**{"schema": "something/9"}))
+            self.store.add_verified_builds(manifest(schema="something/9"))
 
     def test_manifest_needs_a_release_and_builds(self):
         broken: tuple[dict[str, Any], ...] = (
             {"release": None}, {"builds": []}, {"builds": "no"})
         for bad in broken:
-            with self.subTest(bad):
-                with self.assertRaises(srv.Invalid):
-                    self.store.add_verified_builds(manifest(**bad))
+            with self.subTest(bad), self.assertRaises(srv.Invalid):
+                self.store.add_verified_builds(manifest(**bad))
 
     def test_manifest_digests_are_checked(self):
         with self.assertRaises(srv.Invalid):
@@ -705,7 +790,7 @@ class AttestedUploadTest(unittest.TestCase):
         store.keys = {"test-key": (ta.N, ta.E)}
         store.fetched = time.monotonic()
         cls.server.attest = (store, [ta.WORKFLOW])
-        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -832,7 +917,7 @@ class AttestationRefusedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             server = srv.build_server(str(Path(d) / "n.sqlite3"), "127.0.0.1", 0,
                                       rate_limit=0, attest_workflows=[])
-            base = "http://127.0.0.1:%d" % server.server_address[1]
+            base = f"http://127.0.0.1:{server.server_address[1]}"
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
@@ -867,7 +952,7 @@ class AccountTest(unittest.TestCase):
         cls.server = srv.build_server(str(Path(cls.tmp.name) / "a.sqlite3"),
                                       "127.0.0.1", 0, rate_limit=0, auth_limit=0,
                                       register_pow=0, register_limit=0)
-        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.seq = 0
@@ -1168,7 +1253,7 @@ class RegistrationTest(unittest.TestCase):
         thread.start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        return "http://127.0.0.1:%d" % server.server_address[1]
+        return f"http://127.0.0.1:{server.server_address[1]}"
 
     def solved(self, base: str, name: str, **over) -> tuple[int, dict]:
         """Register `name`, doing whatever work the hub asks for."""

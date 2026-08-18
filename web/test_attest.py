@@ -17,14 +17,14 @@ import base64
 import hashlib
 import json
 import random
+import sys
 import time
 import unittest
 from pathlib import Path
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import attest                                            # noqa: E402
+import attest
 
 
 def _prime(rng, bits):
@@ -181,10 +181,13 @@ class AttestTest(unittest.TestCase):
                       self.refuses(token=sign(claims(), key=(other_n, other_d))))
 
     def test_an_unknown_key_id_is_refused(self):
-        # No network in the tests, so the refetch this triggers finds nothing
-        # and the token stays unknown -- which is the required outcome.
+        # No network in the tests, so the refetch this triggers either fails
+        # outright or finds nothing; the token stays unknown, which is the
+        # required outcome. Both are named rather than caught blind: the
+        # verifier's own refusal, or the connection error underneath it.
         self.store.url = "http://127.0.0.1:1/nowhere"
-        self.assertRaises(Exception, lambda: self.check(token=sign(claims(), kid="nope")))
+        with self.assertRaises((attest.AttestationError, OSError)):
+            self.check(token=sign(claims(), kid="nope"))
 
     def test_a_symmetric_algorithm_cannot_be_smuggled_in(self):
         """HS256 signed with the public modulus, the classic confusion attack."""
@@ -238,9 +241,9 @@ class AttestTest(unittest.TestCase):
     # -- shapes -------------------------------------------------------------
     def test_junk_is_refused_without_exploding(self):
         for junk in ("", "not.a.token", "a.b", "x" * 9000, "..", "a.b.c.d"):
-            with self.subTest(junk[:20]):
-                with self.assertRaises(attest.AttestationError):
-                    attest.check(junk, BODY, self.store, [WORKFLOW])
+            with self.subTest(junk[:20]), \
+                 self.assertRaises(attest.AttestationError):
+                attest.check(junk, BODY, self.store, [WORKFLOW])
 
 
 class KeyStoreTest(unittest.TestCase):

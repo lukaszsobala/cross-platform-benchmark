@@ -36,7 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "web"))
 
-import server as srv                                        # noqa: E402
+import server as srv  # noqa: E402
 
 SAMPLE = ROOT / "testdata" / "full-run.json"
 
@@ -302,7 +302,7 @@ class SubmitTest(unittest.TestCase):
         cls.server = srv.build_server(str(Path(cls.tmp.name) / "s.sqlite3"),
                                       "127.0.0.1", 0, rate_limit=0, auth_limit=0,
                                       register_pow=0, register_limit=0)
-        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -316,8 +316,10 @@ class SubmitTest(unittest.TestCase):
         args = [self.binary, "--full", "--cpus", "0", "--threads", "1",
                 "--time", "0.05", "--reps", "1", "--warmup", "0.02",
                 "--submit", self.base, *extra]
-        return subprocess.run(args, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True)
+        # `check=False` throughout this class: what the binary exits with is
+        # part of what is being tested -- one of these runs is meant to fail --
+        # so the caller reads returncode rather than being raised at.
+        return subprocess.run(args, capture_output=True, text=True, check=False)
 
     def get(self, path):
         with urllib.request.urlopen(self.base + path) as r:
@@ -372,8 +374,7 @@ class SubmitTest(unittest.TestCase):
         args = [self.binary, "--variants", "--threads", "1", "--time", "0.05",
                 "--reps", "1", "--warmup", "0.02", "--submit", self.base,
                 "--label", "K" * 205]
-        proc = subprocess.run(args, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(args, capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         # However many variants this ISA can tell apart -- one on a target where
         # vectorization and FMA make no difference, four on x86-64.
@@ -402,8 +403,7 @@ class SubmitTest(unittest.TestCase):
     def test_an_unreachable_hub_does_not_lose_the_result(self):
         args = [self.binary, "--threads", "1", "--time", "0.05", "--reps", "1",
                 "--warmup", "0.02", "--json", "--submit", "http://127.0.0.1:1"]
-        proc = subprocess.run(args, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(args, capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("submit failed", proc.stderr)
         # The measurement still came out, which is the point of doing the

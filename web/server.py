@@ -68,6 +68,11 @@ MAX_AUTH_BODY = 4096        # a name and a password; anything larger is noise
 MAX_DRAIN = 8 << 20         # how much of a refused body to swallow before
                             # hanging up, so the client can read the 413
 MAX_CORES = 1024
+MAX_PAGE = 500              # the most rows any listing will return at once, so
+                            # the page's own picker and a hand-edited limit=
+                            # both stop at the same place
+MAX_OFFSET = 1 << 30        # how far into a listing paging may go; past the end
+                            # is an empty page, not an error
 MAX_TEXT = 200
 MAX_NOTES = 2000
 MAX_VALUE = 1e12            # nothing this benchmark reports comes near this
@@ -500,7 +505,7 @@ def pow_solved(challenge: str, nonce: str, bits: int) -> bool:
     That asymmetry is the whole mechanism, and it needs no state beyond the
     challenge having been issued and not yet spent.
     """
-    digest = hashlib.sha256(f"{challenge}:{nonce}".encode("utf-8")).digest()
+    digest = hashlib.sha256(f"{challenge}:{nonce}".encode()).digest()
     return int.from_bytes(digest, "big") < (1 << (256 - bits))
 
 
@@ -576,8 +581,7 @@ def release_rank(tag: str) -> str:
     of the table to answer one row of the board.
     """
     core, _, pre = tag.strip().lower().partition("-")
-    if core.startswith("v"):
-        core = core[1:]
+    core = core.removeprefix("v")
 
     def pad(s: str) -> str:
         out = []
@@ -587,7 +591,7 @@ def release_rank(tag: str) -> str:
                 # A component too large to be a version number is not one; it
                 # is clamped rather than allowed to widen the field and so
                 # scramble the ordering of every tag around it.
-                out.append("%012d" % n if n < 10 ** 12 else "9" * 12)
+                out.append(f"{n:012d}" if n < 10 ** 12 else "9" * 12)
             else:
                 out.append(part)
         return "".join(out)
@@ -845,19 +849,16 @@ class Store:
                 args + [limit, offset]).fetchall()
         return [dict(r) for r in rows]
 
-    def cores(self, *, scope: str | None = "cpu", target: str | None = None,
-              vectorize: int | None = None, fma: int | None = None,
-              search: str | None = None, ids: list[int] | None = None,
-              run: int | None = None, user_id: int | None = None,
-              verified: str | None = None, group_run: bool = True,
-              sort: str = "score", desc: bool = True, limit: int = 50) -> list[dict]:
-        """Records matching the filters, best first.
+    def core_filters(self, *, scope: str | None = "cpu", target: str | None = None,
+                     vectorize: int | None = None, fma: int | None = None,
+                     search: str | None = None, ids: list[int] | None = None,
+                     run: int | None = None, user_id: int | None = None,
+                     verified: str | None = None) -> tuple[list[str], list[object]]:
+        """The WHERE that a listing and its count are both built from.
 
-        With `group_run` (the leaderboard's default) an upload contributes one
-        row, not one per core: the run's best record at `sort` stands for it,
-        and `records` says how many it was picked from. Without it every
-        matching record is a row of its own -- what the expanded view of a run
-        and a shared comparison link both address.
+        In one place because they must agree: a count taken over different
+        filters from the rows it counts pages the board wrong in exactly the
+        way nobody notices until the last page is empty.
         """
         where = ["1 = 1"]
         args: list[object] = []
@@ -895,6 +896,39 @@ class Store:
         if ids:
             where.append(f"c.id IN ({','.join('?' * len(ids))})")
             args += ids
+        return where, args
+
+    def count_cores(self, *, group_run: bool = True, **filters) -> int:
+        """How many rows a listing has in total, paging aside.
+
+        With `group_run` a run is one row however many records matched, which
+        is what the board counts; without it every matching record is its own.
+        """
+        where, args = self.core_filters(**filters)
+        counted = "DISTINCT c.run_id" if group_run else "*"
+        with self.connect() as db:
+            row = db.execute(
+                f"SELECT COUNT({counted}) AS n FROM cores c "
+                f"JOIN runs r ON r.id = c.run_id "
+                f"WHERE {' AND '.join(where)}", args).fetchone()
+        return int(row["n"])
+
+    def cores(self, *, group_run: bool = True, sort: str = "score",
+              desc: bool = True, limit: int = 50, offset: int = 0,
+              **filters) -> list[dict]:
+        """Records matching the filters, best first.
+
+        With `group_run` (the leaderboard's default) an upload contributes one
+        row, not one per core: the run's best record at `sort` stands for it,
+        and `records` says how many it was picked from. Without it every
+        matching record is a row of its own -- what the expanded view of a run
+        and a shared comparison link both address.
+
+        `offset` is what makes the board browsable past its first page. The
+        order below is total -- the metric, then the id -- so a row cannot sit
+        on two pages at once or fall between them.
+        """
+        where, args = self.core_filters(**filters)
         # `sort` is whitelisted by the caller; never interpolate raw input here.
         assert sort in METRIC_KEYS or sort == "mhz"
         direction = "DESC" if desc else "ASC"
@@ -921,8 +955,8 @@ class Store:
             f"JOIN runs r ON r.id = c.run_id "
             + ("WHERE m.pick = 1 " if group_run else "")
             + f"ORDER BY {order} "
-            f"LIMIT ?")
-        args.append(limit)
+            f"LIMIT ? OFFSET ?")
+        args += [limit, offset]
         with self.connect() as db:
             return [dict(r) for r in db.execute(sql, args).fetchall()]
 
@@ -1122,6 +1156,15 @@ class Store:
             return db.execute("SELECT COUNT(*) AS n FROM runs WHERE user_id = ?",
                               (user_id,)).fetchone()["n"]
 
+    def run_total(self, user_id: int | None = None) -> int:
+        """How many runs a listing of them has in all: the whole hub, or one
+        account's, matching whatever `runs()` was narrowed to."""
+        where = "WHERE user_id = ?" if user_id is not None else ""
+        args = (user_id,) if user_id is not None else ()
+        with self.connect() as db:
+            return db.execute(
+                f"SELECT COUNT(*) AS n FROM runs {where}", args).fetchone()["n"]
+
     # -- sessions ----------------------------------------------------------
 
     def create_session(self, user_id: int) -> tuple[str, int]:
@@ -1273,7 +1316,9 @@ class Handler(BaseHTTPRequestHandler):
     # this parameter -- an override that renames it is one a caller passing it
     # by keyword would not survive.
     def log_message(self, format, *args):   # one tidy line per request
-        sys.stderr.write("%s - %s\n" % (self.client_key(), format % args))
+        # `format % args` is this handler's own contract with http.server and
+        # stays as it is; only the line around it is ours to write.
+        sys.stderr.write(f"{self.client_key()} - {format % args}\n")
 
     # -- who is asking -----------------------------------------------------
     #
@@ -1424,12 +1469,18 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(e.status, str(e))
         except BrokenPipeError:
             pass
-        except Exception as e:                      # never leak a traceback
+        except Exception as e:                      # noqa: BLE001
+            # Deliberately everything: an exception let out of a handler prints
+            # a traceback where the response should be and takes the connection
+            # with it. One line in the log, one plain 500 to the client.
             self.log_message("unhandled error: %r", e)
             try:
                 self.fail(HTTPStatus.INTERNAL_SERVER_ERROR, "internal error")
-            except Exception:
-                pass
+            except Exception as unreportable:       # noqa: BLE001
+                # The 500 could not be sent either: the socket has gone, or the
+                # response had already started. Say so in the log rather than
+                # swallowing it -- this is the one place a bug here would hide.
+                self.log_message("could not report it: %r", unreportable)
 
     def api(self, method: str, path: str, query: dict):
         if path.startswith("/api/auth/"):
@@ -1447,14 +1498,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(HTTPStatus.OK,
                                   {"builds": self.store.verified_builds()})
         if path == "/api/cores" and method == "GET":
-            return self.send_json(HTTPStatus.OK, {"cores": self.query_cores(query)})
+            return self.send_json(HTTPStatus.OK, self.query_cores(query))
         if path == "/api/runs":
             if method == "GET":
-                limit = clamp_int(query.get("limit", ["50"])[0], 1, 200, 50)
-                offset = clamp_int(query.get("offset", ["0"])[0], 0, 1 << 30, 0)
+                limit = clamp_int(query.get("limit", ["50"])[0], 1, MAX_PAGE, 50)
+                offset = clamp_int(query.get("offset", ["0"])[0], 0, MAX_OFFSET, 0)
+                who = self.who_filter(query)
+                runs = self.store.runs(limit, offset, who)
                 return self.send_json(HTTPStatus.OK, {
-                    "runs": self.store.runs(limit, offset,
-                                            self.who_filter(query))})
+                    "runs": runs, "limit": limit, "offset": offset,
+                    "total": self.total(len(runs), limit, offset,
+                                        lambda: self.store.run_total(who))})
             if method == "POST":
                 return self.upload()
             return self.fail(HTTPStatus.METHOD_NOT_ALLOWED, "method not allowed")
@@ -1705,7 +1759,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_session()
         self.send_json(HTTPStatus.OK, {"closed": user["name"], "runs_deleted": removed})
 
-    def query_cores(self, query: dict) -> list[dict]:
+    def query_cores(self, query: dict) -> dict:
         def one(name, default=None):
             v = query.get(name, [default])[0]
             return v if v not in ("", None) else default
@@ -1750,21 +1804,42 @@ class Handler(BaseHTTPRequestHandler):
             raise Invalid("verified must be 'ci', 'attested' or 'release'")
 
         flag = {"1": 1, "0": 0, "true": 1, "false": 0}
-        return self.store.cores(
-            scope=scope,
-            user_id=self.who_filter(query),
-            verified=verified,
-            target=_text(one("target"), 32, "target"),
-            vectorize=flag.get(str(one("vectorize", "")).lower()),
-            fma=flag.get(str(one("fma", "")).lower()),
-            search=_text(one("q"), 64, "q"),
-            ids=ids,
-            run=run,
-            group_run=(group == "run"),
-            sort=sort,
-            desc=(order == "desc"),
-            limit=clamp_int(one("limit", "50"), 1, 500, 50),
-        )
+        # Held as one mapping because the rows and their count must be asked
+        # the same question; both calls below spread it.
+        filters = {
+            "scope": scope,
+            "user_id": self.who_filter(query),
+            "verified": verified,
+            "target": _text(one("target"), 32, "target"),
+            "vectorize": flag.get(str(one("vectorize", "")).lower()),
+            "fma": flag.get(str(one("fma", "")).lower()),
+            "search": _text(one("q"), 64, "q"),
+            "ids": ids,
+            "run": run,
+        }
+        group_run = (group == "run")
+        limit = clamp_int(one("limit", "50"), 1, MAX_PAGE, 50)
+        offset = clamp_int(one("offset", "0"), 0, MAX_OFFSET, 0)
+        cores = self.store.cores(group_run=group_run, sort=sort,
+                                 desc=(order == "desc"), limit=limit,
+                                 offset=offset, **filters)
+        return {"cores": cores, "limit": limit, "offset": offset,
+                "total": self.total(len(cores), limit, offset,
+                                    lambda: self.store.count_cores(
+                                        group_run=group_run, **filters))}
+
+    @staticmethod
+    def total(shown: int, limit: int, offset: int, count) -> int:
+        """How many rows the listing has in all, counted only when it matters.
+
+        A first page that came back short is the whole answer already, and that
+        is most requests here -- the expanded view of one run, a comparison
+        link, the pick of one record. Only a page that filled up, or one past
+        the start, has to ask the database how far the listing really goes.
+        """
+        if offset == 0 and shown < limit:
+            return shown
+        return count()
 
     def drain_unread(self):
         """Swallow a request body nothing got round to reading."""
@@ -2040,7 +2115,7 @@ def main(argv=None) -> int:
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("", file=sys.stderr)
+        print(file=sys.stderr)
     finally:
         srv.server_close()
     return 0

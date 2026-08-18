@@ -58,6 +58,11 @@
     <label class="check" title="show every metric, not just the headline ones">
       <input type="checkbox" name="detailed"> Detailed
     </label>
+    <!-- Options filled by the page, from the one list that also holds the cap
+         the server clamps to. -->
+    <label title="how many results this page asks for at once">Show
+      <select name="limit"></select>
+    </label>
     <label>Trust
       <select name="verified">
         <option value="">anything</option>
@@ -86,6 +91,8 @@
 
 
   <div class="scroller"><table id="board-table"><thead></thead><tbody></tbody></table></div>
+  <!-- Filled by pager(): absent while the whole board fits on one page. -->
+  <div id="board-pager"></div>
   <p class="note legend">↑ higher is better · ↓ lower is better</p>
   <p class="empty" id="board-empty" hidden>Nothing here yet. Be the first to upload a run.</p>
 </section>
@@ -156,13 +163,19 @@
 </section>
 
 <section id="mine" class="tab">
+  <div class="minebar">
+    <label title="how many uploads each list here shows">Show
+      <select id="mine-limit"></select>
+    </label>
+  </div>
   <div id="mine-account"></div>
   <h2>Uploaded from this browser</h2>
   <p class="note">
     Anonymous uploads made here. The delete token is kept in this browser's
     local storage only — it is the only way to withdraw one, so save it if you
     care about being able to. Uploads made while signed in need no token: they
-    are on the account and can be withdrawn from anywhere.
+    are on the account and can be withdrawn from anywhere. Tick the ones you
+    want gone and withdraw them together.
   </p>
   <div id="minelist"></div>
 </section>
