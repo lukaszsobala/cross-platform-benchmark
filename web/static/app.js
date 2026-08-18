@@ -281,7 +281,7 @@ function filterParams() {
   const p = new URLSearchParams();
   // The dropdowns reload the board the moment they change, so their live value
   // is always the applied one.
-  for (const name of ["scope", "target", "vectorize", "fma"]) {
+  for (const name of ["scope", "target", "vectorize", "fma", "norm"]) {
     const v = form.elements[name].value;
     if (v) p.set(name, v);
   }
@@ -671,6 +671,9 @@ async function representative(runId, scope) {
   p.set("group", "run");
   p.set("sort", state.sort);
   p.set("order", state.order);
+  // Per GHz a run is stood for by its most efficient record rather than its
+  // fastest, so the pick has to be asked for the same way the board asked.
+  p.set("norm", state.norm);
   p.set("limit", "1");
   const { cores } = await api("/api/cores?" + p.toString());
   return cores[0] || null;
@@ -1973,21 +1976,21 @@ async function boot() {
   });
   // Picking from a dropdown is the whole gesture -- there is nothing to confirm
   // afterwards, so each one reloads the board itself.
-  for (const name of ["scope", "target", "vectorize", "fma", "verified", "limit"]) {
+  // `norm` is in here rather than with the redraw-only control below because
+  // it is what the board is ranked by as well as what it prints: switching to
+  // per GHz reorders the rows, so it has to ask the server again.
+  for (const name of ["scope", "target", "vectorize", "fma", "verified",
+                      "limit", "norm"]) {
     $("#filters").elements[name].addEventListener("change", () => {
       loadBoard().catch((err) => alert(err.message));
     });
   }
-  // These two change how the rows are drawn, not which rows they are, so
-  // neither refetches.
-  const redraw = () => { renderBoard(); renderSelection(); };
-  $("#filters").elements.norm.addEventListener("change", (e) => {
-    state.norm = e.target.value;
-    redraw();
-  });
+  // This one changes how the rows are drawn, not which rows they are or in
+  // what order, so it does not refetch.
   $("#filters").elements.detailed.addEventListener("change", (e) => {
     state.detailed = e.target.checked;
-    redraw();
+    renderBoard();
+    renderSelection();
   });
   $("#uploadform").addEventListener("submit", doUpload);
   $("#clearsel").addEventListener("click", () => {

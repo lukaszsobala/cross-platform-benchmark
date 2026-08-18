@@ -132,7 +132,7 @@ python3 verified.py --db runs.sqlite3 --forget v0.1.0
 | `GET` | `/api/runs?limit=&offset=&user=` | recent runs, optionally one submitter's |
 | `GET` | `/api/runs/<id>`, `/raw`, `/rank` | one run; the document as uploaded; its percentile per metric |
 | `DELETE` | `/api/runs/<id>` | withdraw; needs `X-Delete-Token` or a signed-in owner |
-| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&user=&verified=&sort=&order=&limit=&offset=` | leaderboard rows: one per upload, each its best record at `sort` |
+| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&user=&verified=&sort=&order=&norm=&limit=&offset=` | leaderboard rows: one per upload, each its best record at `sort` |
 | `GET` | `/api/cores?run=<id>` / `?ids=1,2,3` | every record of one run / named records |
 | `GET` | `/api/metrics`, `/api/stats`, `/api/builds` | metric definitions; counts; recognised release digests |
 | `GET` | `/api/users/<name>` | public profile: name, since, run count |
@@ -141,6 +141,15 @@ python3 verified.py --db runs.sqlite3 --forget v0.1.0
 | `POST` | `/api/auth/register` | `{name, password, challenge, nonce}`, plus `invite` where required |
 | `POST` | `/api/auth/login` `/logout` `/token` `/password` `/close` | sign in; sign out; reissue the upload token; change password; delete the account |
 | `GET` | `/api/auth/me` | the signed-in account, or `{"user": null}` |
+
+`norm` is which reading of `sort` to rank on: `abs` (default) for the figure as
+measured, `ghz` for it per gigahertz of clock — rates divided by GHz, `time`
+metrics turned into cycles, `ratio` and `fixed` ones left alone, and a record
+whose clock was never reported ranked on its raw value, because that is what is
+shown for it. It is the page's **Values** picker, and it is a server-side sort
+because the board is paged: ordering a page after it arrives would only sort the
+rows that happened to be on it. With `group=run` it also decides which record
+stands for an upload — per GHz that is its most efficient core, not its fastest.
 
 Both listings are paged: `limit` (default 50, clamped to 500 — the sizes the
 page's own **Show** pickers offer) and `offset`, and both answer with

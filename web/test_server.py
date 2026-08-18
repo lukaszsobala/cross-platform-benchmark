@@ -208,6 +208,104 @@ class HubTest(unittest.TestCase):
         self.assertEqual(quickest["cpu"], 2)
         self.assertEqual(quickest["score"], 5000.0)
 
+    # -- per GHz ------------------------------------------------------------
+    def test_per_ghz_ranks_by_the_per_ghz_figure(self):
+        """The board is ordered by the values it is printing.
+
+        Per GHz is a reading of the same numbers, not a second set of them, so
+        the ranking has to follow it: a column of figures the eye can see is
+        out of order is the bug, whatever the underlying values do.
+        """
+        fast = self.upload(document(label="perghz-fast", cores=[
+            core(cpu=0, mhz=5000.0, score=20000.0)]))       # 4000 per GHz
+        frugal = self.upload(document(label="perghz-frugal", cores=[
+            core(cpu=0, mhz=2000.0, score=12000.0)]))       # 6000 per GHz
+
+        def order(norm):
+            _, b = self.req(f"/api/cores?scope=cpu&q=perghz&sort=score"
+                            f"&order=desc&norm={norm}&limit=10")
+            return [c["run_id"] for c in b["cores"]]
+
+        self.assertEqual(order("abs"), [fast["id"], frugal["id"]])
+        self.assertEqual(order("ghz"), [frugal["id"], fast["id"]])
+
+    def test_per_ghz_turns_a_latency_into_cycles(self):
+        """A `time` metric multiplies by the clock rather than dividing."""
+        slow = self.upload(document(label="cycles-slow", cores=[
+            core(cpu=0, mhz=2000.0, mem_lat_ns=100.0)]))     # 200 cycles
+        quick = self.upload(document(label="cycles-quick", cores=[
+            core(cpu=0, mhz=5000.0, mem_lat_ns=60.0)]))      # 300 cycles
+
+        def order(norm):
+            _, b = self.req(f"/api/cores?scope=cpu&q=cycles-&sort=mem_lat_ns"
+                            f"&order=asc&norm={norm}&limit=10")
+            return [c["run_id"] for c in b["cores"]]
+
+        self.assertEqual(order("abs"), [quick["id"], slow["id"]])
+        self.assertEqual(order("ghz"), [slow["id"], quick["id"]])
+
+    def test_a_clock_independent_metric_does_not_move(self):
+        """`fixed` and `ratio` metrics rank the same either way.
+
+        MEM is the memory controller's figure, not the core's, so dividing it
+        by a core clock would only flatter whichever core was clocked lower
+        while measuring the same DRAM. The page does not do it and neither
+        does the ordering.
+        """
+        wide = self.upload(document(label="fixed-wide", cores=[
+            core(cpu=0, mhz=5000.0, mem_gbps=30.0, ilp=6.0)]))
+        narrow = self.upload(document(label="fixed-narrow", cores=[
+            core(cpu=0, mhz=1000.0, mem_gbps=20.0, ilp=4.0)]))
+
+        for sort in ("mem_gbps", "ilp"):
+            for norm in ("abs", "ghz"):
+                with self.subTest(sort=sort, norm=norm):
+                    _, b = self.req(f"/api/cores?scope=cpu&q=fixed-&sort={sort}"
+                                    f"&order=desc&norm={norm}&limit=10")
+                    self.assertEqual([c["run_id"] for c in b["cores"]],
+                                     [wide["id"], narrow["id"]])
+
+    def test_per_ghz_stands_a_run_up_by_its_most_efficient_record(self):
+        """Which record represents an upload follows the reading too.
+
+        Ranked per GHz, a machine is on the board for its most efficient core,
+        not its fastest -- otherwise the row shown is one the ranking did not
+        pick, and its printed value can sit out of order among the rest.
+        """
+        out = self.upload(document(label="pick-perghz", cores=[
+            core(cpu=0, mhz=5000.0, score=20000.0),          # 4000 per GHz
+            core(cpu=1, mhz=2000.0, score=12000.0)]))        # 6000 per GHz
+
+        def row(norm):
+            _, b = self.req(f"/api/cores?scope=cpu&q=pick-perghz&sort=score"
+                            f"&order=desc&norm={norm}&limit=10")
+            return next(c for c in b["cores"] if c["run_id"] == out["id"])
+
+        self.assertEqual(row("abs")["cpu"], 0)
+        self.assertEqual(row("ghz")["cpu"], 1)
+
+    def test_a_record_with_no_clock_sorts_on_what_it_shows(self):
+        """No clock, nothing to divide by, so the raw figure is the reading.
+
+        Runs from binaries that could not read a clock are permanently in that
+        state. The page prints their absolute value in the per-GHz view, so
+        that is what they have to be placed by; anything else puts a row in a
+        position its own number does not explain.
+        """
+        clocked = self.upload(document(label="noclock-clocked", cores=[
+            core(cpu=0, mhz=5000.0, score=20000.0)]))        # 4000 per GHz
+        clockless = self.upload(document(label="noclock-bare", cores=[
+            core(cpu=0, mhz=None, score=5000.0)]))           # shown as 5000
+
+        _, b = self.req("/api/cores?scope=cpu&q=noclock-&sort=score"
+                        "&order=desc&norm=ghz&limit=10")
+        self.assertEqual([c["run_id"] for c in b["cores"]],
+                         [clockless["id"], clocked["id"]])
+
+    def test_rejects_an_unknown_norm(self):
+        code, _ = self.expect_error("/api/cores?norm=cycles")
+        self.assertEqual(code, 400)
+
     def test_records_of_one_run_are_addressable(self):
         """What the expanded view of a board row asks for."""
         cores = [core(cpu=i, score=1000.0 + i) for i in range(4)]

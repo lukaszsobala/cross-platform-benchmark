@@ -160,6 +160,10 @@ METRICS = [
     {"key": "disp_cap",    "label": "DISPcap",  "unit": "calls",   "kind": "ratio", "better": "high"},
 ]
 METRIC_KEYS = [m["key"] for m in METRICS]
+# key -> kind, for the one place that has to redo the front end's per-GHz
+# arithmetic in SQL. Spelled apart from METRIC_KINDS below, which is the
+# vocabulary rather than a lookup.
+KIND_OF = {m["key"]: m["kind"] for m in METRICS}
 # The front end switches on these strings and falls through to "leave the value
 # alone" for anything it does not know, so a typo here is a metric that quietly
 # stops being normalised. The contract test pins the vocabulary.
@@ -674,6 +678,27 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def sort_expr(sort: str, norm: str) -> str:
+    """The quantity a listing is ordered by, in SQL.
+
+    Per-GHz is not a second set of numbers, it is a different way of reading
+    the same ones -- so it has to be what the ordering reads too. Ranking by
+    the absolute figure while printing the normalised one puts a column on
+    screen that is visibly out of order, which is the sort of wrong that makes
+    a reader distrust the rows as well as the ordering.
+
+    The arithmetic is the front end's, exactly: rates divide by GHz, latencies
+    in ns become cycles, `ratio` and `fixed` metrics do not move, and a record
+    whose clock was never reported shows its raw value and therefore sorts on
+    it. `mhz` itself is a column, not a metric, and is never normalised.
+    """
+    op = {"rate": "/", "time": "*"}.get(KIND_OF.get(sort, ""))
+    if norm != "ghz" or op is None:
+        return f"c.{sort}"
+    return (f"CASE WHEN c.mhz IS NULL OR c.mhz = 0 THEN c.{sort} "
+            f"ELSE c.{sort} {op} (c.mhz / 1000.0) END")
+
+
 class Store:
     ADDED_COLUMNS = (("compiler_version", "TEXT"), ("cc", "TEXT"),
                      ("build_flags", "TEXT"), ("user_id", "INTEGER"),
@@ -914,8 +939,8 @@ class Store:
         return int(row["n"])
 
     def cores(self, *, group_run: bool = True, sort: str = "score",
-              desc: bool = True, limit: int = 50, offset: int = 0,
-              **filters) -> list[dict]:
+              desc: bool = True, norm: str = "abs", limit: int = 50,
+              offset: int = 0, **filters) -> list[dict]:
         """Records matching the filters, best first.
 
         With `group_run` (the leaderboard's default) an upload contributes one
@@ -923,6 +948,12 @@ class Store:
         and `records` says how many it was picked from. Without it every
         matching record is a row of its own -- what the expanded view of a run
         and a shared comparison link both address.
+
+        `norm` is which reading of the metric to rank on -- "abs" for the
+        figure as measured, "ghz" for it per gigahertz of clock, the same view
+        the page offers. It changes the order and, with `group_run`, which
+        record represents a run: per GHz an upload is stood for by its most
+        efficient core, not its fastest.
 
         `offset` is what makes the board browsable past its first page. The
         order below is total -- the metric, then the id -- so a row cannot sit
@@ -932,10 +963,11 @@ class Store:
         # `sort` is whitelisted by the caller; never interpolate raw input here.
         assert sort in METRIC_KEYS or sort == "mhz"
         direction = "DESC" if desc else "ASC"
+        key = sort_expr(sort, norm)
         # Nulls last whichever way the metric runs, then the metric, then the
         # id so the order is total. Used twice: once to pick each run's
         # representative, once to order the board itself.
-        order = f"(c.{sort} IS NULL), c.{sort} {direction}, c.id ASC"
+        order = f"({key} IS NULL), {key} {direction}, c.id ASC"
         sql = (
             f"WITH matched AS ("
             f"  SELECT c.id AS core_id, "
@@ -1788,6 +1820,12 @@ class Handler(BaseHTTPRequestHandler):
         order = one("order", "desc")
         if order not in ("asc", "desc"):
             raise Invalid("order must be asc or desc")
+        # Which reading of the metric to rank on. The page has the same choice
+        # under `Values`, and the two have to agree or it sorts a column by
+        # numbers it is not showing.
+        norm = one("norm", "abs")
+        if norm not in ("abs", "ghz"):
+            raise Invalid("norm must be 'abs' or 'ghz'")
         ids = None
         if raw_ids:
             try:
@@ -1821,7 +1859,7 @@ class Handler(BaseHTTPRequestHandler):
         limit = clamp_int(one("limit", "50"), 1, MAX_PAGE, 50)
         offset = clamp_int(one("offset", "0"), 0, MAX_OFFSET, 0)
         cores = self.store.cores(group_run=group_run, sort=sort,
-                                 desc=(order == "desc"), limit=limit,
+                                 desc=(order == "desc"), norm=norm, limit=limit,
                                  offset=offset, **filters)
         return {"cores": cores, "limit": limit, "offset": offset,
                 "total": self.total(len(cores), limit, offset,
