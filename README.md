@@ -107,20 +107,14 @@ A run carries the SHA-256 of the binary that produced it, so a run made with a
 published release build is labelled with that release — in grey, as the run's
 own word about itself, because a benchmark cannot vouch for its own numbers.
 
-Two stronger marks come from [the measure workflow](.github/workflows/measure.yml),
-which runs a published binary with fixed arguments and has GitHub sign the exact
-result bytes. Call it from your own repository to measure your own machine:
-
-```yaml
-  measure:
-    uses: lukaszsobala/cross-platform-benchmark/.github/workflows/measure.yml@v0.3.4
-    permissions: { id-token: write, contents: read }
-    with: { hub: https://hub.example, runner: self-hosted, label: "my box" }
-```
-
-On GitHub's own runners nothing in the chain belongs to the submitter and the
-run is marked **verified**. On a self-hosted runner the signatures still hold
-but the machine does not, so it is marked **attested** and never confused with
-the first. Ordinary uploads need none of this and rank the same.
+That is the only check there is, and it is deliberately the only one. A
+benchmark cannot prove it was run: any key it carried to sign its own output
+would sit in a binary anyone can download and read. A signature would have to
+come from somewhere the submitter does not control, and every arrangement of
+that — CI runners, attestation workflows — either measures someone else's
+hardware or asks you to install a build agent on yours. Neither is a benchmark
+you run with one command, so the board does not pretend otherwise: results are
+self-reported, the checksum says which build produced them, and that is what
+makes two of them comparable.
 
 [rel]: https://github.com/lukaszsobala/cross-platform-benchmark/releases/latest

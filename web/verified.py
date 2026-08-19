@@ -12,8 +12,8 @@ attaches to a release, next to the binaries it describes. Loading it stores the
 SHA-256 of each published binary; a run whose `build.binary_sha256` matches one
 is labelled with that release on the board -- in grey, not as a badge, because
 the digest is a field the submitter wrote. It says which binary the run claims,
-which is the comparability question and not the honesty one. What a badge takes
-is an attestation; see web/README.md.
+which is the comparability question and not the honesty one. It is the only
+such check the hub makes, and deliberately so; see web/README.md.
 
 Runs already in the database are verified retroactively, because the match is a
 join rather than a stamp. So loading a manifest late costs nothing, and there is

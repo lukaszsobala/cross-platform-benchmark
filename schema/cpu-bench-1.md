@@ -70,10 +70,9 @@ matching run as that release's build.
 inside a document its submitter wrote, so copying an official digest into a
 hand-edited file produces exactly the same bytes as running the official build.
 Nor could the benchmark sign its own output to fix that: a key inside a public
-binary is a key anyone can extract. Evidence has to come from somewhere the
-submitter does not control, which is what
-[the measure workflow](../.github/workflows/measure.yml) and the hub's
-attestation checking are for — see
+binary is a key anyone can extract. Evidence would have to come from somewhere
+the submitter does not control, and there is no such place that is also a
+benchmark you run with one command — so the hub does not claim one; see
 [web/README.md](../web/README.md#what-a-result-proves). What this field buys on
 its own is that two results claiming one digest were produced by the same
 machine code, which is the comparability question rather than the honesty one.

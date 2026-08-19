@@ -30,7 +30,6 @@ const state = {
   submitter: "",        // board narrowed to one account's uploads, by name
   files: [],            // result documents chosen but not yet uploaded
   release: null,        // the newest release this hub verifies against, if any
-  signed: null,         // {ci, attested}: how many runs carry an outside signature
 };
 
 // How many results a list may show at once. The server clamps every listing to
@@ -476,104 +475,42 @@ function metricCells(tr, row) {
   for (const m of shownMetrics()) tr.append(el("td", "num", fmt(value(row, m))));
 }
 
-// Three different claims, and the display has to keep them apart or the
-// strongest one is worth nothing.
+// The one mark a row can carry: the result named a binary that a release
+// published, so it is comparable with every other row naming that release.
 //
-//   ci         GitHub signed a token over these exact result bytes, from a job
-//              on a GitHub-hosted runner running our pinned workflow. Nothing
-//              in that chain is the submitter's.
-//   attested   the same signed chain, on the submitter's own runner. It rules
-//              out editing the file; it does not rule out the machine's owner.
-//   release    the document says it came from a published binary. The document
-//              is the submitter's, so this is a claim, not a check -- which is
-//              why it is grey text rather than a mark.
+// There is deliberately nothing stronger. A benchmark cannot vouch for its own
+// numbers -- a key inside a downloadable binary is a key anyone can read out of
+// it -- so the only stronger mark would have to be signed by someone who is not
+// the submitter, and every way of arranging that means running the benchmark
+// inside a CI job rather than with one command. That is not this tool.
 //
-// The mark says who signed, not how good the result is. "verified" read as a
-// verdict on the numbers, which is the one thing no signature here speaks to --
-// so each label now names the signer, and there is nothing left for a reader to
-// infer. The wire values (`ci`, `attested`) are the API's and do not move.
-const TRUST = {
-  ci: {
-    label: "github-signed",
-    cls: "badge",
-    tip: (r) => `GitHub signed these exact result bytes as measured on a ` +
-                `GitHub-hosted runner by ` +
-                `${r.attest_workflow || "the pinned workflow"} — no part of ` +
-                `that chain belongs to the submitter`,
-  },
-  attested: {
-    label: "signed, own machine",
-    cls: "badge weak",
-    tip: () => "signed by GitHub as a run of the pinned workflow, on a " +
-               "self-hosted runner — the chain holds, the machine belongs to " +
-               "the submitter",
-  },
-};
-
+// The tag is the newest release those exact bytes appear in, which is the hub's
+// answer and not the run's: a binary unchanged across four releases is one
+// binary, and labelling it with the oldest of them would split one population
+// of comparable runs into four that look like different builds.
 function trustBadge(row) {
-  const kind = TRUST[row.attest_tier];
-  if (kind) {
-    const mark = el("span", kind.cls, kind.label);
-    mark.title = kind.tip(row);
-    return mark;
-  }
-  if (row.release_build) {
-    // Not a badge, and not a demotion either: this is what an ordinary good
-    // result looks like. The digest matches a binary that release published, so
-    // the row is comparable with every other row claiming it -- which is the
-    // question the mark answers. Who ran it is still the submitter's own word.
-    //
-    // The tag is the newest release those exact bytes appear in, which is the
-    // hub's answer and not the run's: a binary unchanged across four releases
-    // is one binary, and labelling it with the oldest of them would split one
-    // population of comparable runs into four that look like different builds.
-    const mark = el("span", "claim", `${row.release_build} build`);
-    mark.title = `this result names the same program ${row.release_build} ` +
-                 `published, so it compares directly with other ` +
-                 `${row.release_build} results — that it does so is the ` +
-                 `result's own word, not something checked here`;
-    return mark;
-  }
-  return null;
+  if (!row.release_build) return null;
+  const mark = el("span", "claim", `${row.release_build} build`);
+  mark.title = `this result names the same program ${row.release_build} ` +
+               `published, so it compares directly with other ` +
+               `${row.release_build} results — that it does so is the ` +
+               `result's own word, not something checked here`;
+  return mark;
 }
 
-// The legend under the board. Written from what this hub actually holds, for one
-// reason: the old one was three fixed sentences, two of which described marks no
-// run here had ever earned, and it led with them. A reader whose every row said
-// "claims a release build" was being told, at length, about two better things
-// they could not have -- so the ordinary case read as a failing grade when it is
-// in fact how the board is meant to be used.
+// The legend under the board: what the one mark on a row means, and what the
+// board is honest about. Short on purpose. It used to explain two stronger
+// marks that nobody reading it could ever earn, which made the ordinary result
+// -- the only kind there is -- read as a failing grade.
 //
-// So the badges are explained only where some row carries one, and otherwise the
-// space goes to what earning one takes. The release name comes from the hub, not
-// from a tag typed into the HTML.
+// The release name comes from the hub rather than from a tag typed into the
+// HTML, so a hub that verifies nothing simply says less.
 function renderBoardLegend() {
   const box = $("#board-legend");
   if (!box) return;
   box.replaceChildren();
   const p = el("p", "note");
   const say = (text) => p.append(el("span", null, text));
-  const badge = (tier) => p.append(
-    el("span", TRUST[tier].cls, TRUST[tier].label));
-
-  // Present tense only for marks that are on the board right now. `known` is
-  // whether /api/stats answered at all: with no counts in hand the legend still
-  // has to read as a sentence, but it must not claim a number it never saw.
-  const known = !!state.signed;
-  const signed = state.signed || {};
-  const ci = signed.ci || 0;
-  const attested = signed.attested || 0;
-
-  if (ci) {
-    badge("ci");
-    say(" GitHub signed these exact numbers, measured on its own runner — " +
-        "nothing in that chain belongs to the submitter. ");
-  }
-  if (attested) {
-    badge("attested");
-    say(" the same signed workflow on the submitter's own machine: the " +
-        "signatures hold, the hardware is theirs. ");
-  }
 
   const rel = state.release && state.release.release;
   if (rel) {
@@ -582,35 +519,10 @@ function renderBoardLegend() {
         `published — running the same program is what makes two results ` +
         `comparable. `);
   }
-  // "Everything else" needs something to be else than, so it is only said where
-  // a mark was actually explained above it.
-  say(ci || attested
-      ? "Everything else is self-reported: the normal case, and it ranks " +
-        "exactly the same."
-      : "Every result here is self-reported: the normal case, and they all " +
-        "rank exactly the same.");
-
+  say("Every result here is self-reported, which is the normal case and the " +
+      "only one: a benchmark cannot prove it was run, so nothing on this " +
+      "board claims to. They all rank exactly the same.");
   box.append(p);
-
-  // What a signature costs, said once, where it is relevant -- and only when
-  // there is none to point at, so it reads as an invitation rather than as a
-  // standing complaint about everyone's rows.
-  if (!ci && !attested) {
-    const how = el("p", "note");
-    how.append(el("span", null,
-      (known ? "No result here carries an outside signature yet. Earning one takes the "
-             : "Earning a mark takes the ") +
-      "measure workflow: GitHub runs the benchmark and signs the exact numbers it " +
-      "got, on its own machines or on yours. A file you sent yourself cannot " +
-      "stand in for that, however honest the run behind it — see "));
-    // A button, not an anchor: the tabs are not hash-routed, so a link to
-    // "#upload" would set a hash that syncHash() then wipes and switch nothing.
-    const go = el("button", "linkish", "Submit a result");
-    go.type = "button";
-    go.addEventListener("click", () => showTab("upload"));
-    how.append(go, el("span", null, "."));
-    box.append(how);
-  }
 }
 
 function filterBySubmitter(name) {
@@ -973,18 +885,11 @@ async function showRun(id) {
     ["build", `${run.compiler || "?"}${run.compiler_version && run.compiler_version !== run.compiler ? ` (${run.compiler_version})` : ""}` +
               ` · ${run.vectorize ? "vectorize on" : "vectorize off"} · ${run.fma ? "FMA on" : "FMA off"}`],
     ["flags", run.build_flags ? `${run.cc || "cc"} ${run.build_flags}` : null],
-    // What the run says about itself, then what someone else signed about it.
-    // Kept as two lines because they are two different kinds of statement.
     ["binary", run.binary_sha256
       ? `sha256:${run.binary_sha256}` +
         (run.release_build
           ? ` — matches a ${run.release_build} binary, as reported by the run`
           : " — not a published build, or a local one")
-      : null],
-    ["attested", run.attest_tier
-      ? `${run.attest_tier === "ci" ? "GitHub-hosted runner" : "self-hosted runner"}` +
-        ` · ${run.attest_workflow || ""}` +
-        (run.attest_repo ? ` · called from ${run.attest_repo}` : "")
       : null],
     ["config", `${run.threads ?? "?"} threads · ${run.seconds ?? "?"}s/phase × ${run.reps ?? "?"} reps · ` +
                 `${run.mem_bytes ? (run.mem_bytes / 1048576).toFixed(0) + " MiB/thread" : "no memory phases"} · ` +
@@ -1055,15 +960,6 @@ async function showRun(id) {
   dl.setAttribute("download", `cpcpub-run-${run.id}.json`);
   const dlp = el("p");
   dlp.append(dl);
-  // The public log of the job that produced it. The signature is the proof;
-  // this is how a reader goes and looks at what was signed.
-  if (run.attest_run_url) {
-    const job = el("a", "linkish", "the CI run that produced it");
-    job.href = run.attest_run_url;
-    job.rel = "noopener noreferrer";
-    job.target = "_blank";
-    dlp.append(el("span", "muted", " · "), job);
-  }
   box.append(dlp);
 
   $("#detail").hidden = false;
@@ -1475,49 +1371,36 @@ function renderAccount() {
 // The two shell blocks on the Submit tab. Both carry this hub's address, and
 // both carry the token when there is one to carry -- a command you have to
 // edit before it works is a command most people will get wrong once.
-// What a mark actually costs, said where someone is about to produce a result
-// rather than only where they read one. The honest version: uploading from here
-// cannot earn one, because nothing about a file you hand a web page is
-// checkable. Saying so is better than implying the badge is within reach.
+// Said where someone is about to produce a result rather than only where they
+// read one: every result here is self-reported, and that is the design and not
+// a shortfall. This used to explain how to earn a signature instead, which sent
+// people towards a CI setup most of them could not use and none of them needed.
 function renderVerifiedNote() {
   const box = $("#verified-note");
   box.replaceChildren();
-  const line = (...kids) => { const p = el("p", "note"); p.append(...kids); return p; };
-
-  box.append(line(
-    el("span", null, "Uploading a file — from here or from a shell — is "),
+  const p = el("p", "note");
+  p.append(
+    el("span", null, "Every result on this board is "),
     el("strong", null, "self-reported"),
-    el("span", null, ". That is the normal way to use this board and the " +
-                     "numbers rank the same. It simply cannot be checked: the " +
-                     "file names the program that produced it, but you sent " +
-                     "the file, so that is a claim rather than evidence.")));
-
-  // The badge text comes from TRUST, so this paragraph cannot drift out of step
-  // with what the board actually prints on a row.
-  const mark = (tier) => el("span", TRUST[tier].cls, TRUST[tier].label);
-  const how = el("p", "note");
-  how.append(el("span", null, "For either mark, the measurement has to be " +
-    "signed by someone who is not you: run the measure workflow from your own " +
-    "repository and GitHub signs the exact numbers that run produced. On a " +
-    "machine of GitHub's own that is "));
-  how.append(mark("ci"));
-  how.append(el("span", null, "; on a runner you host yourself — your own " +
-    "hardware, which is the only way an interesting machine gets a mark — it is "));
-  how.append(mark("attested"));
-  how.append(el("span", null, ", because the signatures hold but the machine is yours."));
-  box.append(how);
+    el("span", null, ", including yours. A benchmark cannot prove it was run: " +
+                     "any key it carried to sign its own numbers would sit in " +
+                     "a program anyone can download and read. So nothing here " +
+                     "is a verdict on your numbers — what the board does check " +
+                     "is which build produced them, which is what makes two " +
+                     "results comparable. Use a published binary and they are."));
+  box.append(p);
 
   if (state.release) {
-    const p = el("p", "note");
-    p.append(el("span", null, "Published binaries and the workflow to call: "));
+    const line = el("p", "note");
+    line.append(el("span", null, "Published binaries: "));
     const link = el("a", "linkish", state.release.release);
     if (state.release.url) {
       link.href = state.release.url;
       link.rel = "noopener noreferrer";
       link.target = "_blank";
     }
-    p.append(link, el("span", null, "."));
-    box.append(p);
+    line.append(link, el("span", null, "."));
+    box.append(line);
   }
 }
 
@@ -2057,13 +1940,12 @@ async function boot() {
   const meta = await api("/api/metrics");
   state.metrics = meta.metrics;
 
-  // Which release this hub verifies against and how many runs carry a
-  // signature, both of which the legend is written from. Not fatal if it fails:
-  // the board is readable without it, and renderBoardLegend() has already run
-  // once with what little that leaves it.
+  // Which release this hub verifies against, and how many results it holds
+  // per architecture. Not fatal if it fails: the board is readable without it,
+  // and both the legend and the Arch picker have already been drawn once with
+  // what little that leaves them.
   api("/api/stats").then((s) => {
     state.release = s.release || null;
-    state.signed = s.attested || null;
     fillTargets(s.targets || []);
     renderBoardLegend();
     renderVerifiedNote();

@@ -24,10 +24,6 @@ from typing import Any
 
 import server as srv
 
-# The token helpers live with the tests that exercise them; here they are only
-# a way to produce a signature the hub will accept.
-import test_attest as ta
-
 
 def core(scope="cpu", cpu: int | None = 0, **over):
     rec: dict[str, object] = {
@@ -678,6 +674,22 @@ class VerifiedTest(unittest.TestCase):
         _, board = b.call("/api/cores?scope=cpu&verified=release&limit=200")
         self.assertNotIn(out["id"], [c["run_id"] for c in board["cores"]])
 
+    def test_the_old_filter_spellings_still_answer(self):
+        """`verified=ci|attested|1` were the GitHub-signature tiers this hub
+        used to keep. The marks are gone; a saved link that names one must
+        still answer as the release filter rather than break."""
+        self.store.add_verified_builds(manifest("v1.2.3", [DIGEST_A]))
+        _, out = self.upload(DIGEST_A)
+        b = Browser(self.base)
+        for spelling in ("release", "ci", "attested", "1", "true"):
+            code, board = b.call(f"/api/cores?scope=cpu&verified={spelling}")
+            self.assertEqual(code, 200, spelling)
+            self.assertIn(out["id"], [c["run_id"] for c in board["cores"]], spelling)
+
+    def test_a_bad_filter_value_is_refused(self):
+        code, _ = Browser(self.base).call("/api/cores?verified=sort-of")
+        self.assertEqual(code, 400)
+
     def test_loading_a_manifest_marks_runs_already_stored(self):
         """The reason the match is a join and not a stamp at upload time."""
         _, out = self.upload(DIGEST_A)
@@ -873,174 +885,6 @@ class VerifiedBuildsMigrationTest(unittest.TestCase):
         srv.Store(self.db)
         before = srv.Store(self.db).verified_builds()
         self.assertEqual(before, srv.Store(self.db).verified_builds())
-
-
-class AttestedUploadTest(unittest.TestCase):
-    """Attestations as an upload sees them: signed bytes, or no mark at all.
-
-    The token machinery is tested in test_attest.py; this is about the hub
-    refusing to store a mark it did not check, and refusing an upload whose
-    proof does not hold.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory()
-        cls.server = srv.build_server(str(Path(cls.tmp.name) / "at.sqlite3"),
-                                      "127.0.0.1", 0, rate_limit=0)
-        # The issuer's keys, replaced with the test key. Nothing here touches
-        # the network.
-        store = ta.attest.KeyStore()
-        store.keys = {"test-key": (ta.N, ta.E)}
-        store.fetched = time.monotonic()
-        cls.server.attest = (store, [ta.WORKFLOW])
-        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-        cls.tmp.cleanup()
-
-    def post(self, body: bytes, token=None):
-        headers = {"Content-Type": "application/json"}
-        if token:
-            headers[srv.ATTEST_HEADER] = token
-        req = urllib.request.Request(self.base + "/api/runs", data=body,
-                                     method="POST", headers=headers)
-        try:
-            with urllib.request.urlopen(req) as resp:
-                return resp.status, json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read())
-
-    def signed(self, body: bytes, **over):
-        """A token GitHub would have issued for exactly these bytes."""
-        aud = ta.attest.AUDIENCE_PREFIX + hashlib.sha256(body).hexdigest()
-        return ta.sign(ta.claims(aud=aud, **over))
-
-    def body(self, **over):
-        # Serialised once and posted verbatim: the signature is over bytes, so
-        # a test that re-serialises would be testing something else.
-        return json.dumps(document(**over)).encode()
-
-    def test_an_attested_upload_is_marked_ci(self):
-        body = self.body()
-        status, out = self.post(body, self.signed(body))
-        self.assertEqual(status, 201, out)
-        self.assertEqual(out["attested"], "ci")
-        _, run = Browser(self.base).call(f"/api/runs/{out['id']}")
-        self.assertEqual(run["attest_tier"], "ci")
-        self.assertEqual(run["attest_repo"], "someone/their-hardware")
-        self.assertIn("measure.yml", run["attest_workflow"])
-        self.assertTrue(run["attest_at"])
-
-    def test_a_self_hosted_run_is_marked_lower(self):
-        body = self.body(label="on my own machine")
-        status, out = self.post(body, self.signed(body,
-                                                  runner_environment="self-hosted"))
-        self.assertEqual(status, 201)
-        self.assertEqual(out["attested"], "attested")
-
-    def test_editing_the_result_invalidates_the_proof(self):
-        """The complaint this whole mechanism answers."""
-        honest = self.body()
-        token = self.signed(honest)
-        cheated = honest.replace(b"20000.0", b"99999.0")
-        self.assertNotEqual(honest, cheated)
-        code, err = self.post(cheated, token)
-        self.assertEqual(code, 403)
-        self.assertIn("different document", err["error"])
-
-    def test_a_token_cannot_be_reused_for_a_second_run(self):
-        first = self.body()
-        token = self.signed(first)
-        self.assertEqual(self.post(first, token)[0], 201)
-        second = self.body(label="a different machine entirely")
-        code, _ = self.post(second, token)
-        self.assertEqual(code, 403)
-
-    def test_a_forged_token_is_refused_and_nothing_is_stored(self):
-        body = self.body(label="forged")
-        head, claims_b64, sig = self.signed(body).split(".")
-        code, _ = self.post(body, f"{head}.{claims_b64}.{sig[:-4]}AAAA")
-        self.assertEqual(code, 403)
-        _, listing = Browser(self.base).call("/api/runs?limit=200")
-        self.assertNotIn("forged", [r["label"] for r in listing["runs"]])
-
-    def test_a_workflow_this_hub_does_not_know_is_refused(self):
-        body = self.body()
-        token = self.signed(
-            body, job_workflow_ref="someone/else/.github/workflows/x.yml@refs/heads/main")
-        code, err = self.post(body, token)
-        self.assertEqual(code, 403)
-        self.assertIn("does not measure with", err["error"])
-
-    def test_an_ordinary_upload_carries_no_mark(self):
-        status, out = self.post(self.body())
-        self.assertEqual(status, 201)
-        self.assertIsNone(out["attested"])
-        _, run = Browser(self.base).call(f"/api/runs/{out['id']}")
-        self.assertIsNone(run["attest_tier"])
-
-    def test_the_filters_keep_the_tiers_apart(self):
-        b1 = self.body(label="hosted")
-        self.post(b1, self.signed(b1))
-        b2 = self.body(label="self hosted")
-        self.post(b2, self.signed(b2, runner_environment="self-hosted"))
-        self.post(self.body(label="plain"))
-        b = Browser(self.base)
-
-        def labels(query):
-            _, out = b.call(f"/api/cores?scope=cpu&limit=200&{query}")
-            return {c["label"] for c in out["cores"]}
-
-        self.assertEqual(labels("verified=ci") & {"hosted", "self hosted", "plain"},
-                         {"hosted"})
-        self.assertEqual(labels("verified=attested") & {"hosted", "self hosted", "plain"},
-                         {"hosted", "self hosted"})
-        self.assertNotIn("plain", labels("verified=attested"))
-
-    def test_a_bad_filter_value_is_refused(self):
-        code, _ = Browser(self.base).call("/api/cores?verified=sort-of")
-        self.assertEqual(code, 400)
-
-    def test_stats_count_the_tiers_separately(self):
-        _, stats = Browser(self.base).call("/api/stats")
-        self.assertIn("ci", stats["attested"])
-        self.assertIn("attested", stats["attested"])
-        self.assertIn("release_builds", stats)
-
-
-class AttestationRefusedTest(unittest.TestCase):
-    """A hub told to accept no attestations must not quietly accept them."""
-
-    def test_a_hub_with_no_policy_refuses_tokens(self):
-        with tempfile.TemporaryDirectory() as d:
-            server = srv.build_server(str(Path(d) / "n.sqlite3"), "127.0.0.1", 0,
-                                      rate_limit=0, attest_workflows=[])
-            base = f"http://127.0.0.1:{server.server_address[1]}"
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                body = json.dumps(document()).encode()
-                aud = ta.attest.AUDIENCE_PREFIX + hashlib.sha256(body).hexdigest()
-                req = urllib.request.Request(
-                    base + "/api/runs", data=body, method="POST",
-                    headers={"Content-Type": "application/json",
-                             srv.ATTEST_HEADER: ta.sign(ta.claims(aud=aud))})
-                with self.assertRaises(urllib.error.HTTPError) as cm:
-                    urllib.request.urlopen(req)
-                self.assertEqual(cm.exception.code, 501)
-                # ...and an unattested upload still works.
-                self.assertEqual(urllib.request.urlopen(urllib.request.Request(
-                    base + "/api/runs", data=body, method="POST",
-                    headers={"Content-Type": "application/json"})).status, 201)
-            finally:
-                server.shutdown()
-                server.server_close()
 
 
 class AccountTest(unittest.TestCase):

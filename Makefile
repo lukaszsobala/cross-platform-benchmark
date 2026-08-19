@@ -44,7 +44,6 @@ contract: bench
 
 test:
 	@$(PYTHON) web/test_server.py
-	@$(PYTHON) web/test_attest.py
 
 # A committed sample of real output: the fixture the contract test uses when no
 # binary is built, and the reference for what the schema actually looks like.

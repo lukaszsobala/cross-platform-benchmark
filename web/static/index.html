@@ -60,11 +60,9 @@
     <label title="how many results this page asks for at once">Show
       <select name="limit"></select>
     </label>
-    <label>Trust
+    <label title="show only results that name a binary we published, which is what makes two of them comparable">Build
       <select name="verified">
-        <option value="">anything</option>
-        <option value="attested">signed by GitHub</option>
-        <option value="ci">signed, on GitHub's runners</option>
+        <option value="">any</option>
         <option value="release">from a published binary</option>
       </select>
     </label>
@@ -78,9 +76,8 @@
   <div id="board-chip" hidden></div>
 
   <p class="note">
-    Compare like with like. <strong>Vectorize</strong> and <strong>FMA</strong> are
-    build switches that let one instruction do more arithmetic at a time, so a
-    result built with them beats one built without on the very same machine.
+    Only runs with the same <strong>Vectorize</strong> and <strong>FMA</strong> are
+    comparable.
   </p>
   <!-- Filled by renderBoardLegend(): which marks to explain depends on which
        ones any row here carries, and the release name is the hub's, not a tag
@@ -97,9 +94,7 @@
 
 <section id="compare" class="tab">
   <p class="note" id="compare-note">
-    Tick rows in the leaderboard to compare them here. One comparison holds one
-    kind of row: changing <strong>Rank by</strong> moves the same machines over
-    to whole-machine, best-core or best-thread rather than mixing them.
+    Tick rows in the leaderboard to compare them here.
   </p>
   <div class="cmpbar" id="compare-bar" hidden>
     <label class="check" title="show every metric, not just the headline ones">

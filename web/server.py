@@ -43,7 +43,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
-import attest
 
 HERE = Path(__file__).resolve().parent
 STATIC_DIR = HERE / "static"
@@ -61,7 +60,6 @@ BUILDS_SCHEMA_ID = "cpu-bench-builds/1"
 # Where an upload carries its proof, when it has one. A header rather than a
 # field in the document, because the signature is over the document's exact
 # bytes and cannot be inside them.
-ATTEST_HEADER = "X-CPU-Bench-Attestation"
 
 MAX_BODY = 1 << 20          # 1 MiB: a --per-core dump of 256 CPUs is ~120 KiB
 MAX_AUTH_BODY = 4096        # a name and a password; anything larger is noise
@@ -204,10 +202,10 @@ SUBMITTER = "(SELECT u.name FROM users u WHERE u.id = r.user_id) AS user"
 # afterwards then marks the runs already sitting in it, instead of leaving them
 # unmarked for having arrived first.
 #
-# Deliberately not called "verified" any more. It rests on a digest the
-# submitter wrote into their own document, so it says which build a result
-# claims -- useful, and not a proof of anything. The proof, where there is one,
-# is in the attest_* columns, which only a signature can set.
+# Deliberately not called "verified". It rests on a checksum the submitter
+# wrote into their own document, so it says which build a result claims --
+# which is what makes two results comparable, and is not a proof of anything.
+# Nothing here can be: see the note on `verified` in the API.
 #
 # The newest release that published those bytes, where several did. Most
 # releases rebuild a target without changing it -- same source, same pinned
@@ -222,8 +220,7 @@ RELEASE_BUILD = ("(SELECT vb.release FROM verified_builds vb "
 
 RUN_COLUMNS = [
     "id", "created_at", "label", "notes", "mode", "binary_sha256",
-    "attest_tier", "attest_repo", "attest_workflow", "attest_run_url",
-    "attest_at", "compiler",
+    "compiler",
     "compiler_version", "cc", "build_flags", "target",
     "vectorize", "fma", "sysname", "os_release", "machine", "cpus",
     "cpu_models", "threads", "seconds", "reps", "warmup", "mem_bytes", "pin",
@@ -700,6 +697,10 @@ def sort_expr(sort: str, norm: str) -> str:
 
 
 class Store:
+    # The attest_* columns are vestigial: the hub once accepted GitHub
+    # signatures over a result, and no longer does. They stay on the table so
+    # a database written by an older build still opens and still holds what it
+    # recorded, but nothing reads or writes them. See schema.sql.
     ADDED_COLUMNS = (("compiler_version", "TEXT"), ("cc", "TEXT"),
                      ("build_flags", "TEXT"), ("user_id", "INTEGER"),
                      ("binary_sha256", "TEXT"), ("attest_tier", "TEXT"),
@@ -783,18 +784,8 @@ class Store:
 
     def insert(self, run: dict, cores: list[dict], raw: str,
                label: str | None, notes: str | None,
-               user_id: int | None = None,
-               attest: dict | None = None) -> tuple[int, str]:
+               user_id: int | None = None) -> tuple[int, str]:
         token = secrets.token_urlsafe(24)
-        # Stamped rather than joined, unlike release_build: this was checked
-        # against these exact bytes at this exact moment, and re-deriving it
-        # later is not possible -- the token is short-lived by design.
-        if attest:
-            run = dict(run, attest_tier=attest["tier"],
-                       attest_repo=attest["repository"],
-                       attest_workflow=attest["workflow_ref"],
-                       attest_run_url=attest["run_url"],
-                       attest_at=iso_now())
         # The delete token is issued whether or not an account owns the run:
         # signing in later must not be the only way back to something uploaded
         # from a shell, and an account holder loses nothing by also having one.
@@ -896,13 +887,10 @@ class Store:
         if user_id is not None:
             where.append("r.user_id = ?")
             args.append(user_id)
-        # Three different questions, kept apart because conflating them is the
-        # whole complaint against a self-reported badge.
-        if verified == "ci":
-            where.append("r.attest_tier = 'ci'")
-        elif verified == "attested":
-            where.append("r.attest_tier IN ('ci', 'attested')")
-        elif verified == "release":
+        # The one question a hub can actually answer about an upload: does
+        # the checksum in it name a binary some release published. Not whether
+        # the numbers are honest -- nothing here can establish that.
+        if verified == "release":
             where.append("EXISTS (SELECT 1 FROM verified_builds vb "
                          "WHERE vb.sha256 = r.binary_sha256)")
         if target:
@@ -984,7 +972,7 @@ class Store:
             # board prints -- Linux, Windows, macOS -- so the release string
             # this run also carries stays on the run's own page.
             f"       r.sysname, "
-            f"       {SUBMITTER}, {RELEASE_BUILD}, r.attest_tier, "
+            f"       {SUBMITTER}, {RELEASE_BUILD}, "
             f"       m.peers AS records "
             f"FROM matched m "
             f"JOIN cores c ON c.id = m.core_id "
@@ -1047,9 +1035,6 @@ class Store:
                 "SELECT COUNT(*) AS n FROM runs r WHERE EXISTS "
                 "(SELECT 1 FROM verified_builds vb "
                 " WHERE vb.sha256 = r.binary_sha256)").fetchone()["n"]
-            attested = {r["tier"]: r["n"] for r in db.execute(
-                "SELECT attest_tier AS tier, COUNT(*) AS n FROM runs "
-                "WHERE attest_tier IS NOT NULL GROUP BY tier")}
             targets = db.execute(
                 "SELECT target, COUNT(*) AS n FROM runs WHERE target IS NOT NULL "
                 "GROUP BY target ORDER BY n DESC").fetchall()
@@ -1064,12 +1049,6 @@ class Store:
         if latest and latest["release"]:
             release = {"release": latest["release"], "url": latest["release_url"]}
         return {"runs": runs, "records": cores, "users": users,
-                # Three separate numbers on purpose: how many results carry a
-                # signature nobody could have written (ci), how many went
-                # through the workflow on the submitter's own machine
-                # (attested), and how many merely claim a release binary.
-                "attested": {"ci": attested.get("ci", 0),
-                             "attested": attested.get("attested", 0)},
                 "release_builds": release_builds, "release": release,
                 "targets": [dict(t) for t in targets]}
 
@@ -1836,14 +1815,15 @@ class Handler(BaseHTTPRequestHandler):
                 ids = [int(x) for x in raw_ids.split(",") if x][:64]
             except ValueError:
                 raise Invalid("ids must be a comma-separated list of integers")
-        # `1` used to mean "the digest matched a release". It now means the
-        # strongest thing on offer, because a filter that quietly kept its old,
-        # weaker meaning is exactly the confusion this rework is about.
+        # One value left. `1`, `ci` and `attested` are older spellings from
+        # when this hub also checked GitHub signatures; they are kept working
+        # as the release filter rather than turned into errors, so a saved link
+        # or a script still answers instead of breaking.
         verified = one("verified")
-        if verified in ("1", "true"):
-            verified = "attested"
-        if verified is not None and verified not in ("ci", "attested", "release"):
-            raise Invalid("verified must be 'ci', 'attested' or 'release'")
+        if verified in ("1", "true", "ci", "attested"):
+            verified = "release"
+        if verified is not None and verified != "release":
+            raise Invalid("verified must be 'release'")
 
         flag = {"1": 1, "0": 0, "true": 1, "false": 0}
         # Held as one mapping because the rows and their count must be asked
@@ -1960,51 +1940,17 @@ class Handler(BaseHTTPRequestHandler):
             label = label or _text(payload.get("label"), MAX_TEXT, "label")
             notes = notes or _text(payload.get("notes"), MAX_NOTES, "notes")
 
-        # Checked over `raw` -- the bytes as received, before any parsing --
-        # because that is what the signature covers. Re-serialising the parsed
-        # document first would break every attestation, and quietly accepting
-        # one that no longer matched would be worse.
-        attestation = self.check_attestation(raw)
-
         run, cores = validate(payload)
         run_id, token = self.store.insert(
             run, cores, raw.decode("utf-8"), label, notes,
-            user_id=user["id"] if user else None, attest=attestation)
+            user_id=user["id"] if user else None)
         self.send_json(HTTPStatus.CREATED, {
             "id": run_id,
             "delete_token": token,
             "user": user["name"] if user else None,
-            "attested": attestation["tier"] if attestation else None,
             "url": f"/#run={run_id}",
             "records": len(cores),
         })
-
-    def check_attestation(self, raw: bytes) -> dict | None:
-        """Verify the attestation header, if one was sent.
-
-        A refusal fails the whole upload rather than storing the run without
-        the mark. Someone who went to the trouble of attesting a result needs
-        to hear that it did not take; silently downgrading them to an ordinary
-        row is how a hub ends up full of results nobody can explain.
-        """
-        token = self.headers.get(ATTEST_HEADER)
-        if not token:
-            return None
-        verifier = self.hub.attest
-        if verifier is None:
-            raise Denied("this hub does not accept attestations",
-                         HTTPStatus.NOT_IMPLEMENTED)
-        keys, workflows = verifier
-        try:
-            return attest.check(token.strip(), raw, keys, workflows)
-        except attest.AttestationError as e:
-            raise Denied(f"attestation rejected: {e}")
-        except OSError as e:
-            # The issuer's keys could not be fetched. Not the submitter's
-            # fault, and not something to record as a failed attestation.
-            self.log_message("JWKS fetch failed: %r", e)
-            raise HttpError(HTTPStatus.SERVICE_UNAVAILABLE,
-                            "cannot check attestations right now; try again")
 
     def static(self, path: str):
         if path in ("/", ""):
@@ -2026,12 +1972,6 @@ def clamp_int(v, lo: int, hi: int, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(lo, min(hi, n))
-
-
-# What it takes to check an attestation: the issuer's keys, and the workflows
-# whose tokens this hub will act on. Both together or neither -- keys without a
-# workflow allowlist would verify a signature and learn nothing from it.
-Verifier = tuple[attest.KeyStore, list[str]]
 
 
 class Server(ThreadingHTTPServer):
@@ -2059,26 +1999,16 @@ class Server(ThreadingHTTPServer):
     register_pow: int = REGISTER_POW_BITS
     signup_token: str | None = None
     trust_proxy: bool = False
-    # The keys to check attestations against and the workflows to accept them
-    # from, or None for a hub that takes no attestations at all.
-    attest: Verifier | None = None
 
 
 def build_server(db_path: str, host: str, port: int, *, rate_limit: int = 30,
                  window: float = 3600.0, trust_proxy: bool = False,
-                 auth_limit: int = 20, attest_workflows: list[str] | None = None,
-                 jwks_file: str | None = None, register_open: bool = True,
+                 auth_limit: int = 20, register_open: bool = True,
                  register_pow: int = REGISTER_POW_BITS,
                  register_limit: int = 5,
                  signup_token: str | None = None) -> Server:
     srv = Server((host, port), Handler)
     srv.store = Store(db_path)
-    # An empty workflow list refuses attestations, spelled explicitly: a hub
-    # that trusts no workflow can verify nothing, and should say so rather than
-    # accept tokens it has no policy for.
-    workflows = [attest.DEFAULT_WORKFLOW] if attest_workflows is None \
-        else [w for w in attest_workflows if w]
-    srv.attest = (attest.KeyStore(path=jwks_file), workflows) if workflows else None
     srv.limiter = RateLimiter(rate_limit, window)
     # Sign-ins are limited separately and much harder: uploading a lot is
     # enthusiasm, trying twenty passwords in a quarter of an hour is not.
@@ -2127,16 +2057,6 @@ def main(argv=None) -> int:
     ap.add_argument("--no-register", action="store_true",
                     help="take no new accounts at all (existing ones, "
                          "anonymous uploads and the board are unaffected)")
-    ap.add_argument("--attest-workflow", action="append", metavar="REF",
-                    help="a job_workflow_ref whose GitHub OIDC attestations "
-                         "this hub accepts, without the @ref part (repeatable; "
-                         f"default {attest.DEFAULT_WORKFLOW})")
-    ap.add_argument("--no-attest", action="store_true",
-                    help="refuse attestations entirely")
-    ap.add_argument("--jwks-file", metavar="PATH",
-                    help="verify against a saved copy of the issuer's keys "
-                         "instead of fetching them (for a hub with no outbound "
-                         "network; refresh it when GitHub rotates keys)")
     ap.add_argument("--trust-proxy", action="store_true",
                     help="take the client address from X-Forwarded-For, and "
                          "the scheme from X-Forwarded-Proto so session cookies "
@@ -2146,8 +2066,6 @@ def main(argv=None) -> int:
     srv = build_server(args.db, args.host, args.port,
                        rate_limit=args.rate_limit, trust_proxy=args.trust_proxy,
                        auth_limit=args.auth_limit,
-                       attest_workflows=[] if args.no_attest else args.attest_workflow,
-                       jwks_file=args.jwks_file,
                        register_open=not args.no_register,
                        register_pow=args.register_pow,
                        register_limit=args.register_limit,

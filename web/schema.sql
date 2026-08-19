@@ -54,19 +54,19 @@ CREATE TABLE IF NOT EXISTS runs (
     -- Matched against verified_builds; see the note on that table.
     binary_sha256 TEXT,
 
-    -- What a third party signed about this upload, if anything. Written at
-    -- upload time and only after checking GitHub's signature over these exact
-    -- bytes, so unlike binary_sha256 it is not something the submitter can
-    -- write. NULL for every ordinary upload, which stays the normal case.
-    --   ci        ran on a GitHub-hosted runner: nothing in the chain is the
-    --             submitter's
-    --   attested  same pinned workflow on the submitter's own runner: the
-    --             chain of signatures holds, the machine does not
+    -- Vestigial, and kept only so a database written by an older build still
+    -- opens and still holds what it recorded. The hub once accepted a GitHub
+    -- OIDC token signed over an uploaded result and stored what it claimed
+    -- here. It no longer does: earning one meant running the benchmark from a
+    -- CI job, on GitHub's own hardware or on a build agent installed on your
+    -- own, which is not a benchmark anybody runs with one command -- and the
+    -- architectures this project exists to compare have no build agent at all.
+    -- Nothing reads or writes these five columns.
     attest_tier     TEXT,
-    attest_repo     TEXT,   -- the repository whose job ran it
-    attest_workflow TEXT,   -- job_workflow_ref, including the ref it was at
-    attest_run_url  TEXT,   -- the public log of the run that produced it
-    attest_at       TEXT,   -- when the hub checked it
+    attest_repo     TEXT,
+    attest_workflow TEXT,
+    attest_run_url  TEXT,
+    attest_at       TEXT,
     compiler      TEXT,               -- "gcc 15.2.0"
     compiler_version TEXT,            -- the toolchain's own version banner
     cc            TEXT,               -- driver invoked, e.g. riscv64-linux-gnu-gcc

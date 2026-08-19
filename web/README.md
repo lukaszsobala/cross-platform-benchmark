@@ -8,7 +8,6 @@ benchmark does not need it.
 python3 server.py                        # http://127.0.0.1:8080
 python3 server.py --db /var/lib/cpcpub/runs.sqlite3 --host 0.0.0.0 --port 8782
 python3 test_server.py                   # the hub's own tests
-python3 test_attest.py                   # what an attestation must be refused for
 ```
 
 From the repo root: `make serve`, `make test`, and `make check` (which also runs
@@ -80,40 +79,41 @@ account), `--auth-limit` (sign-in attempts per address per 15 minutes).
 
 ## What a result proves
 
-| shown as | who vouches for it | what it rules out |
-| --- | --- | --- |
-| **github-signed** | GitHub, over these exact bytes, from a GitHub-hosted runner | everything the submitter could have done |
-| **signed, own machine** | GitHub, same workflow, on a self-hosted runner | editing the result — not an operator tampering with their own runner |
-| `vx.x.x build` | nobody — it is the run's own word | nothing about honesty; it says which binary a run reports, which is what makes runs comparable |
-| nothing | nobody | nothing. A local build, and it ranks the same |
+Nothing about the numbers, and the board says so rather than implying otherwise.
 
-Each mark names its **signer**, deliberately: nothing here is a verdict on the
-numbers, and a badge reading "verified" was taken as one. The API keeps its own
-names — `attest_tier` is `ci` or `attested`, and `?verified=` still filters on
-them — because those are a wire contract; only the display changed. The board
-explains a mark only when some row carries it, so a hub nobody has attested to
-does not advertise two badges over a page of results that cannot have them.
+| shown as | what it means |
+| --- | --- |
+| `vx.x.x build` | the result names the checksum of a binary that release published, so it compares directly with every other result naming it — the run's own word, not a check |
+| nothing | a local build, or one this hub has no manifest for. It ranks exactly the same |
 
-The `vx.x.x` in that third row is the **newest** release publishing those exact
+**A benchmark cannot prove it was run.** Any key it carried to sign its own
+output would sit inside a binary anyone can download and read out. Evidence
+would have to come from somewhere the submitter does not control — and every
+arrangement of that means running the benchmark inside a CI job: either on
+someone else's hardware, which is not the machine you wanted measured, or on a
+build agent installed on your own, which is not a benchmark you run with one
+command. GitHub does not even publish that agent for riscv64, loongarch64,
+ppc64le or s390x, which are half of what this project exists to compare.
+
+So the hub checks the one thing it can, and the one thing a leaderboard
+actually needs: **did these two results come from the same program.** That is
+what `build.binary_sha256` against a release manifest answers, and it is why
+`?verified=release` is the only filter of its kind left. Treat every number on
+the board as self-reported, because it is.
+
+This hub used to accept a GitHub OIDC token signed over an uploaded result and
+stored two trust tiers from it. That is gone: `attest.py`, the `measure.yml`
+workflow and the `--attest-workflow`, `--no-attest` and `--jwks-file` flags no
+longer exist. The `attest_*` columns stay on the `runs` table so an older
+database still opens holding what it recorded, and `?verified=ci`, `=attested`
+and `=1` still answer — as the release filter — so a saved link does not break.
+
+The `vx.x.x` in that first row is the **newest** release publishing those exact
 bytes, not the one that first did. Most releases rebuild every target and only
 some of them come out different, so an unchanged binary is published again by
 each release after it — and a board that named the earliest would split one
 population of identical builds into several that read as different ones. Load
 the manifests in any order you like; the answer does not depend on it.
-
-`build.binary_sha256` sits inside a document the submitter wrote, so matching it
-against a release is a claim, not evidence. Nor can the benchmark sign its own
-output: a key inside a public binary is a key anyone can read out of it. What is
-binding is [`.github/workflows/measure.yml`](../.github/workflows/measure.yml),
-which runs a published binary and asks GitHub for an OIDC token whose audience
-is the SHA-256 of the result it just produced; the hub checks that signature
-against GitHub's keys before storing any mark.
-
-```sh
-python3 server.py --attest-workflow me/mine/.github/workflows/measure.yml
-python3 server.py --no-attest
-python3 server.py --jwks-file github-oidc-keys.json   # hub with no outbound network
-```
 
 Release digests are loaded once per release, and mark runs already stored:
 
@@ -128,11 +128,11 @@ python3 verified.py --db runs.sqlite3 --forget v0.1.0
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/runs?label=&notes=` | upload one document; returns `{id, delete_token, user, attested, records}` |
+| `POST` | `/api/runs?label=&notes=` | upload one document; returns `{id, delete_token, user, records}` |
 | `GET` | `/api/runs?limit=&offset=&user=` | recent runs, optionally one submitter's |
 | `GET` | `/api/runs/<id>`, `/raw`, `/rank` | one run; the document as uploaded; its percentile per metric |
 | `DELETE` | `/api/runs/<id>` | withdraw; needs `X-Delete-Token` or a signed-in owner |
-| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&user=&verified=&sort=&order=&norm=&limit=&offset=` | leaderboard rows: one per upload, each its best record at `sort` |
+| `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&user=&verified=release&sort=&order=&norm=&limit=&offset=` | leaderboard rows: one per upload, each its best record at `sort` |
 | `GET` | `/api/cores?run=<id>` / `?ids=1,2,3` | every record of one run / named records |
 | `GET` | `/api/metrics`, `/api/stats`, `/api/builds` | metric definitions; counts, including one per architecture, which is what fills the board's **Arch** picker; recognised release digests |
 | `GET` | `/api/users/<name>` | public profile: name, since, run count |
@@ -179,4 +179,4 @@ copying it, or `sqlite3 runs.sqlite3 ".backup out.sqlite3"` while it runs.
 
 What is deliberately not here: TLS, password recovery, and any claim that an
 uploaded number was produced by the machine it names. Treat the board as
-self-reported.
+self-reported — see [What a result proves](#what-a-result-proves).
