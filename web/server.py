@@ -980,6 +980,10 @@ class Store:
             f"       c.{', c.'.join(CORE_COLUMNS[3:])}, "
             f"       r.target, r.vectorize, r.fma, r.cpu_models, r.label, "
             f"       r.created_at, r.mode, r.threads, r.compiler, r.machine, "
+            # Which operating system produced it. The family alone is what the
+            # board prints -- Linux, Windows, macOS -- so the release string
+            # this run also carries stays on the run's own page.
+            f"       r.sysname, "
             f"       {SUBMITTER}, {RELEASE_BUILD}, r.attest_tier, "
             f"       m.peers AS records "
             f"FROM matched m "

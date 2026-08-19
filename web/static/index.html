@@ -35,18 +35,15 @@
         <option value="thread">best thread</option>
       </select>
     </label>
-    <label>Arch
-      <select name="target">
-        <option value="">any</option>
-        <option value="x86_64">x86_64</option>
-        <option value="aarch64">aarch64</option>
-        <option value="riscv64">riscv64</option>
-      </select>
+    <!-- Options filled by the page: every architecture the benchmark can
+         report, plus anything else this hub happens to hold. -->
+    <label title="the instruction set the result was measured on">Arch
+      <select name="target"></select>
     </label>
-    <label>Vectorize
+    <label title="a build switch: one instruction works on several numbers at once">Vectorize
       <select name="vectorize"><option value="">any</option><option value="0">off</option><option value="1">on</option></select>
     </label>
-    <label>FMA
+    <label title="a build switch: multiply and add done as one instruction">FMA
       <select name="fma"><option value="">any</option><option value="0">off</option><option value="1">on</option></select>
     </label>
     <label>Values
@@ -81,8 +78,9 @@
   <div id="board-chip" hidden></div>
 
   <p class="note">
-    Results are only comparable between builds with the same <strong>vectorize</strong> and
-    <strong>FMA</strong> flags.
+    Compare like with like. <strong>Vectorize</strong> and <strong>FMA</strong> are
+    build switches that let one instruction do more arithmetic at a time, so a
+    result built with them beats one built without on the very same machine.
   </p>
   <!-- Filled by renderBoardLegend(): which marks to explain depends on which
        ones any row here carries, and the release name is the hub's, not a tag
@@ -99,13 +97,18 @@
 
 <section id="compare" class="tab">
   <p class="note" id="compare-note">
-    Tick rows in the leaderboard to compare them here. A comparison holds one
-    kind of record — changing <strong>Rank by</strong> carries the same machines
-    over to whole-machine, best-core or best-thread rather than mixing them.
+    Tick rows in the leaderboard to compare them here. One comparison holds one
+    kind of row: changing <strong>Rank by</strong> moves the same machines over
+    to whole-machine, best-core or best-thread rather than mixing them.
   </p>
+  <div class="cmpbar" id="compare-bar" hidden>
+    <label class="check" title="show every metric, not just the headline ones">
+      <input type="checkbox" id="compare-detailed"> Detailed
+    </label>
+    <button type="button" id="clearsel" hidden>Clear selection</button>
+  </div>
   <div id="compare-warn"></div>
   <div id="compare-body"></div>
-  <button type="button" id="clearsel" hidden>Clear selection</button>
 </section>
 
 <section id="upload" class="tab">
@@ -113,11 +116,11 @@
     <li>
       <h2>Measure and submit, in one command</h2>
       <p class="note">
-        On the machine you want on the board, with nothing else running:
-        background load depresses every result and biases <code>DISPcap</code>
-        upward. <code>--full</code> is the form worth uploading — the totals say
-        what the machine does at once, the per-core records what each core does
-        alone.
+        On the machine you want on the board, with nothing else running —
+        anything else using the CPU drags every number here down.
+        <code>--full</code> is the form worth uploading: the totals say what the
+        whole machine does at once, the per-core figures what one core does on
+        its own.
       </p>
       <div class="cmd"><pre id="cmd-submit"></pre><button type="button" class="copy" data-copy="cmd-submit">Copy</button></div>
       <p class="note" id="shell-note"></p>
@@ -171,11 +174,11 @@
   <div id="mine-account"></div>
   <h2>Uploaded from this browser</h2>
   <p class="note">
-    Anonymous uploads made here. The delete token is kept in this browser's
-    local storage only — it is the only way to withdraw one, so save it if you
-    care about being able to. Uploads made while signed in need no token: they
-    are on the account and can be withdrawn from anywhere. Tick the ones you
-    want gone and withdraw them together.
+    These were sent without signing in. Removing one needs its delete token,
+    which lives only in this browser — copy it somewhere safe if you might want
+    the upload gone later. Uploads made while
+    signed in need no token: they belong to the account and can be removed from
+    any browser. Tick the ones you want gone and remove them together.
   </p>
   <div id="minelist"></div>
 </section>

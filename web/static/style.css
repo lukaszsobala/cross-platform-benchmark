@@ -181,12 +181,30 @@ th.sorted .sorth { color: var(--accent); }
   display: flex; flex-direction: column; gap: 0.15rem; min-width: 12rem;
 }
 .chip span { color: var(--muted); font-size: 0.75rem; }
+/* the label leads the chip, so it is the one line in it drawn as text and not
+   as small print; the CPU model under it sits between the two. */
+.chip-top { display: flex; align-items: baseline; gap: 0.5rem; justify-content: space-between; }
+.chip-top .linkish { font-weight: 600; text-align: left; }
+.chip .chip-sub { color: var(--ink); font-size: 0.78rem; }
+.chip-x {
+  background: none; border: 0; padding: 0 0.1rem; cursor: pointer;
+  color: var(--muted); font-size: 1rem; line-height: 1; flex: none;
+}
+.chip-x:hover { color: var(--warn); }
 .chip.c0 { border-left-color: var(--c0); }
 .chip.c1 { border-left-color: var(--c1); }
 .chip.c2 { border-left-color: var(--c2); }
 .chip.c3 { border-left-color: var(--c3); }
 .chip.c4 { border-left-color: var(--c4); }
 .chip.c5 { border-left-color: var(--c5); }
+
+/* Detailed and Clear selection, on one line above the chips. */
+.cmpbar { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.9rem; }
+.cmpbar[hidden] { display: none; }
+.cmpbar .check {
+  display: flex; align-items: center; gap: 0.4rem; cursor: pointer;
+  white-space: nowrap; color: var(--muted); font-size: 0.85rem;
+}
 
 .cmp-metric { margin-bottom: 1.1rem; }
 .cmp-title { display: flex; gap: 0.5rem; align-items: baseline; margin-bottom: 0.3rem; }

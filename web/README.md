@@ -134,7 +134,7 @@ python3 verified.py --db runs.sqlite3 --forget v0.1.0
 | `DELETE` | `/api/runs/<id>` | withdraw; needs `X-Delete-Token` or a signed-in owner |
 | `GET` | `/api/cores?scope=&target=&vectorize=&fma=&q=&user=&verified=&sort=&order=&norm=&limit=&offset=` | leaderboard rows: one per upload, each its best record at `sort` |
 | `GET` | `/api/cores?run=<id>` / `?ids=1,2,3` | every record of one run / named records |
-| `GET` | `/api/metrics`, `/api/stats`, `/api/builds` | metric definitions; counts; recognised release digests |
+| `GET` | `/api/metrics`, `/api/stats`, `/api/builds` | metric definitions; counts, including one per architecture, which is what fills the board's **Arch** picker; recognised release digests |
 | `GET` | `/api/users/<name>` | public profile: name, since, run count |
 | `GET` | `/api/auth/policy` | what registering here costs: `{open, invite_required, bits}` |
 | `GET` | `/api/auth/challenge` | the same, plus a single-use puzzle to register with |

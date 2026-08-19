@@ -171,6 +171,12 @@ class HubTest(unittest.TestCase):
         _, out = self.req("/api/cores?scope=cpu&q=Test+CPU")
         self.assertTrue(out["cores"])
 
+    def test_board_rows_carry_the_operating_system(self):
+        """The board has an OS column, so the listing has to answer with one."""
+        self.upload()
+        _, out = self.req("/api/cores?scope=cpu&limit=1")
+        self.assertEqual(out["cores"][0]["sysname"], "Linux")
+
     def test_latency_metric_sorts_ascending(self):
         self.upload()
         _, out = self.req("/api/cores?scope=cpu&sort=mem_lat_ns&order=asc&limit=5")

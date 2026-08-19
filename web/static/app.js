@@ -240,6 +240,63 @@ function shownMetrics() {
   return state.metrics.filter((m) => m.headline || m.key === state.sort);
 }
 
+// Every architecture the benchmark can report -- the list in arch_string(),
+// bench/src/bench.c -- each with a name a reader will recognise. All of them,
+// not the three that used to be typed into the HTML: a hub holding a POWER,
+// LoongArch or IBM Z result had no way to ask for it.
+const TARGETS = [
+  ["x86_64", "Intel / AMD, 64-bit"],
+  ["aarch64", "Arm, 64-bit"],
+  ["riscv64", "RISC-V, 64-bit"],
+  ["loongarch64", "LoongArch, 64-bit"],
+  ["ppc64le", "POWER, little-endian"],
+  ["ppc64", "POWER, big-endian"],
+  ["s390x", "IBM Z"],
+];
+
+// Fill the Arch picker: the list above, then anything this hub actually holds
+// that is not on it -- a build newer than this page, or the "unknown" a target
+// nobody taught the benchmark reports. Counts arrive with /api/stats, so an
+// entry that would find nothing says so before it is picked rather than after.
+// Called again when they do, which is why the current choice is put back.
+function fillTargets(counts) {
+  const sel = $("#filters").elements.target;
+  const chosen = sel.value;
+  const held = new Map((counts || []).map((t) => [t.target, t.n]));
+  const known = new Map(TARGETS);
+  const order = [...known.keys()];
+  for (const t of held.keys()) if (!known.has(t) && t) order.push(t);
+
+  sel.replaceChildren();
+  const any = el("option", null, "any");
+  any.value = "";
+  sel.append(any);
+  for (const t of order) {
+    const name = known.get(t);
+    const n = held.get(t) || 0;
+    const o = el("option", null,
+      (name ? `${t} — ${name}` : t) + (counts ? ` (${n})` : ""));
+    o.value = t;
+    sel.append(o);
+  }
+  sel.value = chosen;
+  // A stored or hand-typed choice this hub has no option for would leave the
+  // picker blank while still filtering; falling back to "any" says what the
+  // board is actually showing.
+  if (sel.value !== chosen) sel.value = "";
+}
+
+// What to call the operating system a result was measured on. The upload
+// carries uname's own spelling, and "Darwin" is not what anyone calls that
+// machine; anything else -- a BSD, an unknown -- passes through as it came.
+const OS_NAMES = { linux: "Linux", darwin: "macOS", windows: "Windows" };
+
+function osName(row, unknown = "—") {
+  const s = (row.sysname || "").trim();
+  if (!s) return unknown;
+  return OS_NAMES[s.toLowerCase()] || s;
+}
+
 // What to call a machine whose run never said. uname's `machine` is the
 // instruction set, not a CPU: printing it bare made a row read as a box called
 // "aarch64", which is both untrue and already the target column's job. Runs
@@ -249,15 +306,6 @@ function shownMetrics() {
 function machineName(row, unknown = "unknown CPU") {
   if (row.cpu_models) return row.cpu_models;
   return row.machine ? `unnamed ${row.machine} CPU` : unknown;
-}
-
-// Machine and record together, for the compare chips: there a row has been
-// lifted out of the board and has to identify itself on its own. The board
-// itself names the machine only.
-function coreName(row) {
-  const model = machineName(row);
-  if (row.scope === "total") return `${model} · all ${row.threads ?? "?"} threads`;
-  return row.cpu === null || row.cpu === undefined ? model : `${model} · cpu${row.cpu}`;
 }
 
 function recordName(row) {
@@ -480,10 +528,10 @@ function trustBadge(row) {
     // is one binary, and labelling it with the oldest of them would split one
     // population of comparable runs into four that look like different builds.
     const mark = el("span", "claim", `${row.release_build} build`);
-    mark.title = `the digest in this result matches a binary published in ` +
-                 `${row.release_build}, so it compares directly with other ` +
-                 `${row.release_build} runs — the digest is the run's own ` +
-                 `word, the release is the newest one publishing those bytes`;
+    mark.title = `this result names the same program ${row.release_build} ` +
+                 `published, so it compares directly with other ` +
+                 `${row.release_build} results — that it does so is the ` +
+                 `result's own word, not something checked here`;
     return mark;
   }
   return null;
@@ -530,8 +578,9 @@ function renderBoardLegend() {
   const rel = state.release && state.release.release;
   if (rel) {
     p.append(el("span", "claim", `${rel} build`));
-    say(` the run reports one of the binaries ${rel} published, matched by ` +
-        `digest — which is what makes two results comparable. `);
+    say(` the result says it came from one of the programs ${rel} ` +
+        `published — running the same program is what makes two results ` +
+        `comparable. `);
   }
   // "Everything else" needs something to be else than, so it is only said where
   // a mark was actually explained above it.
@@ -549,11 +598,11 @@ function renderBoardLegend() {
   if (!ci && !attested) {
     const how = el("p", "note");
     how.append(el("span", null,
-      (known ? "No run here carries an outside signature yet. It takes the "
-             : "A mark takes the ") +
-      "measure workflow: GitHub signs the result bytes it produced, on its runners or " +
-      "on your own. A digest inside a document you wrote cannot substitute, " +
-      "however honest the run behind it — see "));
+      (known ? "No result here carries an outside signature yet. Earning one takes the "
+             : "Earning a mark takes the ") +
+      "measure workflow: GitHub runs the benchmark and signs the exact numbers it " +
+      "got, on its own machines or on yours. A file you sent yourself cannot " +
+      "stand in for that, however honest the run behind it — see "));
     // A button, not an anchor: the tabs are not hash-routed, so a link to
     // "#upload" would set a hash that syncHash() then wipes and switch nothing.
     const go = el("button", "linkish", "Submit a result");
@@ -598,7 +647,7 @@ function renderBoard() {
 
   const hr = el("tr");
   hr.append(el("th", "num", "#"), el("th", "", ""), el("th", "wide", "machine"),
-            el("th", "", "arch"), el("th", "", "build"),
+            el("th", "", "OS"), el("th", "", "arch"), el("th", "", "build"),
             sortHeader("MHz", "", "mhz"));
   for (const m of shownMetrics()) hr.append(sortHeader(m.label, unitOf(m), m.key));
   thead.append(hr);
@@ -642,7 +691,10 @@ function renderBoard() {
     }
     tr.append(name);
 
-    tr.append(el("td", "", row.target || "—"), el("td", "flags", flagsText(row)));
+    // The family only -- Linux, Windows, macOS. The build number the upload
+    // also carries is a different question, and it is on the run's own page.
+    tr.append(el("td", "", osName(row)), el("td", "", row.target || "—"),
+              el("td", "flags", flagsText(row)));
     metricCells(tr, row);
     tbody.append(tr);
 
@@ -652,7 +704,7 @@ function renderBoard() {
       sub.append(el("td", "num", ""), selectBox(c));
       const cname = el("td", "wide");
       cname.append(el("span", "childname", recordName(c)));
-      sub.append(cname, el("td", "", ""), el("td", "", ""));
+      sub.append(cname, el("td", "", ""), el("td", "", ""), el("td", "", ""));
       metricCells(sub, c);
       tbody.append(sub);
     }
@@ -751,10 +803,25 @@ function showTab(name) {
 // Compare
 // ---------------------------------------------------------------------------
 
+// "Detailed" is one setting with a box on the board and a box in Compare, so
+// that neither panel makes you leave it to change what it is showing. Both
+// boxes are set here, or the one you did not touch would soon be lying about
+// what the other panel prints.
+function setDetailed(on) {
+  state.detailed = !!on;
+  for (const box of [$("#filters").elements.detailed, $("#compare-detailed")]) {
+    if (box) box.checked = state.detailed;
+  }
+  renderBoard();
+  renderSelection();
+}
+
 function renderSelection() {
   const n = state.selected.size;
   $("#selcount").textContent = n ? `(${n})` : "";
   $("#clearsel").hidden = n === 0;
+  // The bar controls a comparison, so it appears with one and not before.
+  $("#compare-bar").hidden = n === 0;
   $("#compare-note").hidden = n > 0;
 
   const body = $("#compare-body");
@@ -769,9 +836,9 @@ function renderSelection() {
   const builds = new Set(rows.map((r) => `${r.vectorize}/${r.fma}`));
   if (builds.size > 1) {
     warn.append(el("p", "warn",
-      "These rows were built with different vectorize/FMA flags. A vectorised " +
-      "or FMA-contracted build does more work per instruction, so the compute " +
-      "numbers are not comparable with a scalar one."));
+      "These results were built with different vectorize/FMA settings. Those " +
+      "switches let one instruction do more arithmetic at a time, so the " +
+      "compute numbers are not measuring the same amount of work."));
   }
   // The backstop. retargetSelection keeps the selection to one scope at every
   // door into it, so this should not fire -- but a mixed comparison reads as a
@@ -780,21 +847,52 @@ function renderSelection() {
   const scopes = new Set(rows.map((r) => r.scope));
   if (scopes.size > 1) {
     warn.append(el("p", "warn",
-      "Mixing per-core, per-thread and whole-machine records: a 'total' row is " +
-      "the sum over every thread, so it will tower over single-core rows."));
+      "Whole-machine rows mixed with single-core ones. A whole-machine row is " +
+      "every thread added together, so it will tower over the rest."));
   }
 
   const head = el("div", "cmp-head");
   rows.forEach((r, i) => {
     const chip = el("div", `chip c${i % 6}`);
-    chip.append(el("strong", null, coreName(r)));
+    const named = r.label || machineName(r);
+
+    // The label leads. It is the name its owner gave the machine, and it was
+    // the one thing this panel did not print: four bars against four rows all
+    // reading "unnamed aarch64 CPU" are four bars nobody can tell apart. The
+    // CPU model stays directly under it, since that is what the label means to
+    // everyone who did not write it.
+    const top = el("div", "chip-top");
+    const title = el("button", "linkish", named);
+    title.type = "button";
+    title.title = "open this result";
+    title.addEventListener("click", () => showRun(r.run_id).catch((e) => alert(e.message)));
+    // Dropping a row from here rather than going back to find its tick on the
+    // board, which on page three of a long board is a hunt.
+    const drop = el("button", "chip-x", "×");
+    drop.type = "button";
+    drop.title = "remove from the comparison";
+    drop.setAttribute("aria-label", `remove ${named}`);
+    drop.addEventListener("click", () => toggleSelect(r, false).catch((e) => alert(e.message)));
+    top.append(title, drop);
+    chip.append(top);
+
+    if (r.label) chip.append(el("span", "chip-sub", machineName(r)));
     chip.append(el("span", null,
-      `${r.target || "?"} · ${flagsText(r)} · ${r.mhz ? Math.round(r.mhz) + " MHz" : "clock unknown"}`));
+      recordName(r) + (r.user ? ` · uploaded by ${r.user}` : "")));
+    chip.append(el("span", null, [
+      osName(r, "system not reported"),
+      r.target || "arch not reported",
+      flagsText(r),
+      r.mhz ? Math.round(r.mhz) + " MHz" : "clock unknown",
+    ].join(" · ")));
     head.append(chip);
   });
   body.append(head);
 
-  for (const m of state.metrics) {
+  // The headline metrics unless the Detailed box is ticked, the same as the
+  // board: fifteen stacks of bars is a page you scroll rather than read, and
+  // the box is right there when the rest of them are the point.
+  for (const m of shownMetrics()) {
     const vals = rows.map((r) => value(r, m));
     if (vals.every((v) => v === null)) continue;
     const finite = vals.filter((v) => v !== null);
@@ -1390,9 +1488,9 @@ function renderVerifiedNote() {
     el("span", null, "Uploading a file — from here or from a shell — is "),
     el("strong", null, "self-reported"),
     el("span", null, ". That is the normal way to use this board and the " +
-                     "numbers rank the same. It simply cannot be checked: a " +
-                     "digest inside a document you wrote is a claim about " +
-                     "which binary you ran, not evidence of it.")));
+                     "numbers rank the same. It simply cannot be checked: the " +
+                     "file names the program that produced it, but you sent " +
+                     "the file, so that is a claim rather than evidence.")));
 
   // The badge text comes from TRUST, so this paragraph cannot drift out of step
   // with what the board actually prints on a row.
@@ -1400,11 +1498,11 @@ function renderVerifiedNote() {
   const how = el("p", "note");
   how.append(el("span", null, "For either mark, the measurement has to be " +
     "signed by someone who is not you: run the measure workflow from your own " +
-    "repository and GitHub signs the exact result bytes it produced. On its " +
-    "own runners that is "));
+    "repository and GitHub signs the exact numbers that run produced. On a " +
+    "machine of GitHub's own that is "));
   how.append(mark("ci"));
-  how.append(el("span", null, "; on a self-hosted runner — your own hardware, " +
-    "which is the only way an interesting machine gets a mark — it is "));
+  how.append(el("span", null, "; on a runner you host yourself — your own " +
+    "hardware, which is the only way an interesting machine gets a mark — it is "));
   how.append(mark("attested"));
   how.append(el("span", null, ", because the signatures hold but the machine is yours."));
   box.append(how);
@@ -1948,6 +2046,9 @@ async function boot() {
     b.addEventListener("click", () => copyButton(b));
   }
   renderCommands();
+  // The full list first, so the picker is usable before any request finishes,
+  // and again with the counts once /api/stats has them.
+  fillTargets(null);
   // Once before /api/stats answers, so the board is never explained by a blank
   // gap, and again from the hub's numbers when they arrive.
   renderBoardLegend();
@@ -1963,6 +2064,7 @@ async function boot() {
   api("/api/stats").then((s) => {
     state.release = s.release || null;
     state.signed = s.attested || null;
+    fillTargets(s.targets || []);
     renderBoardLegend();
     renderVerifiedNote();
   }).catch(() => {});
@@ -1987,11 +2089,9 @@ async function boot() {
   }
   // This one changes how the rows are drawn, not which rows they are or in
   // what order, so it does not refetch.
-  $("#filters").elements.detailed.addEventListener("change", (e) => {
-    state.detailed = e.target.checked;
-    renderBoard();
-    renderSelection();
-  });
+  for (const box of [$("#filters").elements.detailed, $("#compare-detailed")]) {
+    box.addEventListener("change", (e) => setDetailed(e.target.checked));
+  }
   $("#uploadform").addEventListener("submit", doUpload);
   $("#clearsel").addEventListener("click", () => {
     state.selected.clear();
