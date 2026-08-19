@@ -43,7 +43,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
-
 HERE = Path(__file__).resolve().parent
 STATIC_DIR = HERE / "static"
 SCHEMA_PATH = HERE / "schema.sql"
@@ -345,6 +344,119 @@ def _obj(payload, key):
     return v
 
 
+# ---------------------------------------------------------------------------
+# Internal consistency
+# ---------------------------------------------------------------------------
+#
+# Four numbers in every record are arithmetic on other numbers in the same
+# record: `score` is a geometric mean of six of them, and `ilp`, `filp` and
+# `mlp` are each a ratio of two. So a document that was opened in an editor and
+# improved disagrees with itself, and recomputing them is what notices.
+#
+# Worth being exact about what this is. It catches a number changed by hand,
+# which is how a leaderboard actually gets cheated, and it raises the price of
+# a fake result from "edit one field" to "rescale six inputs and recompute the
+# derived ones". It is not evidence of anything: someone who pays that price
+# passes, and no check running on a machine its owner controls can do better.
+# Nothing is shown for passing. A document that fails is refused at upload, and
+# that is the whole of it -- there is no badge here and there must not be one.
+#
+# The formulas are core_score(), machine_score() and summarize() in
+# bench/src/bench.c; they are part of the cpu-bench/1 contract, and the real
+# sample in testdata/full-run.json is checked against them by the hub's tests,
+# so a change to the benchmark's formulas cannot quietly start refusing every
+# honest upload.
+
+# The benchmark prints its numbers at six significant figures (`%.6g`), so a
+# record nobody has touched still differs from a recomputation somewhere in the
+# seventh. This is three orders of magnitude looser than that: an edit small
+# enough to hide underneath it is an edit not worth making.
+CONSISTENCY_TOLERANCE = 1e-3
+
+
+def _f(row: dict, key: str) -> float:
+    """One measurement as a number, with missing read as zero.
+
+    The benchmark writes null for any value that is not positive, so absent and
+    zero are a single state on the wire and are treated as one here.
+    """
+    v = row.get(key)
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+
+
+def _geomean(values: list[float]) -> float:
+    """As geomean() in bench.c: terms that are not positive drop out, rather
+    than taking the whole mean to zero."""
+    logs = [math.log(v) for v in values if v > 0.0]
+    return math.exp(math.fsum(logs) / len(logs)) if logs else 0.0
+
+
+def score_terms(row: dict, mlp_scale: float = 1.0) -> list[float]:
+    """The six components a record's score is the geometric mean of.
+
+    `mlp_scale` is the thread count for a whole-machine row and 1 for every
+    other one: n threads chase n sets of pointers at once, and that is the only
+    difference between machine_score() and core_score().
+    """
+    # disp_span is written as null in two different situations -- there was no
+    # dispatch measurement at all, or the span itself came out at zero -- and
+    # the score treats them differently: the first drops the term, the second
+    # contributes (0 + 1) * 2000. disp_prediction is what tells them apart, so
+    # an honest record with a zero span is not refused for it.
+    span = 0.0 if row.get("disp_prediction") == "unknown" \
+        else (_f(row, "disp_span") + 1.0) * 2000.0
+    lat8 = _f(row, "mem_lat8_ns")
+    return [
+        _f(row, "int_thr"),
+        _f(row, "fp_thr"),
+        _f(row, "mul_thr") * 4.0,
+        _f(row, "disp_thr") * 20.0,
+        span,
+        mlp_scale * (1000.0 / lat8) * 100.0 if lat8 > 0.0 else 0.0,
+    ]
+
+
+def _ratio(row: dict, top: str, bottom: str) -> float:
+    below = _f(row, bottom)
+    return _f(row, top) / below if below > 0.0 else 0.0
+
+
+def _agrees(row: dict, key: str, want: float, where: str) -> None:
+    got = _f(row, key)
+    if got <= 0.0 and want <= 0.0:
+        return
+    if got > 0.0 and want > 0.0 and abs(got - want) <= CONSISTENCY_TOLERANCE * want:
+        return
+    raise Invalid(
+        f"{where}: {key} is {row.get(key)!r}, but the other numbers in the "
+        f"same record make it {want:.6g}. This document does not agree with "
+        f"itself, so it is not the one the benchmark wrote -- upload the file "
+        f"exactly as produced.")
+
+
+def check_consistency(rows: list[dict], threads: int | None) -> None:
+    """Refuse a document whose derived numbers disagree with their inputs."""
+    for row in rows:
+        scope = row.get("scope")
+        where = f"{scope} record"
+        if row.get("cpu") is not None:
+            where += f" cpu{row['cpu']}"
+        _agrees(row, "ilp", _ratio(row, "int_thr", "int_lat"), where)
+        _agrees(row, "filp", _ratio(row, "fp_thr", "fp_lat"), where)
+        _agrees(row, "mlp", _ratio(row, "mem_lat_ns", "mem_lat8_ns"), where)
+        scale = 1.0
+        if scope == "total":
+            # The whole-machine score scales its memory term by the number of
+            # threads, so it can only be recomputed where the document says how
+            # many there were. Missing, the row keeps its ratio checks and
+            # skips this one rather than being refused for a field it is
+            # allowed to omit.
+            if not threads:
+                continue
+            scale = float(threads)
+        _agrees(row, "score", _geomean(score_terms(row, scale)), where)
+
+
 def validate(payload: object) -> tuple[dict, list[dict]]:
     """Turn an uploaded document into (run row, core rows) or raise Invalid."""
     if not isinstance(payload, dict):
@@ -436,6 +548,10 @@ def validate(payload: object) -> tuple[dict, list[dict]]:
 
     if not any(r.get("score") or r.get("int_thr") for r in rows):
         raise Invalid("no usable measurements in this upload")
+    # Last of all, so an empty or malformed upload says so in its own terms
+    # first. This one answers a different question: not "is this a result" but
+    # "is this the result the benchmark wrote".
+    check_consistency(rows, run.get("threads"))
     return run, rows
 
 

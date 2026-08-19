@@ -236,6 +236,22 @@ class ContractTest(unittest.TestCase):
         # that reads a run resolves it to a name instead.
         self.assertEqual({"delete_token", "raw", "user_id"} - runs, set())
 
+    def test_the_derived_numbers_recompute(self):
+        """`score`, `ilp`, `filp` and `mlp` are arithmetic on the numbers
+        beside them in the same record, and the hub refuses an upload where
+        they do not agree -- its one check against a result edited after the
+        benchmark wrote it. This is the side of that contract the benchmark
+        keeps. If a formula in bench.c moves and server.py does not follow,
+        every honest upload starts being refused, and this says so first.
+        """
+        for name, doc in DOCUMENTS:
+            with self.subTest(name):
+                try:
+                    srv.validate(doc)
+                except srv.Invalid as e:
+                    self.fail(f"{name}: the benchmark wrote a document the hub "
+                              f"refuses as disagreeing with itself -- {e}")
+
     def test_document_survives_a_round_trip(self):
         """Every value the benchmark measured comes back out of the database."""
         for name, doc in DOCUMENTS:

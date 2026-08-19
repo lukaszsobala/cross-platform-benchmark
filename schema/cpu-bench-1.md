@@ -120,6 +120,42 @@ throughputs and so scales with core count. Both are the same key with the same
 unit, so nothing rejects a comparison between them — the hub keeps them apart by
 only ever ranking a scope against itself.
 
+### Four of them are arithmetic on the others
+
+These are not independent measurements, and the hub **recomputes them and
+refuses an upload where they disagree**:
+
+| field | is | 
+| --- | --- |
+| `ilp` | `int_thr_mops / int_lat_mops` |
+| `filp` | `fp_thr_mflops / fp_lat_mflops` |
+| `mlp` | `mem_lat_ns / mem_lat8_ns` |
+| `score` | geomean of `int_thr_mops`, `fp_thr_mflops`, `mul_thr_mmul_s`×4, `disp_thr_mcall_s`×20, (`disp_span`+1)×2000, (1000/`mem_lat8_ns`)×100 |
+
+On a `total` record the last of the score's six terms is multiplied by
+`config.threads` as well — n threads chase n sets of pointers at once. Terms
+that are not positive drop out of the geomean rather than taking it to zero,
+and `disp_span` is written as `null` both when there was no dispatch
+measurement and when the span came out at zero: `disp_prediction` is `unknown`
+in the first case and the term drops, and anything else keeps it. Numbers are
+written at six significant figures, so the hub allows 0.1% either way.
+
+This is why the two halves must not drift: change `core_score()`,
+`machine_score()` or `summarize()` in [bench/src/bench.c](../bench/src/bench.c)
+without changing `score_terms()` in [web/server.py](../web/server.py) and every
+honest upload starts being refused.
+[tests/test_contract.py](../tests/test_contract.py) runs the hub's check over a
+live run of the binary, which is what notices.
+
+**What it is for, and what it is not.** A document edited after the benchmark
+wrote it disagrees with itself, and this catches that — which is how a
+leaderboard actually gets cheated. It is not evidence: rescale every input,
+recompute the four, and it passes. Nothing running on a machine its owner
+controls can do better, and the hub claims nothing for it — there is no badge,
+no tier, and a passing document simply uploads.
+
+### The key set
+
 The set is exact in **both** directions — a record with an extra key fails the
 contract test, and so does one missing a key. A field only one side knows about
 is measured and then silently dropped, or stored as `NULL` forever; neither is

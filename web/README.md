@@ -95,11 +95,19 @@ build agent installed on your own, which is not a benchmark you run with one
 command. GitHub does not even publish that agent for riscv64, loongarch64,
 ppc64le or s390x, which are half of what this project exists to compare.
 
-So the hub checks the one thing it can, and the one thing a leaderboard
-actually needs: **did these two results come from the same program.** That is
-what `build.binary_sha256` against a release manifest answers, and it is why
-`?verified=release` is the only filter of its kind left. Treat every number on
-the board as self-reported, because it is.
+So the hub checks the two things it can. **Did these two results come from the
+same program** — what `build.binary_sha256` against a release manifest answers,
+and why `?verified=release` is the only filter of its kind left. And **does this
+document agree with itself**: `score` is a geometric mean of six numbers in the
+same record and `ilp`, `filp` and `mlp` are ratios of two each, so a result
+edited after the benchmark wrote it contradicts its own arithmetic. The hub
+recomputes all four and refuses the upload with a message naming the field; see
+[the schema](../schema/cpu-bench-1.md#four-of-them-are-arithmetic-on-the-others).
+
+That second check raises the price of a fake from "edit one number" to "rescale
+six inputs and recompute the four derived from them" — and someone who pays it
+passes, so nothing is displayed for passing and there is no badge for it. Treat
+every number on the board as self-reported, because it is.
 
 This hub used to accept a GitHub OIDC token signed over an uploaded result and
 stored two trust tiers from it. That is gone: `attest.py`, the `measure.yml`

@@ -14,7 +14,6 @@ import json
 import sqlite3
 import tempfile
 import threading
-import time
 import unittest
 import urllib.error
 import urllib.request
@@ -24,19 +23,82 @@ from typing import Any
 
 import server as srv
 
+# A fixture has to be a document the benchmark could have written. The hub
+# recomputes `score`, `ilp`, `filp` and `mlp` from the numbers they are made of
+# and refuses an upload that disagrees with itself, so a record carrying a score
+# typed in independently of its own measurements is no longer a valid input --
+# it is the thing the check exists to catch.
+#
+# A test that wants a row to rank at a chosen score therefore still asks for it,
+# and the throughput components are scaled until their geometric mean lands
+# there. The test keeps saying what it meant and the document stays honest.
 
-def core(scope="cpu", cpu: int | None = 0, **over):
+# The four score components a fixture scales. The other two -- the memory term
+# and the dispatch span -- are left alone: one is a latency that would have to
+# move the wrong way and the other cannot go negative, and four are enough.
+SCORE_INPUTS = ("int_thr_mops", "fp_thr_mflops", "mul_thr_mmul_s",
+                "disp_thr_mcall_s")
+
+
+def _cols(rec):
+    """The record under the hub's column names, which its helpers read."""
+    return {col: rec.get(jkey) for jkey, col, _ in srv.CORE_FIELDS}
+
+
+def _score_of(rec, threads=1.0):
+    return srv._geomean(srv.score_terms(_cols(rec), threads))
+
+
+def _tie(rec, asked, ratio, top, bottom, move):
+    """Keep `ratio` equal to top/bottom.
+
+    A test that pinned the ratio keeps it and `move` shifts to match -- always
+    the field of the three that is not one of the score's own inputs, so tying
+    a ratio cannot quietly move the score. Otherwise the ratio follows the two
+    measurements it is the ratio of.
+    """
+    if asked.get(ratio) is not None:
+        r = float(asked[ratio])
+        other = rec.get(bottom if move == top else top)
+        if not isinstance(other, (int, float)) or not r:
+            rec[move] = None
+        else:
+            rec[move] = r * other if move == top else other / r
+        return
+    t, b = rec.get(top), rec.get(bottom)
+    rec[ratio] = (t / b if isinstance(t, (int, float)) and isinstance(b, (int, float))
+                  and b else None)
+
+
+def core(scope="cpu", cpu: int | None = 0, *, threads=1.0, **over):
     rec: dict[str, object] = {
         "scope": scope, "cpu": cpu, "mhz": 4000.0, "mhz_src": "measured",
-        "int_lat_mops": 4000.0, "int_thr_mops": 20000.0, "ilp": 5.0,
+        "int_lat_mops": 4000.0, "int_thr_mops": 20000.0, "ilp": None,
         "mul_thr_mmul_s": 9000.0, "fp_lat_mflops": 1500.0,
-        "fp_thr_mflops": 11000.0, "filp": 7.3, "mem_gbps": 30.0,
-        "mem_lat_ns": 100.0, "mem_lat8_ns": 12.0, "mlp": 8.3,
+        "fp_thr_mflops": 11000.0, "filp": None, "mem_gbps": 30.0,
+        "mem_lat_ns": 100.0, "mem_lat8_ns": 12.0, "mlp": None,
         "disp_thr_mcall_s": 1000.0, "disp_cap_calls": 500.0,
         "disp_prediction": "measured", "disp_gain": 5.0, "disp_span": 7.0,
-        "score": 20000.0,
+        "score": None,
     }
     rec.update(over)
+
+    # Scale to the score the caller asked for, if it asked for one. Four of the
+    # six terms move, so a geometric mean over six of them shifts by m^(4/6) --
+    # which is the exponent below, undoing it.
+    want = over.get("score")
+    if want is not None:
+        now = _score_of(rec, threads)
+        if now > 0.0:
+            m = (float(want) / now) ** 1.5
+            for key in SCORE_INPUTS:
+                if isinstance(rec.get(key), (int, float)):
+                    rec[key] *= m
+
+    _tie(rec, over, "ilp", "int_thr_mops", "int_lat_mops", "int_lat_mops")
+    _tie(rec, over, "filp", "fp_thr_mflops", "fp_lat_mflops", "fp_lat_mflops")
+    _tie(rec, over, "mlp", "mem_lat_ns", "mem_lat8_ns", "mem_lat_ns")
+    rec["score"] = _score_of(rec, threads) or None
     return rec
 
 
@@ -57,7 +119,9 @@ def document(mode="per-core", **over):
         doc["cores"] = [core(cpu=0), core(cpu=1, score=15000.0)]
     if mode in ("threads", "full"):
         doc["threads"] = [core("thread", 0), core("thread", 1)]
-        doc["total"] = core("total", None, score=None)
+        # The whole-machine score counts one set of pointer chases per thread,
+        # so it is built knowing how many the document says there were.
+        doc["total"] = core("total", None, threads=doc["config"]["threads"])
         doc["checksum"] = "0xdeadbeefdeadbeef"
     doc.update(over)
     return doc
@@ -208,7 +272,10 @@ class HubTest(unittest.TestCase):
         self.assertEqual(best["mem_lat_ns"], 200.0)
         quickest = row("mem_lat_ns", "asc")
         self.assertEqual(quickest["cpu"], 2)
-        self.assertEqual(quickest["score"], 5000.0)
+        # Not an exact equality: a fixture reaches a chosen score by scaling the
+        # components the score is the geometric mean of, so it arrives within a
+        # float rounding of it rather than on it.
+        self.assertAlmostEqual(quickest["score"], 5000.0, places=6)
 
     # -- per GHz ------------------------------------------------------------
     def test_per_ghz_ranks_by_the_per_ghz_figure(self):
@@ -887,6 +954,101 @@ class VerifiedBuildsMigrationTest(unittest.TestCase):
         self.assertEqual(before, srv.Store(self.db).verified_builds())
 
 
+class ConsistencyTest(unittest.TestCase):
+    """A document has to agree with itself.
+
+    `score` is a geometric mean of six numbers in the same record and `ilp`,
+    `filp` and `mlp` are ratios of two each, so a result edited after the
+    benchmark wrote it contradicts itself. That is the only check a hub can
+    make on its own, and these tests fix both what it catches and what it
+    openly does not.
+    """
+
+    SAMPLE = Path(__file__).resolve().parent.parent / "testdata" / "full-run.json"
+
+    def sample(self):
+        """A real document, straight from the benchmark."""
+        if not self.SAMPLE.exists():          # a checkout without the sample
+            self.skipTest(f"{self.SAMPLE} is not here")
+        return json.loads(self.SAMPLE.read_text())
+
+    def test_a_real_document_passes(self):
+        """The formulas here are the benchmark's, and this is what says so.
+
+        Every record of a genuine --full run -- eight cores, eight threads and
+        the machine total -- has to recompute. If it stops doing so, the hub
+        has started refusing every honest upload, and that is far worse than
+        anything it was meant to catch.
+        """
+        _, rows = srv.validate(self.sample())
+        self.assertEqual(len(rows), 17)
+
+    def test_an_edited_score_is_refused(self):
+        doc = self.sample()
+        doc["cores"][0]["score"] = 99999.0
+        with self.assertRaises(srv.Invalid) as cm:
+            srv.validate(doc)
+        self.assertIn("score", str(cm.exception))
+
+    def test_an_edited_total_is_refused(self):
+        doc = self.sample()
+        doc["total"]["score"] = 99999.0
+        with self.assertRaises(srv.Invalid):
+            srv.validate(doc)
+
+    def test_a_nudged_score_is_refused(self):
+        """One per cent is far too small to be worth taking, and is taken."""
+        doc = self.sample()
+        doc["cores"][0]["score"] *= 1.01
+        with self.assertRaises(srv.Invalid):
+            srv.validate(doc)
+
+    def test_editing_an_input_breaks_a_ratio(self):
+        """Raising a component instead of the score is caught by `ilp`, which
+        is that component over the latency beside it."""
+        doc = self.sample()
+        doc["cores"][0]["int_thr_mops"] *= 3.0
+        with self.assertRaises(srv.Invalid) as cm:
+            srv.validate(doc)
+        self.assertIn("ilp", str(cm.exception))
+
+    def test_a_shaved_latency_is_refused(self):
+        doc = self.sample()
+        doc["cores"][0]["mem_lat8_ns"] /= 5.0
+        with self.assertRaises(srv.Invalid) as cm:
+            srv.validate(doc)
+        self.assertIn("mlp", str(cm.exception))
+
+    def test_a_run_with_no_dispatch_measurement_passes(self):
+        """`disp_span` is written as null both when there was no measurement
+        and when the span came out at zero, and the score treats those two
+        differently. An honest record of the first kind must not be refused."""
+        doc = document("per-core", cores=[
+            core(cpu=0, disp_prediction="unknown", disp_span=None,
+                 disp_cap_calls=None)])
+        _, rows = srv.validate(doc)
+        self.assertIsNone(rows[0]["disp_span"])
+
+    def test_a_consistent_forgery_passes(self):
+        """What this check is not.
+
+        Rescale every input and recompute the numbers derived from them and the
+        document agrees with itself perfectly, because it is arithmetic and not
+        evidence. Nothing running on a machine its owner controls can do
+        better, and the hub says so rather than implying otherwise -- this test
+        is here so that stays a decision and not an oversight.
+        """
+        doc = self.sample()
+        for rec in doc["cores"] + doc["threads"] + [doc["total"]]:
+            for key in ("int_thr_mops", "fp_thr_mflops", "mul_thr_mmul_s",
+                        "disp_thr_mcall_s", "int_lat_mops", "fp_lat_mflops"):
+                rec[key] *= 1.2
+            n = doc["config"]["threads"] if rec is doc["total"] else 1.0
+            rec["score"] = _score_of(rec, n)
+        _, rows = srv.validate(doc)
+        self.assertEqual(len(rows), 17)
+
+
 class AccountTest(unittest.TestCase):
     """Accounts: signing in, what an account may do, and what it may not."""
 
@@ -1470,9 +1632,11 @@ class ValidateTest(unittest.TestCase):
             srv.validate(document("per-core", cores=[empty]))
 
     def test_nulls_survive(self):
-        _, rows = srv.validate(document("per-core",
-                                        cores=[core(mem_gbps=None, mlp=None)]))
+        """A run with no memory phases: the whole memory group is absent."""
+        _, rows = srv.validate(document("per-core", cores=[core(
+            mem_gbps=None, mem_lat_ns=None, mem_lat8_ns=None, mlp=None)]))
         self.assertIsNone(rows[0]["mem_gbps"])
+        self.assertIsNone(rows[0]["mlp"])
         self.assertEqual(rows[0]["int_thr"], 20000.0)
 
 
