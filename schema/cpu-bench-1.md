@@ -22,7 +22,8 @@ Written by `json_open` / `json_result` / `emit_json` in
   "system": { "sysname": …, "release": …, "machine": …, "cpus": 8,
               "cpu_models": … },
   "config": { "threads": …, "seconds_per_phase": …, "reps": …,
-              "warmup_seconds": …, "mem_bytes_per_thread": …, "pin": true,
+              "warmup_seconds": …, "mem_bytes_per_thread": …,
+              "mem_bytes_per_core_sweep": …, "pin": true,
               "clock": "raw", "seed": 1 },
   "dram":   { "name": …, "mhz_min": …, "mhz_max": … },
   "threads": [ record, … ],
@@ -36,7 +37,10 @@ Written by `json_open` / `json_result` / `emit_json` in
 `mode` is one of `threads`, `per-core`, `full`. `threads`/`total` are present
 for `threads` and `full`; `cores` for `per-core` and `full`. `dram` appears only
 on machines exposing a DRAM devfreq node; `system` is only as complete as the
-host will say. Each system names its own hardware and the field passes that
+host will say. `config.mem_bytes_per_core_sweep` appears only when a per-core
+sweep ran (`per-core` and `full`) — the two phases size their buffers
+differently, N threads sharing the cache that one swept core has to itself, so
+`mem_bytes_per_thread` describes the multi-threaded phase where there is one. Each system names its own hardware and the field passes that
 through unchanged, so the same silicon reads `aarch64` on Linux, `arm64` on
 macOS and `ARM64` on Windows — `build.target` is the normalised one to key on.
 `config.clock` records the clock that was *used*: asking for `raw` on a host
@@ -107,12 +111,15 @@ always present; anything not measured is `null`, never absent and never `0`.
 `filp`, `mem_gbps`, `mem_lat_ns`, `mem_lat8_ns`, `mlp`, `disp_thr_mcall_s`,
 `disp_cap_calls`, `disp_prediction`, `disp_gain`, `disp_span`, `score`.
 
-`mhz_src` says how much the clock beside it is worth: `measured` was read off
-the machine (cpufreq, or the device tree's declared `clock-frequency`), `given`
-was asserted by whoever ran it with `--mhz`, and `estimated` was inferred from
-`int_lat_mops` — which assumes the core retires one dependent op per cycle, and
-reads low on one that does not. A machine with no cpufreq driver and no clock in
-its device tree has nothing else to offer, which is what `--mhz` is for.
+`mhz_src` says how much the clock beside it is worth: `measured` was sampled
+off the machine while the core was under load, `given` was asserted by whoever
+ran it with `--mhz`, `rated` is a ceiling the machine declares rather than a
+number anybody observed (cpufreq's max, the device tree's `clock-frequency`,
+the Windows registry's `~MHz`, or macOS's `hw.cpufrequency`) — a throttling
+core ran below it — and `estimated` was inferred from `int_lat_mops`, which
+assumes the core retires one dependent op per cycle and reads low on one that
+does not. A machine with no cpufreq driver and no clock in its device tree has
+nothing else to offer, which is what `--mhz` is for.
 
 `score` means something different by `scope`: on a `cpu` or `thread` record it is
 a single core's composite, on the `total` it is the same geomean over the summed

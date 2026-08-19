@@ -16,6 +16,7 @@
 #include "http.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +41,6 @@ typedef SOCKET sock_t;
 // the bytes `--json` printed. POSIX popen takes no such letter and rejects it.
 #define POPEN_MODE  "wb"
 #else
-#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <signal.h>
@@ -362,6 +362,28 @@ static int says_chunked(const char *head) {
     return found != NULL && (eol == NULL || found < eol);
 }
 
+// Whether a chunked body has arrived whole: walk the chunk framing from the
+// front and see if the terminating zero-length chunk is here. Walked, not
+// searched -- a scan for "\r\n0\r\n" would also match those five bytes inside
+// a chunk's *data* and truncate the reply mid-body.
+static int chunks_complete(const char *body, size_t blen) {
+    size_t at = 0;
+    for (;;) {
+        // The chunk-size line, which must have arrived whole to be readable.
+        size_t eol = at;
+        while (eol + 1 < blen && !(body[eol] == '\r' && body[eol + 1] == '\n'))
+            ++eol;
+        if (eol + 1 >= blen) return 0;          // still arriving
+        if (!isxdigit((unsigned char)body[at])) return 1;   // broken framing:
+                                                            // stop reading
+        const unsigned long n = strtoul(body + at, NULL, 16);
+        if (n == 0) return 1;                   // the terminating chunk
+        if (n > MAX_REPLY) return 1;            // bigger than would be kept
+        at = eol + 2 + (size_t)n + 2;           // its line, its data, its CR LF
+        if (at > blen) return 0;                // data still arriving
+    }
+}
+
 // The reply, read only as far as the reply goes.
 //
 // Not simply "everything until the peer hangs up": `Connection: close` asks for
@@ -409,11 +431,7 @@ static char *read_reply(sock_t s, size_t *len_out, http_reply_t *r) {
         }
         const char *body = buf + head_end;
         if (chunked) {
-            // The zero-length chunk that ends a chunked body, either at the
-            // front of it or after one. Found rather than counted: dechunk()
-            // does the counting, and this only has to know when there is
-            // nothing more coming.
-            if (!strncmp(body, "0\r\n", 3) || strstr(body, "\r\n0\r\n")) break;
+            if (chunks_complete(body, len - head_end)) break;
         } else if (want >= 0 && len - head_end >= (size_t)want) {
             break;
         }
@@ -468,10 +486,11 @@ static int parse_reply(char *raw, size_t len, http_reply_t *r) {
 // https, by way of curl
 // ---------------------------------------------------------------------------
 
-// What may appear in a URL or a token before either is put in a command line.
-// Both are checked rather than escaped: quoting rules differ between the shell
-// and cmd.exe, and a character set both agree is inert needs no rules at all.
-// `$`, backtick, backslash, quotes and whitespace are the ones that are not.
+// What may appear in a token, and in the temp-file path handed to curl,
+// before either is put where a shell can read it. Checked rather than
+// escaped: quoting rules differ between the shell and cmd.exe, and a
+// character set both agree is inert needs no rules at all. `$`, backtick,
+// backslash, quotes and whitespace are the ones that are not.
 static int shell_safe(const char *s, const char *extra) {
     for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
         const int ok = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
@@ -481,30 +500,104 @@ static int shell_safe(const char *s, const char *extra) {
     return 1;
 }
 
+// A private temporary file for what must reach curl but must not appear on
+// its command line. POSIX mkstemp creates it 0600; the Windows temp directory
+// is ACL'd to the user, which is the same property spelled differently.
+static FILE *private_file(char *path, size_t cap, http_reply_t *r) {
+    FILE *f = NULL;
+#ifdef _WIN32
+    char dir[MAX_PATH + 1];
+    const DWORD n = GetTempPathA((DWORD)sizeof(dir), dir);
+    if (n == 0 || n >= sizeof(dir) || cap < MAX_PATH ||
+        GetTempFileNameA(dir, "cpc", 0, path) == 0) {
+        fail(r, "cannot create a temporary file for curl");
+        return NULL;
+    }
+    f = fopen(path, "wb");
+#else
+    // $TMPDIR because /tmp is not universal: Android has no /tmp at all.
+    const char *dir = getenv("TMPDIR");
+    if (!dir || !*dir) dir = "/tmp";
+    if ((size_t)snprintf(path, cap, "%s/cpcpub.XXXXXX", dir) >= cap) {
+        fail(r, "$TMPDIR is too long a path for the curl fallback");
+        return NULL;
+    }
+    const int fd = mkstemp(path);
+    if (fd < 0) {
+        fail(r, "cannot create a temporary file for curl: %s", strerror(errno));
+        return NULL;
+    }
+    f = fdopen(fd, "w");
+    if (!f) close(fd);
+#endif
+    if (!f) {
+        fail(r, "cannot open %s: %s", path, strerror(errno));
+        remove(path);
+        return NULL;
+    }
+    return f;
+}
+
 static int post_via_curl(const char *url, const char *token, const char *body,
                          size_t len, http_reply_t *r) {
-    if (!shell_safe(url, "-._~:/?#[]@!&()*+,;=%"))
+    // The URL and the token ride in a --config file rather than on the command
+    // line, for two reasons that happen to coincide: argv is readable by every
+    // other local user for as long as curl runs, and cmd.exe expands %VAR%
+    // even inside double quotes, so a percent-encoded label could reach the
+    // hub as a different URL on Windows. curl's own parser reads the file, and
+    // the only thing left on the command line is a path this program chose.
+    //
+    // Inside the file's quoted strings a backslash starts an escape and a
+    // quote ends the string; url_split has already refused spaces and control
+    // characters, so these two are what is left to refuse here.
+    if (strchr(url, '"') || strchr(url, '\\'))
         return fail(r, "this https URL has characters the curl fallback will "
                        "not pass on; use an http:// hub, or pipe the JSON to "
                        "curl yourself");
 
-    char cmd[9000];
+    char cfg_path[512];
+    FILE *cfg = private_file(cfg_path, sizeof(cfg_path), r);
+    if (!cfg) return -1;
+    fprintf(cfg, "url = \"%s\"\n", url);
+    fprintf(cfg, "header = \"Content-Type: application/json\"\n");
+    if (token && *token)
+        fprintf(cfg, "header = \"Authorization: Bearer %s\"\n", token);
+    if (fflush(cfg) != 0 || ferror(cfg)) {
+        fclose(cfg);
+        remove(cfg_path);
+        return fail(r, "cannot write curl's config file: %s", strerror(errno));
+    }
+    fclose(cfg);
+
+    // The path is this program's choice, not the caller's, but the shell still
+    // reads the line it is on: refuse the rare temp directory whose name the
+    // shell would rewrite even inside double quotes.
+    if (!shell_safe(cfg_path, "-._~:/\\ ")) {
+        remove(cfg_path);
+        return fail(r, "the temporary directory's path has characters a shell "
+                       "would rewrite; point TMPDIR (or TMP on Windows) at a "
+                       "plainer one");
+    }
+
+    char cmd[1024];
     // Everything curl says goes to stderr, so a --json run's stdout stays one
     // clean document even while an upload is happening on the side.
     const int n = snprintf(cmd, sizeof(cmd),
-        "curl -fsS --max-time %d -X POST \"%s\" "
-        "-H \"Content-Type: application/json\" %s%s%s--data-binary @- 1>&2",
-        IO_SECONDS, url,
-        (token && *token) ? "-H \"Authorization: Bearer " : "",
-        (token && *token) ? token : "",
-        (token && *token) ? "\" " : "");
-    if (n < 0 || n >= (int)sizeof(cmd))
-        return fail(r, "hub URL is too long for the curl fallback");
+        "curl -fsS --max-time %d -X POST --config \"%s\" --data-binary @- 1>&2",
+        IO_SECONDS, cfg_path);
+    if (n < 0 || n >= (int)sizeof(cmd)) {
+        remove(cfg_path);
+        return fail(r, "the temporary path is too long for the curl fallback");
+    }
 
     FILE *pipe = popen(cmd, POPEN_MODE);
-    if (!pipe) return fail(r, "https needs curl, and it could not be started");
+    if (!pipe) {
+        remove(cfg_path);
+        return fail(r, "https needs curl, and it could not be started");
+    }
     const size_t wrote = fwrite(body, 1, len, pipe);
     int rc = pclose(pipe);
+    remove(cfg_path);
 #ifndef _WIN32
     // POSIX hands back a wait status, not an exit code; Windows hands back the
     // code itself. Reported as curl documents its own numbers -- 7 is "could
@@ -582,7 +675,7 @@ int http_post_json(const char *url, const char *token, const char *body,
                    size_t len, http_reply_t *out) {
     memset(out, 0, sizeof(*out));
     // Checked before either transport sees it: in a header a stray CR LF is a
-    // second header, and on a command line a space is a second argument.
+    // second header, and in curl's config file a quote ends the string.
     if (token && *token && !shell_safe(token, "-._~"))
         return fail(out, "an upload token is letters, digits, '-', '_', '.' "
                          "and '~'; this one is not");

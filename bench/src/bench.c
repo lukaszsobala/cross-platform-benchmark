@@ -342,10 +342,42 @@ static double cpu_cur_mhz(int cpu) {
     return khz > 0.0 ? khz / 1000.0 : 0.0;
 }
 
+// The clock the machine *rates* this CPU at -- a ceiling it declares, not one
+// anybody observed. Reported as "rated", never "measured": a throttling
+// machine runs below this number for the whole benchmark.
 static double cpu_max_mhz(int cpu) {
+#if defined(_WIN32)
+    // The kernel times each core at boot and writes the result beside the
+    // brand string this file already reads elsewhere.
+    char key[80];
+    snprintf(key, sizeof(key),
+             "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\%d",
+             cpu < 0 ? 0 : cpu);
+    DWORD mhz = 0, len = sizeof(mhz);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, key, "~MHz", RRF_RT_REG_DWORD,
+                     NULL, &mhz, &len) == ERROR_SUCCESS && mhz > 0) {
+        return (double)mhz;
+    }
+    return 0.0;
+#elif defined(__APPLE__)
+    // Intel Macs publish the nominal clock; Apple Silicon deleted the key, so
+    // this returns 0 there and the caller falls through to the estimate.
+    (void)cpu;    // one package, one answer
+    static const char *const keys[] = { "hw.cpufrequency_max",
+                                        "hw.cpufrequency" };
+    for (int k = 0; k < ARRAY_LEN(keys); ++k) {
+        uint64_t hz = 0;
+        size_t len = sizeof(hz);
+        if (sysctlbyname(keys[k], &hz, &len, NULL, 0) == 0 && hz > 0) {
+            return (double)hz / 1e6;
+        }
+    }
+    return 0.0;
+#else
     double khz = read_cpu_khz(cpu, "cpuinfo_max_freq");
     if (khz <= 0.0) khz = read_cpu_khz(cpu, "scaling_max_freq");
     return khz > 0.0 ? khz / 1000.0 : 0.0;
+#endif
 }
 
 // A device-tree integer property: 4 or 8 bytes, big-endian, which is how the
@@ -663,7 +695,7 @@ static void *worker(void *arg) {
             }
         }
         free(idx);
-        free(buf);
+        plat_aligned_free(buf);
         return NULL;
     }
 
@@ -1498,7 +1530,16 @@ static int run_workers(worker_t *w, int n, const run_opts_t *o) {
         w[i].ks = o->kernels;
         w[i].seed = o->seed + (uint64_t)i * UINT64_C(0x9E3779B97F4A7C15) + 1u;
         const int rc = pthread_create(&ths[i], NULL, worker, &w[i]);
-        if (rc != 0) { errno = rc; perror("pthread_create"); free(ths); return -1; }
+        if (rc != 0) {
+            // No unwinding from here: the threads already started are blocked
+            // at a barrier sized for n arrivals that will now never come, and
+            // they can be neither joined nor portably cancelled. Returning
+            // would free the very worker array they are still using, so the
+            // one honest exit is the process's.
+            errno = rc;
+            perror("pthread_create");
+            exit(1);
+        }
     }
     for (int i = 0; i < n; ++i) pthread_join(ths[i], NULL);
 
@@ -1842,10 +1883,13 @@ static double core_score(const worker_t *w) {
 typedef struct {
     int    cpu;              // pinned CPU, or -1
     double mhz;              // 0 if unknown
-    // Where `mhz` came from, because the three are worth very different
-    // amounts to a reader: read off the machine, asserted by the operator, or
-    // inferred from INT-lat under an assumption the core may not honour.
-    enum { MHZ_READ, MHZ_GIVEN, MHZ_ESTIMATED } mhz_src;
+    // Where `mhz` came from, because the four are worth different amounts to
+    // a reader: sampled under load, asserted by the operator, a ceiling the
+    // machine declares (cpufreq max, the device tree, the Windows registry --
+    // rated, not observed), or inferred from INT-lat under an assumption the
+    // core may not honour. Ordered by trust, weakest last: aggregate() keeps
+    // the weakest source of any row it folds in.
+    enum { MHZ_READ, MHZ_GIVEN, MHZ_RATED, MHZ_ESTIMATED } mhz_src;
     double int_lat, int_thr, mul_thr, fp_lat, fp_thr;
     double mem_gbps, mem_lat_ns, mem_lat8_ns;
     double ilp, filp, mlp;
@@ -1905,8 +1949,14 @@ static result_t summarize(const worker_t *w, int cpu) {
         r.mhz_src = MHZ_GIVEN;
     } else {
         r.mhz = w->mhz_observed;
-        if (r.mhz <= 0.0 && cpu >= 0) r.mhz = cpu_max_mhz(cpu);
-        if (r.mhz <= 0.0)             r.mhz = dt_cpu_mhz(cpu);
+        if (r.mhz <= 0.0) {
+            // Nothing was sampled under load, so what is left is a rated
+            // clock: cpufreq's ceiling (or the registry's on Windows, or
+            // sysctl's on an Intel Mac), then the device tree's declaration.
+            r.mhz = cpu_max_mhz(cpu);
+            if (r.mhz <= 0.0) r.mhz = dt_cpu_mhz(cpu);
+            if (r.mhz > 0.0)  r.mhz_src = MHZ_RATED;
+        }
         if (r.mhz <= 0.0) {
             r.mhz = r.int_lat;
             r.mhz_src = MHZ_ESTIMATED;
@@ -1917,9 +1967,12 @@ static result_t summarize(const worker_t *w, int cpu) {
 
 // The `mhz_src` value in JSON and TSV. "given" is deliberately not "measured":
 // a reader can then tell a clock the machine reported from one its owner did.
+// And "rated" is neither: it is the ceiling the machine declares, which a
+// throttling core never reached.
 static const char *mhz_src_name(int src) {
     switch (src) {
         case MHZ_GIVEN:     return "given";
+        case MHZ_RATED:     return "rated";
         case MHZ_ESTIMATED: return "estimated";
         default:            return "measured";
     }
@@ -2011,7 +2064,7 @@ static void json_result(const result_t *r, const char *scope, const char *indent
 // Opening half of the JSON document: schema, build, system and run config. The
 // caller adds the result arrays and calls json_close().
 static void json_open(const char *mode, const run_opts_t *o, int threads,
-                      int pin) {
+                      int pin, size_t mem_sweep) {
     char cc[64], models[512];
     compiler_string(cc, sizeof(cc));
     detect_cpu_models(models, sizeof(models));
@@ -2032,22 +2085,25 @@ static void json_open(const char *mode, const run_opts_t *o, int threads,
          o->kernels->vectorize ? "true" : "false",
          o->kernels->fma ? "true" : "false");
 
+    // Every uname field through j_str: they are the kernel's text, not ours.
     plat_sysinfo_t si;
-    jout(",\n  \"system\": {");
+    jout(",\n  \"system\": { \"cpus\": %d", get_cpu_count());
     if (plat_sysinfo(&si) == 0) {
-        jout(" \"sysname\": \"%s\"", si.sysname);
+        j_str("sysname", si.sysname);
         j_str("release", si.release);
         j_str("machine", si.machine);
-        jout(",");
     }
-    jout(" \"cpus\": %d", get_cpu_count());
     if (models[0]) j_str("cpu_models", models);
     jout(" }");
 
     jout(",\n  \"config\": { \"threads\": %d, \"seconds_per_phase\": %g,"
-           " \"reps\": %d, \"warmup_seconds\": %g, \"mem_bytes_per_thread\": %zu,"
-         " \"pin\": %s, \"clock\": \"%s\", \"seed\": %llu }",
-         threads, o->seconds, o->reps, o->warmup, o->mem_per_thread,
+         " \"reps\": %d, \"warmup_seconds\": %g, \"mem_bytes_per_thread\": %zu",
+         threads, o->seconds, o->reps, o->warmup, o->mem_per_thread);
+    // --full measures with two buffer sizes -- N threads share the cache, one
+    // core has it to itself -- so the sweep's size is its own key rather than
+    // whichever of the two happened to be set last.
+    if (mem_sweep > 0) jout(", \"mem_bytes_per_core_sweep\": %zu", mem_sweep);
+    jout(", \"pin\": %s, \"clock\": \"%s\", \"seed\": %llu }",
          pin ? "true" : "false", g_clock_raw ? "raw" : "mono",
          (unsigned long long)o->seed);
 }
@@ -2184,14 +2240,17 @@ static void text_threads(const suite_t *s, size_t mem_per_thread) {
     const double n = s->n_threads > 0 ? (double)s->n_threads : 1.0;
     printf("%-9s %-23s %8s %11s %11s\n",
            "metric", "what it measures", "unit", "total", "per-thread");
-    printf("%-9s %-23s %8s %11.1f %11.1f\n",
-           "INT-lat", "integer latency", "Mop/s", t->int_lat, t->int_lat / n);
+    // The latency rows keep their total cell blank: n dependency chains on n
+    // threads do not make any one chain shorter, so a summed latency rate is
+    // not a number the machine ever produces. Per-thread is the mean.
+    printf("%-9s %-23s %8s %11s %11.1f\n",
+           "INT-lat", "integer latency", "Mop/s", "-", t->int_lat / n);
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
            "INT-thr", "integer throughput", "Mop/s", t->int_thr, t->int_thr / n);
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
            "MUL-thr", "multiply throughput", "Mmul/s", t->mul_thr, t->mul_thr / n);
-    printf("%-9s %-23s %8s %11.1f %11.1f\n",
-           "FP-lat", "FP latency", "Mflop/s", t->fp_lat, t->fp_lat / n);
+    printf("%-9s %-23s %8s %11s %11.1f\n",
+           "FP-lat", "FP latency", "Mflop/s", "-", t->fp_lat / n);
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
            "FP-thr", "FP throughput", "Mflop/s", t->fp_thr, t->fp_thr / n);
     printf("%-9s %-23s %8s %11.1f %11.1f\n",
@@ -2294,11 +2353,14 @@ static void emit_tsv(const suite_t *s, const char *variant, int first) {
 }
 
 static void emit_json(const suite_t *s, const char *mode, const run_opts_t *o,
-                      int threads, int pin) {
-    json_open(mode, o, threads, pin);
+                      int threads, int pin, size_t mem_sweep) {
+    json_open(mode, o, threads, pin, mem_sweep);
     if (s->dram_hi > 0.0) {
-        jout(",\n  \"dram\": { \"name\": \"%s\", \"mhz_min\": %.6g,"
-             " \"mhz_max\": %.6g }", g_dram_name, s->dram_lo, s->dram_hi);
+        // j_str, not %s: the name is whatever the devfreq node called itself.
+        jout(",\n  \"dram\": { \"mhz_min\": %.6g, \"mhz_max\": %.6g",
+             s->dram_lo, s->dram_hi);
+        j_str("name", g_dram_name);
+        jout(" }");
     }
     if (s->have_threads) {
         jout(",\n  \"threads\": [\n");
@@ -2647,8 +2709,12 @@ static int run_variant(const run_cfg_t *c, run_opts_t *opts, int idx, int n_sel,
         // An upload sends one document per variant rather than the array
         // --variants prints, because the hub stores one run per build.
         sbuf_t doc = { NULL, 0, 0, 0 };
+        // config.mem_bytes_per_thread describes the multi-threaded phase where
+        // there was one; the per-core sweep's size travels under its own key.
+        opts->mem_per_thread = c->want_threads ? c->mem_mt : c->mem_pc;
         g_json_sink = &doc;
-        emit_json(&s, c->mode, opts, c->threads, c->pin);
+        emit_json(&s, c->mode, opts, c->threads, c->pin,
+                  c->want_cores ? c->mem_pc : 0);
         g_json_sink = NULL;
         if (doc.oom) {
             fprintf(msg(), "out of memory building the result document\n");
@@ -2990,7 +3056,7 @@ int main(int argc, char **argv) {
                 }
             }
         } else if (g_format == FMT_JSON) {
-            json_open("disp-sweep", &opts, 1, pin);
+            json_open("disp-sweep", &opts, 1, pin, 0);
             printf(",\n  \"sweep\": [\n");
             for (int i = 0; i < n_cpus; ++i) {
                 printf("    { \"cpu\": %d, \"mhz\": %.6g, \"points\": [\n",

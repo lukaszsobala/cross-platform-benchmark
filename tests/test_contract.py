@@ -55,7 +55,8 @@ SECTION_KEYS = {
                "binary_sha256", "vectorize", "fma"},
     "system": {"sysname", "release", "machine", "cpus", "cpu_models"},
     "config": {"threads", "seconds_per_phase", "reps", "warmup_seconds",
-               "mem_bytes_per_thread", "pin", "clock", "seed"},
+               "mem_bytes_per_thread", "mem_bytes_per_core_sweep",
+               "pin", "clock", "seed"},
     "dram":   {"name", "mhz_min", "mhz_max"},
 }
 
