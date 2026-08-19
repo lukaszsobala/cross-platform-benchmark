@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img"
+     aria-label="stopwatch">
+  <!-- The tab icon: U+23F1 with the emoji-presentation selector, drawn as
+       text rather than as paths. It is the viewer's emoji font that renders
+       it, so it always matches the platform the board is being read on --
+       and there is nothing here to redraw if the glyph is ever replaced.
+       The font stack names the three platform emoji fonts before falling
+       back to whatever a system calls its own. -->
+  <text x="32" y="33" font-size="54" text-anchor="middle"
+        dominant-baseline="central"
+        font-family="'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',sans-serif"
+        >&#x23F1;&#xFE0F;</text>
+</svg>
