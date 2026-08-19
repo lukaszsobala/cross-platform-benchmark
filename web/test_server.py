@@ -237,6 +237,29 @@ class HubTest(unittest.TestCase):
         _, out = self.req("/api/cores?scope=cpu&limit=1")
         self.assertEqual(out["cores"][0]["sysname"], "Linux")
 
+    def test_the_os_filter_narrows_to_one_system(self):
+        """Matched case-insensitively: a hand-written link is not a typo."""
+        self.upload()
+        self.upload(document(system={"sysname": "Windows", "release": "10",
+                                     "machine": "x86_64", "cpus": 8,
+                                     "cpu_models": "Test CPU 9000"}))
+        _, out = self.req("/api/cores?scope=cpu&os=Windows")
+        self.assertTrue(out["cores"])
+        self.assertEqual({c["sysname"] for c in out["cores"]}, {"Windows"})
+        _, lower = self.req("/api/cores?scope=cpu&os=windows")
+        self.assertEqual(len(lower["cores"]), len(out["cores"]))
+        _, none = self.req("/api/cores?scope=cpu&os=Plan9")
+        self.assertEqual(none["cores"], [])
+
+    def test_stats_counts_the_systems_it_holds(self):
+        """What the OS picker is drawn from -- there is no fixed list of them."""
+        _, before = self.req("/api/stats")
+        was = {row["sysname"]: row["n"] for row in before["systems"]}
+        self.upload()
+        _, after = self.req("/api/stats")
+        now = {row["sysname"]: row["n"] for row in after["systems"]}
+        self.assertEqual(now.get("Linux", 0), was.get("Linux", 0) + 1)
+
     def test_latency_metric_sorts_ascending(self):
         self.upload()
         _, out = self.req("/api/cores?scope=cpu&sort=mem_lat_ns&order=asc&limit=5")

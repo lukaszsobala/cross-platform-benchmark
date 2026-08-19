@@ -40,11 +40,19 @@
     <label title="the instruction set the result was measured on">Arch
       <select name="target"></select>
     </label>
+    <!-- Options filled by the page: uname says whatever the machine it ran on
+         says, so the list is whatever this hub happens to hold. -->
+    <label title="the operating system the result was measured on">OS
+      <select name="os"></select>
+    </label>
+    <!-- Both default to "off" rather than "any": a board mixing build switches
+         is a board of numbers that cannot be compared, and the scalar,
+         no-FMA build is the one every machine can produce. -->
     <label title="a build switch: one instruction works on several numbers at once">Vectorize
-      <select name="vectorize"><option value="">any</option><option value="0">off</option><option value="1">on</option></select>
+      <select name="vectorize"><option value="">any</option><option value="0" selected>off</option><option value="1">on</option></select>
     </label>
     <label title="a build switch: multiply and add done as one instruction">FMA
-      <select name="fma"><option value="">any</option><option value="0">off</option><option value="1">on</option></select>
+      <select name="fma"><option value="">any</option><option value="0" selected>off</option><option value="1">on</option></select>
     </label>
     <label>Values
       <select name="norm">
@@ -79,11 +87,6 @@
     Only runs with the same <strong>Vectorize</strong> and <strong>FMA</strong> are
     comparable.
   </p>
-  <!-- Filled by renderBoardLegend(): which marks to explain depends on which
-       ones any row here carries, and the release name is the hub's, not a tag
-       frozen into this file. -->
-  <div id="board-legend"></div>
-
 
   <div class="scroller"><table id="board-table"><thead></thead><tbody></tbody></table></div>
   <!-- Filled by pager(): absent while the whole board fits on one page. -->

@@ -983,6 +983,7 @@ class Store:
 
     def core_filters(self, *, scope: str | None = "cpu", target: str | None = None,
                      vectorize: int | None = None, fma: int | None = None,
+                     sysname: str | None = None,
                      search: str | None = None, ids: list[int] | None = None,
                      run: int | None = None, user_id: int | None = None,
                      verified: str | None = None) -> tuple[list[str], list[object]]:
@@ -1018,6 +1019,12 @@ class Store:
         if fma is not None:
             where.append("r.fma = ?")
             args.append(fma)
+        # uname's own spelling, matched case-insensitively: the picker offers
+        # what this hub holds, but a hand-written link asking for "linux" means
+        # the same machines as one asking for "Linux".
+        if sysname:
+            where.append("LOWER(r.sysname) = LOWER(?)")
+            args.append(sysname)
         if search:
             where.append("(r.cpu_models LIKE ? OR r.label LIKE ? OR r.machine LIKE ?)")
             pat = f"%{search}%"
@@ -1154,6 +1161,12 @@ class Store:
             targets = db.execute(
                 "SELECT target, COUNT(*) AS n FROM runs WHERE target IS NOT NULL "
                 "GROUP BY target ORDER BY n DESC").fetchall()
+            # The operating systems this hub actually holds, for the OS picker:
+            # there is no fixed list to draw it from, since uname says whatever
+            # the machine it ran on says.
+            systems = db.execute(
+                "SELECT sysname, COUNT(*) AS n FROM runs WHERE sysname IS NOT NULL "
+                "GROUP BY sysname ORDER BY n DESC").fetchall()
             # The newest release this hub knows of, for the page to point at
             # when it explains what a release build is. By version and not by
             # when the manifest happened to be loaded: an operator catching up
@@ -1166,7 +1179,8 @@ class Store:
             release = {"release": latest["release"], "url": latest["release_url"]}
         return {"runs": runs, "records": cores, "users": users,
                 "release_builds": release_builds, "release": release,
-                "targets": [dict(t) for t in targets]}
+                "targets": [dict(t) for t in targets],
+                "systems": [dict(t) for t in systems]}
 
     # -- verified builds ---------------------------------------------------
 
@@ -1951,6 +1965,7 @@ class Handler(BaseHTTPRequestHandler):
             "target": _text(one("target"), 32, "target"),
             "vectorize": flag.get(str(one("vectorize", "")).lower()),
             "fma": flag.get(str(one("fma", "")).lower()),
+            "sysname": _text(one("os"), 64, "os"),
             "search": _text(one("q"), 64, "q"),
             "ids": ids,
             "run": run,

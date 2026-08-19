@@ -30,6 +30,7 @@ const state = {
   submitter: "",        // board narrowed to one account's uploads, by name
   files: [],            // result documents chosen but not yet uploaded
   release: null,        // the newest release this hub verifies against, if any
+  held: null,           // how many runs this hub holds at all, from /api/stats
 };
 
 // How many results a list may show at once. The server clamps every listing to
@@ -296,6 +297,29 @@ function osName(row, unknown = "—") {
   return OS_NAMES[s.toLowerCase()] || s;
 }
 
+// Fill the OS picker from what this hub holds. There is no list to draw it
+// from the way Arch has one: uname reports whatever the machine it ran on
+// says, so an OS nobody has uploaded from is an option worth not offering.
+// Empty until /api/stats answers, which is why the current choice is put back.
+function fillSystems(counts) {
+  const sel = $("#filters").elements.os;
+  const chosen = sel.value;
+  sel.replaceChildren();
+  const any = el("option", null, "any");
+  any.value = "";
+  sel.append(any);
+  for (const row of counts || []) {
+    if (!row.sysname) continue;
+    const o = el("option", null, `${osName(row)} (${row.n})`);
+    o.value = row.sysname;
+    sel.append(o);
+  }
+  sel.value = chosen;
+  // Same as Arch: a choice this hub has nothing for falls back to "any" rather
+  // than leaving the picker blank while still narrowing the board.
+  if (sel.value !== chosen) sel.value = "";
+}
+
 // What to call a machine whose run never said. uname's `machine` is the
 // instruction set, not a CPU: printing it bare made a row read as a box called
 // "aarch64", which is both untrue and already the target column's job. Runs
@@ -328,7 +352,7 @@ function filterParams() {
   const p = new URLSearchParams();
   // The dropdowns reload the board the moment they change, so their live value
   // is always the applied one.
-  for (const name of ["scope", "target", "vectorize", "fma", "norm"]) {
+  for (const name of ["scope", "target", "os", "vectorize", "fma", "norm"]) {
     const v = form.elements[name].value;
     if (v) p.set(name, v);
   }
@@ -498,33 +522,6 @@ function trustBadge(row) {
   return mark;
 }
 
-// The legend under the board: what the one mark on a row means, and what the
-// board is honest about. Short on purpose. It used to explain two stronger
-// marks that nobody reading it could ever earn, which made the ordinary result
-// -- the only kind there is -- read as a failing grade.
-//
-// The release name comes from the hub rather than from a tag typed into the
-// HTML, so a hub that verifies nothing simply says less.
-function renderBoardLegend() {
-  const box = $("#board-legend");
-  if (!box) return;
-  box.replaceChildren();
-  const p = el("p", "note");
-  const say = (text) => p.append(el("span", null, text));
-
-  const rel = state.release && state.release.release;
-  if (rel) {
-    p.append(el("span", "claim", `${rel} build`));
-    say(` the result says it came from one of the programs ${rel} ` +
-        `published — running the same program is what makes two results ` +
-        `comparable. `);
-  }
-  say("Every result here is self-reported, which is the normal case and the " +
-      "only one: a benchmark cannot prove it was run, so nothing on this " +
-      "board claims to. They all rank exactly the same.");
-  box.append(p);
-}
-
 function filterBySubmitter(name) {
   state.submitter = name || "";
   showTab("board");
@@ -544,6 +541,25 @@ function renderSubmitterChip() {
   box.append(clear);
 }
 
+// What an empty board says. It matters more than it looks now that Vectorize
+// and FMA start at "off": the first thing a visitor sees can be nothing at all
+// on a hub whose results were built the other way, and telling them to be the
+// first to upload -- when there are results here they merely filtered out --
+// sends them away for no reason. `state.held` is how many runs the hub has
+// regardless of filters, so an empty hub still says it is empty; until
+// /api/stats answers it is null, and an empty board is read as filtered, which
+// is the harmless way to be wrong.
+function renderEmptyNote() {
+  const box = $("#board-empty");
+  box.hidden = state.rows.length > 0;
+  if (!box.hidden) return;
+  box.textContent = state.held === 0
+    ? "Nothing here yet. Be the first to upload a run."
+    : "No result matches these filters. Vectorize and FMA start at " +
+      "\u201coff\u201d \u2014 set either to \u201cany\u201d to see results " +
+      "built the other way.";
+}
+
 function renderBoard() {
   renderSubmitterChip();
   const table = $("#board-table");
@@ -551,7 +567,7 @@ function renderBoard() {
   const tbody = table.tBodies[0];
   thead.replaceChildren();
   tbody.replaceChildren();
-  $("#board-empty").hidden = state.rows.length > 0;
+  renderEmptyNote();
   const box = $("#board-pager");
   box.replaceChildren();
   pager(box, { offset: state.offset, limit: state.limit, total: state.total },
@@ -1929,26 +1945,32 @@ async function boot() {
     b.addEventListener("click", () => copyButton(b));
   }
   renderCommands();
-  // The full list first, so the picker is usable before any request finishes,
-  // and again with the counts once /api/stats has them.
+  // Arch gets its full list at once, so the picker is usable before any
+  // request finishes; OS has no list to draw until /api/stats says what this
+  // hub holds, so it starts as "any" alone. Both are filled again with the
+  // counts when they arrive.
   fillTargets(null);
-  // Once before /api/stats answers, so the board is never explained by a blank
-  // gap, and again from the hub's numbers when they arrive.
-  renderBoardLegend();
+  fillSystems(null);
   renderVerifiedNote();
 
   const meta = await api("/api/metrics");
   state.metrics = meta.metrics;
 
   // Which release this hub verifies against, and how many results it holds
-  // per architecture. Not fatal if it fails: the board is readable without it,
-  // and both the legend and the Arch picker have already been drawn once with
-  // what little that leaves them.
+  // per architecture and per operating system. Not fatal if it fails: the
+  // board is readable without it, and the Arch and OS pickers have already
+  // been drawn once with what little that leaves them -- for OS, just "any",
+  // which is what they default to anyway.
   api("/api/stats").then((s) => {
     state.release = s.release || null;
+    state.held = typeof s.runs === "number" ? s.runs : null;
     fillTargets(s.targets || []);
-    renderBoardLegend();
+    fillSystems(s.systems || []);
     renderVerifiedNote();
+    // Only ever corrects a message already on screen: an empty board drawn
+    // before the counts arrived cannot yet know whether the hub is empty or
+    // merely filtered.
+    if (!$("#board-empty").hidden) renderEmptyNote();
   }).catch(() => {});
 
   $("#filters").addEventListener("submit", (e) => {
@@ -1963,7 +1985,7 @@ async function boot() {
   // `norm` is in here rather than with the redraw-only control below because
   // it is what the board is ranked by as well as what it prints: switching to
   // per GHz reorders the rows, so it has to ask the server again.
-  for (const name of ["scope", "target", "vectorize", "fma", "verified",
+  for (const name of ["scope", "target", "os", "vectorize", "fma", "verified",
                       "limit", "norm"]) {
     $("#filters").elements[name].addEventListener("change", () => {
       loadBoard().catch((err) => alert(err.message));
